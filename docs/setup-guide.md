@@ -41,7 +41,7 @@ If the flag is missing, rebuild from a recent llama.cpp release.
 ## 2. Build the proxy
 
 ```bash
-git clone <your-repo-url> lpcache-rs
+git clone https://github.com/kokleong98/llama-proxy-cache.git lpcache-rs
 cd lpcache-rs
 cargo build --release
 # binary: target/release/lpcache
