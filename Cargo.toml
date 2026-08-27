@@ -1,0 +1,31 @@
+[package]
+name = "lpcache"
+version = "0.1.0"
+edition = "2024"
+description = "KV-cache aware OpenAI-compatible proxy for llama.cpp"
+license = "MIT"
+
+[lib]
+name = "lpcache"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lpcache"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
