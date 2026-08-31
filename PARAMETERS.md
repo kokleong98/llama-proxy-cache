@@ -64,6 +64,7 @@ precedence over the built-in defaults. `-h` / `--help` prints the built-in help.
 | `PORT` | `--port <PORT>` | `8081` | Proxy listen port |
 | `LLAMA_API_KEY` | `--api-key <KEY>` | — | Sent to the backend as `Authorization: Bearer <KEY>` (llama-server `--api-key`). Blank/whitespace-only = no header |
 | `LOG_LEVEL` | `--log-level <LEVEL>` | `INFO` | `TRACE`..`ERROR`; **`RUST_LOG` env var overrides it when set** |
+| `STREAM_QUEUE_SIZE` | `--stream-queue-size <N>` | `16` | Capacity of the per-request bounded channel that buffers streamed SSE bytes between the background reader and the HTTP response. Must be `>= 1` (`0`/invalid fall back to the default with a warning). Smaller values backpressure a slow client faster; the default 16 matches the Python original |
 | `COALESCE_REQUESTS` | `--coalesce-requests <BOOL>` | `false` | Group concurrent requests with the same KV cache key into one backend call (followers receive the leader's result, regardless of generation parameters) |
 | — | `-V`, `--version` | — | Print the proxy version (from `Cargo.toml`) and exit; the version is also logged in the `app_start` line at startup |
 | — | `-h`, `--help` | — | Show help and exit |

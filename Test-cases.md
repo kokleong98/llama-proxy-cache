@@ -4,26 +4,26 @@ Complete catalog of the **lpcache** regression suite (KV-cache-aware,
 OpenAI-compatible proxy for llama.cpp). Every entry maps 1:1 to a test
 function; the full suite runs with `cargo test`.
 
-**Total: 104 test cases** — 66 unit + 23 API integration + 15 client
+**Total: 107 test cases** — 67 unit + 25 API integration + 15 client
 integration.
 
 | # | Suite | Location | Tests |
 |---|-------|----------|-------|
-| 1 | Configuration (env vars, CLI, precedence) | `src/config.rs` | 23 |
+| 1 | Configuration (env vars, CLI, precedence) | `src/config.rs` | 24 |
 | 2 | Hashing, meta files, pruning | `src/hashing.rs` | 19 |
 | 3 | Request coalescing (`SingleFlight`) | `src/coalesce.rs` | 4 |
 | 4 | Backend client — slot pinning | `src/llama_client.rs` | 3 |
 | 5 | Slot management (selection, locks, breaker) | `src/slot_manager.rs` | 17 |
-| 6 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 23 |
+| 6 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 25 |
 | 7 | Backend client — HTTP behavior | `tests/client.rs` | 15 |
 
 ## How to run
 
 ```sh
 cd lpcache
-cargo test                    # full regression suite (104 tests, ~4 s)
-cargo test --lib              # 66 unit tests only
-cargo test --test api         # 23 API integration tests
+cargo test                    # full regression suite (107 tests, ~4 s)
+cargo test --lib              # 67 unit tests only
+cargo test --test api         # 25 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test <name-substring>   # run a single test by name filter
 cargo clippy --all-targets    # lint gate (expected: 0 warnings)
@@ -33,7 +33,7 @@ Integration tests start `MockLlama` — an in-process mock of the llama.cpp
 server (`src/mock_backend.rs`) on free localhost ports — so the suite needs
 no real `llama-server`, model files, or network access.
 
-## 1. Configuration — `src/config.rs` (23)
+## 1. Configuration — `src/config.rs` (24)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -56,10 +56,11 @@ no real `llama-server`, model files, or network access.
 | 17 | `cli_help_flags` | `--help` / `-h`, also among other options | `help` flag set |
 | 18 | `cli_version_flags` | `--version` / `-V`, also among other options | `version` flag set |
 | 19 | `version_string_is_crate_name_and_version` | `version_string()` output | starts with `lpcache `, ends with the crate version |
-| 20 | `cli_usage_lists_all_flags_and_env_vars` | completeness of `--help` text | all 17 flags and 15 env vars listed |
+| 20 | `cli_usage_lists_all_flags_and_env_vars` | completeness of `--help` text | all 18 flags and 16 env vars listed |
 | 21 | `coalesce_requests_flag` | `COALESCE_REQUESTS` env + CLI | off by default; `true`/`1` on; `0`/invalid off; CLI overrides env |
-| 22 | `config_precedence_cli_over_env_over_defaults` | CLI > env > default (merged env map **and** final Config) | CLI overrides; env applies to unset flags; unset flags add nothing; default otherwise |
-| 23 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
+| 22 | `stream_queue_size_env_and_cli` | `STREAM_QUEUE_SIZE` env + CLI | default 16; env `64` applied; `0` / invalid → default; CLI `--stream-queue-size 8` overrides env; builder clamps below 1 to 1 |
+| 23 | `config_precedence_cli_over_env_over_defaults` | CLI > env > default (merged env map **and** final Config) | CLI overrides; env applies to unset flags; unset flags add nothing; default otherwise |
+| 24 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
 
 ## 2. Hashing, meta files, pruning — `src/hashing.rs` (19)
 
@@ -127,7 +128,7 @@ save/restore semantics and the backend circuit breaker.
 | 16 | `probe_down_backends_recovers_up_backend` | probe recovery | one probe round recovers a live backend; healthy backends not counted |
 | 17 | `acquire_excluding_picks_other_backend` | retry on a different backend | exclude be0 → be1 slot 0; single backend → fast error (no 300 s wait) |
 
-## 6. API end-to-end — `tests/api.rs` (23)
+## 6. API end-to-end — `tests/api.rs` (25)
 
 The real proxy router (axum) in front of `MockLlama`, which records every
 chat body/query, restore and save. Default setup: 1 backend, 2 slots,
@@ -160,6 +161,8 @@ behaviour requires a real connection).
 | 21 | `coalesce_stream_groups_share_one_backend_stream` | 3 concurrent stream requests | 1 backend stream; every follower receives the identical byte stream |
 | 22 | `coalesce_flag_off_preserves_per_request_backend_calls` | `COALESCE_REQUESTS` off | 5 requests → 5 backend calls |
 | 23 | `coalesce_new_group_after_completion` | sequential identical requests | 2 backend calls (a new group starts after the leader finishes) |
+| 24 | `stream_queue_size_one_delivers_full_stream` | stream chat with `STREAM_QUEUE_SIZE=1` (maximal backpressure) | full SSE delivered (Hello/world/`[DONE]`); 3 chunks produced exactly once; reader cleanup still saves KV + writes meta |
+| 25 | `coalesce_stream_queue_size_one_follower_receives_full_stream` | 3 concurrent stream requests, coalescing on, queue size 1 | 1 backend stream; every follower receives the identical full stream ending `[DONE]` |
 
 ## 7. Backend client — HTTP behavior — `tests/client.rs` (15)
 
@@ -205,8 +208,13 @@ client-disconnect behaviour.
 | Concurrent-request coalescing (Rust-only feature) | 4 unit + 6 E2E coalesce tests |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 
-**Suite health (2026-08-26).** 104/104 passing, clippy clean, ~4 s wall
+**Suite health (2026-08-31).** 107/107 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
+On 2026-08-31 the configurable `STREAM_QUEUE_SIZE` (env var +
+`--stream-queue-size` flag) added three cases: `stream_queue_size_env_and_cli`
+(config) and `stream_queue_size_one_delivers_full_stream` /
+`coalesce_stream_queue_size_one_follower_receives_full_stream` (E2E,
+both with `STREAM_QUEUE_SIZE=1` for maximal channel backpressure).
 De-duplicated from 109 tests on 2026-08-26: removed
 `stream_client_disconnect_aborts_upstream` (merged into the TCP variant),
 `failed_slot_mark_used_is_skipped_by_free_first` (subsumed by three other

@@ -61,6 +61,7 @@ and the query string ((llama.cpp accepts it in several places depending on the b
 | `MODEL_ID`          | `llama.cpp`         | model id advertised by `/v1/models` and used as default |
 | `PORT`              | `8081`              | proxy listen port (0.0.0.0)                    |
 | `LOG_LEVEL`         | `INFO`              | log level (`RUST_LOG` overrides it)            |
+| `STREAM_QUEUE_SIZE` | `16`                | per-request SSE channel capacity (must be >= 1) |
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
 
 Every variable is also available as a command-line flag (see
@@ -68,7 +69,7 @@ Every variable is also available as a command-line flag (see
 `--n-slots`, `--words-per-block`, `--big-threshold-words`, `--lcp-th`,
 `--meta-dir`, `--meta-max`, `--slot-save-path`, `--request-timeout`,
 `--model-id`, `--port`, `--api-key` (→ `LLAMA_API_KEY`), `--log-level`,
-`--coalesce-requests`.
+`--stream-queue-size`, `--coalesce-requests`.
 `-h`/`--help` shows the full help; `-V`/`--version` prints the proxy version
 (also logged in the `app_start` line at startup).
 Explicit flags take precedence over environment variables, which take
@@ -123,20 +124,22 @@ words appended — the second request logs
 cargo test
 ```
 
-- **Unit tests** (49): config parsing/defaults (incl. `META_MAX` /
-  `SLOT_SAVE_PATH`), raw-prefix construction, word tokenization, block
-  hashing, LCP, SHA256 vectors, meta file round-trips, candidate
-  filtering/thresholds, LRU pruning, slot selection (free/oldest ordering,
-  idle-aware, multi-backend, circuit breaker, escalating backoff,
-  success/probe recovery, retry slot exclusion), per-slot locking, acquire
-  timeout, save semantics.
-- **Integration tests** (30): `LlamaClient` against the mock backend
+- **Unit tests** (67): config parsing/defaults (incl. `META_MAX` /
+  `SLOT_SAVE_PATH` / `STREAM_QUEUE_SIZE`, CLI-over-env precedence), raw-prefix
+  construction, word tokenization, block hashing, LCP, SHA256 vectors, meta
+  file round-trips, candidate filtering/thresholds, LRU pruning, slot
+  selection (free/oldest ordering, idle-aware, multi-backend, circuit
+  breaker, escalating backoff, success/probe recovery, retry slot
+  exclusion), per-slot locking, acquire timeout, save semantics.
+- **Integration tests** (40): `LlamaClient` against the mock backend
   (slot pinning in body/options/query, save/restore status codes, JSON vs
   non-JSON provider answers, streaming), and end-to-end proxy behaviour
   (small vs big requests, meta file creation, restore on the second big
   request, SSE passthrough, provider error mapping, 422 on bad JSON, dead
   backend failover, transparent retry on connection failure, probe recovery
-  of a cooled-down backend, failing-slot non-pinning, LRU meta+KV pruning).
+  of a cooled-down backend, failing-slot non-pinning, LRU meta+KV pruning,
+  streaming with a minimal `STREAM_QUEUE_SIZE` on the leader and
+  coalesced-follower paths).
 
 `cargo clippy --all-targets` and `cargo fmt --check` are clean.
 

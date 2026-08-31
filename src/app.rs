@@ -42,9 +42,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-/// Stream queue size (Python: `STREAM_QUEUE_SIZE = 16`).
-const STREAM_QUEUE_SIZE: usize = 16;
-
 /// Shared application state (Python: `app.state`).
 #[derive(Clone)]
 pub struct AppState {
@@ -122,7 +119,13 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
             Some((fk, flight))
         } else {
             tracing::info!("coalesce_join key={} group={}", short16(&key), short16(&fk));
-            return follower_response(flight, &client_model, stream).await;
+            return follower_response(
+                flight,
+                &client_model,
+                stream,
+                state.config.stream_queue_size,
+            )
+            .await;
         }
     } else {
         None
@@ -346,7 +349,8 @@ async fn run_pipeline(
             // (aborting the in-flight request to llama-server — the backend
             // has no cancel endpoint, so the closed TCP connection is the
             // cancellation) before running the cleanup.
-            let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_QUEUE_SIZE);
+            let (tx, rx) =
+                mpsc::channel::<Result<Bytes, std::io::Error>>(state.config.stream_queue_size);
             let (client_gone_tx, mut client_gone_rx) = tokio::sync::oneshot::channel::<()>();
             let sm = Arc::clone(&state.sm);
             let cfg = Arc::clone(&state.config);
@@ -603,7 +607,12 @@ async fn wait_outcome(flight: &Flight) -> SharedOutcome {
 
 /// Serve a coalesced (follower) request from the leader's result: no slot
 /// is acquired, no backend call is made, and no meta file is written.
-async fn follower_response(flight: Arc<Flight>, client_model: &str, stream: bool) -> Response {
+async fn follower_response(
+    flight: Arc<Flight>,
+    client_model: &str,
+    stream: bool,
+    stream_queue_size: usize,
+) -> Response {
     if !stream {
         let outcome = wait_outcome(&flight).await;
         return render_follower_json(&outcome, client_model);
@@ -621,7 +630,7 @@ async fn follower_response(flight: Arc<Flight>, client_model: &str, stream: bool
         }
         notified.await;
     }
-    let (tx, rx) = mpsc::channel(STREAM_QUEUE_SIZE);
+    let (tx, rx) = mpsc::channel(stream_queue_size);
     let flight2 = Arc::clone(&flight);
     tokio::spawn(async move {
         let mut pos = 0usize;
