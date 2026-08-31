@@ -74,11 +74,12 @@ async fn main() {
     }
 
     tracing::info!(
-        "app_start version={} n_backends={} port={} meta_max={}",
+        "app_start version={} n_backends={} port={} meta_max={} stream_queue={}",
         lpcache::config::VERSION,
         state.clients.len(),
         port,
-        config.meta_max
+        config.meta_max,
+        config.stream_queue_size
     );
 
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {

@@ -18,6 +18,9 @@
 //! - `COALESCE_REQUESTS` (`false`; when true, concurrent requests with the
 //!   same KV cache key are grouped into a single backend call regardless of
 //!   generation parameters — see the `coalesce` module)
+//! - `STREAM_QUEUE_SIZE` (16; capacity of the per-request bounded channel
+//!   that buffers streamed SSE bytes between the background reader and the
+//!   HTTP response — smaller values backpressure the backend faster)
 //! - `LOG_LEVEL` (`INFO`)
 //!
 //! Every variable can also be set with a command-line flag (see [`Cli`]);
@@ -40,6 +43,7 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: f64 = 600.0;
 pub const DEFAULT_MODEL_ID: &str = "llama.cpp";
 pub const DEFAULT_PORT: u16 = 8081;
 pub const DEFAULT_LOG_LEVEL: &str = "INFO";
+pub const DEFAULT_STREAM_QUEUE_SIZE: usize = 16;
 
 /// Crate version from `Cargo.toml`, reported by `-V` / `--version` and
 /// logged at startup in the `app_start` line.
@@ -80,6 +84,10 @@ pub struct Config {
     pub api_key: Option<String>,
     pub port: u16,
     pub log_level: String,
+    /// `STREAM_QUEUE_SIZE`: capacity of the per-request bounded channel that
+    /// buffers streamed SSE bytes between the background reader and the
+    /// HTTP response (always >= 1).
+    pub stream_queue_size: usize,
     /// `COALESCE_REQUESTS`: group concurrent requests with the same KV cache
     /// key into a single backend call, regardless of generation parameters
     /// (followers receive the leader's result — see the `coalesce` module).
@@ -113,6 +121,8 @@ pub struct Cli {
     pub help: bool,
     /// `-V` / `--version` was passed.
     pub version: bool,
+    /// Maps to `STREAM_QUEUE_SIZE` (per-request SSE channel capacity, >= 1).
+    pub stream_queue_size: Option<String>,
     /// Maps to `COALESCE_REQUESTS` (`true`/`false`, or `1`/`0`).
     pub coalesce_requests: Option<String>,
 }
@@ -143,6 +153,7 @@ impl Config {
             api_key: None,
             port,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
+            stream_queue_size: DEFAULT_STREAM_QUEUE_SIZE,
             coalesce_requests: false,
         }
     }
@@ -157,6 +168,13 @@ impl Config {
     /// (`COALESCE_REQUESTS`).
     pub fn with_coalesce_requests(mut self, on: bool) -> Self {
         self.coalesce_requests = on;
+        self
+    }
+
+    /// Override the stream queue capacity (`STREAM_QUEUE_SIZE`); values
+    /// below 1 are clamped to 1.
+    pub fn with_stream_queue_size(mut self, size: usize) -> Self {
+        self.stream_queue_size = size.max(1);
         self
     }
 
@@ -249,6 +267,7 @@ impl Config {
                 .get("LOG_LEVEL")
                 .cloned()
                 .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string()),
+            stream_queue_size: env_stream_queue_size(vars),
             coalesce_requests: env_bool(vars, "COALESCE_REQUESTS", false),
         }
     }
@@ -284,6 +303,23 @@ fn env_float(vars: &HashMap<String, String>, key: &str, default: f64) -> f64 {
             }
         },
         None => default,
+    }
+}
+
+/// Parse `STREAM_QUEUE_SIZE` (the per-request SSE channel capacity): like
+/// [`env_int`], but the value must be >= 1 — a channel capacity of 0 is not
+/// representable, so `0` (as well as invalid values) falls back to the
+/// default with a warning.
+fn env_stream_queue_size(vars: &HashMap<String, String>) -> usize {
+    let n = env_int(vars, "STREAM_QUEUE_SIZE", DEFAULT_STREAM_QUEUE_SIZE);
+    if n == 0 {
+        tracing::warn!(
+            "env STREAM_QUEUE_SIZE=0 is not allowed (capacity must be >= 1), using {}",
+            DEFAULT_STREAM_QUEUE_SIZE
+        );
+        DEFAULT_STREAM_QUEUE_SIZE
+    } else {
+        n
     }
 }
 
@@ -356,6 +392,7 @@ impl Cli {
                 "--port" => cli.port = Some(value),
                 "--api-key" => cli.api_key = Some(value),
                 "--log-level" => cli.log_level = Some(value),
+                "--stream-queue-size" => cli.stream_queue_size = Some(value),
                 "--coalesce-requests" => cli.coalesce_requests = Some(value),
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -386,6 +423,7 @@ Options:
   --port <PORT>                 PORT                 proxy listen port (default 8081)
   --api-key <KEY>               LLAMA_API_KEY        sent as Authorization: Bearer <KEY>
   --log-level <LEVEL>           LOG_LEVEL            TRACE..ERROR (default INFO; RUST_LOG overrides)
+  --stream-queue-size <N>       STREAM_QUEUE_SIZE    per-request SSE channel capacity (default 16, must be >= 1)
   --coalesce-requests <BOOL>    COALESCE_REQUESTS    group concurrent same-key requests into one backend call (default false)
   -V, --version                 show version and exit
   -h, --help                    show this help and exit
@@ -429,6 +467,7 @@ Notes:
             ("PORT", &self.port),
             ("LLAMA_API_KEY", &self.api_key),
             ("LOG_LEVEL", &self.log_level),
+            ("STREAM_QUEUE_SIZE", &self.stream_queue_size),
             ("COALESCE_REQUESTS", &self.coalesce_requests),
         ];
         for (env_name, value) in opts {
@@ -468,6 +507,7 @@ mod tests {
         assert_eq!(c.model_id, "llama.cpp");
         assert_eq!(c.port, 8081);
         assert_eq!(c.log_level, "INFO");
+        assert_eq!(c.stream_queue_size, 16);
     }
 
     #[test]
@@ -703,6 +743,7 @@ mod tests {
             "--port",
             "--api-key",
             "--log-level",
+            "--stream-queue-size",
             "--coalesce-requests",
             "--version",
             "--help",
@@ -724,6 +765,7 @@ mod tests {
             "PORT",
             "LLAMA_API_KEY",
             "LOG_LEVEL",
+            "STREAM_QUEUE_SIZE",
             "COALESCE_REQUESTS",
         ] {
             assert!(usage.contains(env), "usage missing {env}");
@@ -744,6 +786,34 @@ mod tests {
         let cli = Cli::parse(vec!["--coalesce-requests".to_string(), "false".to_string()]).unwrap();
         let merged = cli.merged_env(&vars(&[("COALESCE_REQUESTS", "1")]));
         assert!(!Config::from_env_map(&merged).coalesce_requests);
+    }
+
+    #[test]
+    fn stream_queue_size_env_and_cli() {
+        // default
+        assert_eq!(Config::from_env_map(&HashMap::new()).stream_queue_size, 16);
+        // env value
+        assert_eq!(
+            Config::from_env_map(&vars(&[("STREAM_QUEUE_SIZE", "64")])).stream_queue_size,
+            64
+        );
+        // 0 is not a representable capacity -> default
+        assert_eq!(
+            Config::from_env_map(&vars(&[("STREAM_QUEUE_SIZE", "0")])).stream_queue_size,
+            16
+        );
+        // invalid -> default
+        assert_eq!(
+            Config::from_env_map(&vars(&[("STREAM_QUEUE_SIZE", "oops")])).stream_queue_size,
+            16
+        );
+        // CLI wins over env
+        let cli = Cli::parse(vec!["--stream-queue-size".to_string(), "8".to_string()]).unwrap();
+        let merged = cli.merged_env(&vars(&[("STREAM_QUEUE_SIZE", "64")]));
+        assert_eq!(Config::from_env_map(&merged).stream_queue_size, 8);
+        // builder clamps below 1 to 1
+        let c = Config::from_env_map(&HashMap::new()).with_stream_queue_size(0);
+        assert_eq!(c.stream_queue_size, 1);
     }
 
     #[test]

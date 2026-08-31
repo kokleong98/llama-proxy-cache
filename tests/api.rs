@@ -4,7 +4,7 @@
 use axum::body::{Body, to_bytes};
 use lpcache::app::{AppState, router};
 use lpcache::coalesce::SingleFlight;
-use lpcache::config::{BackendConf, Config};
+use lpcache::config::{BackendConf, Config, DEFAULT_STREAM_QUEUE_SIZE};
 use lpcache::llama_client::{LlamaBackend, LlamaClient};
 use lpcache::mock_backend::MockLlama;
 use lpcache::slot_manager::SlotManager;
@@ -21,18 +21,35 @@ async fn make_state(
     n_slots: usize,
     acquire_timeout: Option<Duration>,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, acquire_timeout, false).await
+    make_state_inner(n_slots, acquire_timeout, false, DEFAULT_STREAM_QUEUE_SIZE).await
 }
 
 /// Like [`make_state`], but with concurrent-request coalescing enabled.
 async fn make_state_coalesce(n_slots: usize) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, true).await
+    make_state_inner(n_slots, None, true, DEFAULT_STREAM_QUEUE_SIZE).await
+}
+
+/// Like [`make_state`], but with a custom `STREAM_QUEUE_SIZE`.
+async fn make_state_stream_queue(
+    n_slots: usize,
+    stream_queue_size: usize,
+) -> (AppState, MockLlama, tempfile::TempDir) {
+    make_state_inner(n_slots, None, false, stream_queue_size).await
+}
+
+/// Like [`make_state_coalesce`], but with a custom `STREAM_QUEUE_SIZE`.
+async fn make_state_coalesce_stream_queue(
+    n_slots: usize,
+    stream_queue_size: usize,
+) -> (AppState, MockLlama, tempfile::TempDir) {
+    make_state_inner(n_slots, None, true, stream_queue_size).await
 }
 
 async fn make_state_inner(
     n_slots: usize,
     acquire_timeout: Option<Duration>,
     coalesce: bool,
+    stream_queue_size: usize,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
     let mock = MockLlama::start(BACKEND_MODEL).await;
     let td = tempfile::tempdir().expect("tempdir");
@@ -50,7 +67,8 @@ async fn make_state_inner(
         "llama.cpp".to_string(),
         0,
     )
-    .with_coalesce_requests(coalesce);
+    .with_coalesce_requests(coalesce)
+    .with_stream_queue_size(stream_queue_size);
     let client = Arc::new(
         LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
     );
@@ -1086,4 +1104,94 @@ async fn coalesce_new_group_after_completion() {
     let r2 = app.clone().oneshot(post_json(&body)).await.expect("resp");
     assert_eq!(r2.status().as_u16(), 200);
     assert_eq!(mock.state.calls.lock().await.chat_bodies.len(), 2);
+}
+
+#[tokio::test]
+async fn stream_queue_size_one_delivers_full_stream() {
+    // STREAM_QUEUE_SIZE=1: the per-request channel the background reader
+    // pumps SSE bytes through holds a single item, so every send after the
+    // first waits for the consumer (backpressure). The stream must still be
+    // delivered fully, byte-for-byte, and the reader cleanup (save + meta)
+    // must still run.
+    let (state, mock, td) = make_state_stream_queue(2, 1).await;
+    let app = router(state);
+    // stretch the mock stream so the reader keeps the (capacity-1) channel
+    // full while the consumer reads
+    mock.state.set_stream_chunk_delay(Duration::from_millis(30));
+    mock.state.reset_chunks_produced();
+    let body = json!({
+        "model": "m1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "queue size one" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = String::from_utf8(
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("stream body")
+            .to_vec(),
+    )
+    .expect("utf8");
+    assert!(text.contains("Hello"), "stream: {text}");
+    assert!(text.contains("world"), "stream: {text}");
+    assert!(text.ends_with("data: [DONE]\n\n"), "stream: {text}");
+    // all three mock chunks were generated exactly once
+    assert_eq!(mock.state.chunks_produced(), 3);
+    // the reader task ran its cleanup despite the backpressure
+    let key = expected_key("queue size one");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !mock.state.saves().await.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for save"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(mock.state.saves().await, vec![(0usize, key.clone())]);
+    assert!(td.path().join(format!("{key}.meta.json")).exists());
+}
+
+#[tokio::test]
+async fn coalesce_stream_queue_size_one_follower_receives_full_stream() {
+    // The stream-follower path also bridges the leader's bytes through a
+    // channel of STREAM_QUEUE_SIZE capacity. With 1 and a stretched leader
+    // stream, every follower send is backpressured, yet each follower must
+    // still receive the identical full SSE stream and the backend must be
+    // called once for the whole group.
+    let (state, mock, _td) = make_state_coalesce_stream_queue(2, 1).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "stream queue coalesce" }]
+    });
+    // stretch the mock stream so all requests overlap in time
+    mock.state.set_stream_chunk_delay(Duration::from_millis(30));
+    let mut futs = Vec::new();
+    for _ in 0..3 {
+        let app = app.clone();
+        let body = body.clone();
+        futs.push(tokio::spawn(async move {
+            app.oneshot(post_json(&body)).await.expect("resp")
+        }));
+    }
+    let mut streams = Vec::new();
+    for f in futs {
+        let r = f.await.expect("join");
+        assert_eq!(r.status().as_u16(), 200);
+        streams.push(to_bytes(r.into_body(), usize::MAX).await.expect("body"));
+    }
+    // one backend stream for the whole group
+    assert_eq!(mock.state.calls.lock().await.chat_bodies.len(), 1);
+    // every follower received the same full stream, ending with [DONE]
+    for s in &streams[1..] {
+        assert_eq!(&streams[0], s);
+    }
+    let s = String::from_utf8(streams[0].to_vec()).expect("utf8");
+    assert!(s.contains("Hello"), "stream: {s}");
+    assert!(s.ends_with("data: [DONE]\n\n"), "stream: {s}");
 }

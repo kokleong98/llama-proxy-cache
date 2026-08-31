@@ -175,6 +175,7 @@ listening on 0.0.0.0:8081
 | `MODEL_ID`            | `llama.cpp`                | id advertised by `/v1/models` and used as the default `model` field |
 | `PORT`                | `8081`                     | proxy listen port (binds `0.0.0.0`)                 |
 | `LOG_LEVEL`           | `INFO`                     | `TRACE..ERROR`; `RUST_LOG` overrides it             |
+| `STREAM_QUEUE_SIZE`   | `16`                       | capacity of the per-request SSE channel that buffers streamed bytes between the background reader and the HTTP response (must be >= 1; smaller values backpressure the backend faster) |
 | `COALESCE_REQUESTS`   | `false`                    | group concurrent same-cache-key requests into one backend call (Rust-only) |
 
 Every variable also has a command-line flag; explicit flags take
@@ -197,6 +198,7 @@ built-in defaults. `--help` prints the full list with defaults:
 | `--port <PORT>`               | `PORT`              |
 | `--api-key <KEY>`             | `LLAMA_API_KEY`     |
 | `--log-level <LEVEL>`         | `LOG_LEVEL`         |
+| `--stream-queue-size <N>`     | `STREAM_QUEUE_SIZE` |
 | `--coalesce-requests <BOOL>`  | `COALESCE_REQUESTS` |
 
 The cache key is `sha256(backend_model_id + "\n" + prefix)`, where
