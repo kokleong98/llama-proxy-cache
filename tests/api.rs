@@ -45,6 +45,23 @@ async fn make_state_coalesce_stream_queue(
     make_state_inner(n_slots, None, true, stream_queue_size).await
 }
 
+/// Like [`make_state`], but with the built-in keyword prefilter enabled
+/// (`keywords`, case-insensitive).
+async fn make_state_prefilter(
+    n_slots: usize,
+    keywords: &[&str],
+) -> (AppState, MockLlama, tempfile::TempDir) {
+    make_state_inner(n_slots, None, false, Some((keywords, true))).await
+}
+
+/// Like [`make_state_coalesce`], but with the built-in keyword prefilter
+/// enabled (`keywords`, case-insensitive).
+async fn make_state_prefilter_coalesce(
+    keywords: &[&str],
+) -> (AppState, MockLlama, tempfile::TempDir) {
+    make_state_inner(2, None, true, Some((keywords, true))).await
+}
+
 async fn make_state_inner(
     n_slots: usize,
     acquire_timeout: Option<Duration>,
@@ -79,11 +96,13 @@ async fn make_state_inner(
         None => sm,
     };
     let sm = Arc::new(sm);
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     (state, mock, td)
 }
@@ -582,11 +601,13 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
         SlotManager::new(&cfg.backends, clients.clone())
             .with_backend_cooldown(Duration::from_secs(60)),
     );
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -654,11 +675,13 @@ async fn connection_failure_retries_on_other_backend() {
         Arc::clone(&c1) as Arc<dyn LlamaBackend>,
     ];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -722,11 +745,13 @@ async fn probe_recovers_cooled_down_backend() {
         SlotManager::new(&cfg.backends, clients.clone())
             .with_backend_cooldown(Duration::from_secs(60)),
     );
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm: Arc::clone(&sm),
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -803,11 +828,13 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         Arc::clone(&c1) as Arc<dyn LlamaBackend>,
     ];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -858,11 +885,13 @@ async fn prune_removes_oldest_meta_and_kv_files() {
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -1194,4 +1223,213 @@ async fn coalesce_stream_queue_size_one_follower_receives_full_stream() {
     let s = String::from_utf8(streams[0].to_vec()).expect("utf8");
     assert!(s.contains("Hello"), "stream: {s}");
     assert!(s.ends_with("data: [DONE]\n\n"), "stream: {s}");
+}
+// ---------------------------------------------------------------------------
+// Prefilter adapter (accept/reject before any slot/backend work)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn prefilter_rejects_keyword_request_before_backend() {
+    let (state, mock, td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "this is forbidden content" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    let v = read_body(resp).await;
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("forbidden"),
+        "body: {v}"
+    );
+
+    // The request never reached the backend: no chat, no save, no
+    // restore, no meta files.
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+    assert!(calls.saves.is_empty());
+    assert!(calls.restores.is_empty());
+    assert_eq!(std::fs::read_dir(td.path()).expect("read dir").count(), 0);
+}
+
+#[tokio::test]
+async fn prefilter_accepts_clean_request() {
+    let (state, mock, _td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["choices"][0]["message"]["content"], "mock reply");
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+}
+
+#[tokio::test]
+async fn prefilter_is_case_insensitive_by_default() {
+    let (state, mock, _td) = make_state_prefilter(2, &["ForBIDDEN"]).await;
+    let app = router(state);
+    let body = json!({
+        "messages": [{ "role": "user", "content": "say FORBIDDEN please" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+}
+
+#[tokio::test]
+async fn prefilter_inspects_content_part_arrays() {
+    let (state, mock, _td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "part one" },
+                { "type": "image_url", "image_url": "http://x" },
+                { "type": "text", "text": "part two FORBIDDEN" }
+            ]
+        }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+}
+
+#[tokio::test]
+async fn prefilter_rejects_stream_request_with_json_error() {
+    let (state, mock, _td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "forbidden" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    // JSON error, not an SSE stream.
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .expect("content-type")
+        .to_str()
+        .expect("str")
+        .to_string();
+    assert!(
+        ctype.starts_with("application/json"),
+        "content-type: {ctype}"
+    );
+    let v = read_body(resp).await;
+    assert!(v["error"].as_str().unwrap_or("").contains("forbidden"));
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+}
+
+#[tokio::test]
+async fn prefilter_rejects_big_request_without_save_or_meta() {
+    let (state, mock, td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    // > 500 words -> would be "big" (cache_prompt, save, meta) if accepted.
+    let content = format!("{} forbidden {}", words(300), words(300));
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": content }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+    assert!(calls.saves.is_empty());
+    assert!(calls.restores.is_empty());
+    assert_eq!(std::fs::read_dir(td.path()).expect("read dir").count(), 0);
+}
+
+#[tokio::test]
+async fn prefilter_rejects_before_coalescing() {
+    // Coalescing enabled + keyword prefilter: two concurrent same-key
+    // requests are both rejected at the prefilter — no group forms (a
+    // rejected request never leads or joins one) and the backend is
+    // never called.
+    let (state, mock, _td) = make_state_prefilter_coalesce(&["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "forbidden thing" }]
+    });
+    let (r1, r2) = tokio::join!(
+        app.clone().oneshot(post_json(&body)),
+        app.clone().oneshot(post_json(&body)),
+    );
+    assert_eq!(r1.expect("resp").status(), 400);
+    assert_eq!(r2.expect("resp").status(), 400);
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+}
+
+/// A custom prefilter adapter: rejects prompts longer than `max_words`.
+/// Proves the `Prefilter` trait is a working extension point beyond the
+/// built-in keyword filter.
+struct LongPromptFilter {
+    max_words: usize,
+}
+
+#[async_trait::async_trait]
+impl lpcache::prefilter::Prefilter for LongPromptFilter {
+    fn name(&self) -> &str {
+        "long_prompt"
+    }
+
+    async fn check(
+        &self,
+        req: &lpcache::prefilter::PrefilterRequest,
+    ) -> lpcache::prefilter::PrefilterDecision {
+        if req.n_words > self.max_words {
+            lpcache::prefilter::PrefilterDecision::Reject {
+                status: 413,
+                message: format!(
+                    "prompt too long: {} words (max {})",
+                    req.n_words, self.max_words
+                ),
+            }
+        } else {
+            lpcache::prefilter::PrefilterDecision::Accept
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_prefilter_adapter_accepts_and_rejects() {
+    let (mut state, mock, _td) = make_state(2, None).await;
+    state.prefilter = Some(Arc::new(LongPromptFilter { max_words: 5 }));
+    let app = router(state);
+
+    // short prompt -> accepted, reaches the backend
+    let short = json!({
+        "model": "m1",
+        "messages": [{ "role": "user", "content": "hi there" }]
+    });
+    let resp = app.clone().oneshot(post_json(&short)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+
+    // long prompt -> rejected with the adapter's own status/message
+    let long = json!({
+        "model": "m1",
+        "messages": [{ "role": "user", "content": words(50) }]
+    });
+    let resp = app.clone().oneshot(post_json(&long)).await.expect("resp");
+    assert_eq!(resp.status(), 413);
+    let v = read_body(resp).await;
+    assert!(v["error"].as_str().unwrap_or("").contains("too long"));
+
+    // only the accepted (short) request reached the backend
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
 }

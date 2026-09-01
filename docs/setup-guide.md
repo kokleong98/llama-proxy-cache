@@ -12,6 +12,7 @@ client (OpenAI API)                llama.cpp backend(s)
 │ lpcache (this project)                              │
 │  • prefix hashing  • big/small  • LCP restore lookup   │
 │  • slot locks (free-first, then LRU)  • SSE passthrough│
+│  • prefilter accept/reject (optional, PREFILTER_BLOCKLIST) │
 │  • saves KV cache + writes <key>.meta.json            │
 └────────────────────────────────────────────────────────┘
 ```
@@ -285,7 +286,7 @@ Then, with a >500-word prompt in the messages, send the prompt twice
 ```
 
 This is the same flow the test-suite validates; the identical flows are
-covered by `cargo test` (104 tests) against the in-process mock.
+covered by `cargo test` (122 tests) against the in-process mock.
 
 ---
 
@@ -338,6 +339,11 @@ journalctl -u lpcache -f
   cost is O(meta files), so a smaller bound is also faster.
 - **`WORDS_PER_BLOCK`** — changing it orphans existing caches (the restore
   filter skips mismatching `wpb`); only change it before caches are needed.
+- **`PREFILTER_BLOCKLIST`** — optional comma-separated keyword blocklist;
+  matching requests are rejected with `400` before any slot/backend work
+  (no KV cost at all). Matching is a plain case-insensitive substring by
+  default; set `PREFILTER_CASE_INSENSITIVE=false` for exact-case matches.
+  Unset/blank disables the prefilter entirely.
 
 ## 10. Troubleshooting
 
@@ -349,6 +355,7 @@ journalctl -u lpcache -f
 | `restore_before_chat ... ok=false` | The KV `.bin` for that key is missing from `--slot-save-path` (deleted, or a different server/build). The request proceeds without the restore. |
 | No `restore_candidate` on repeated prompts | Prompt below `BIG_THRESHOLD_WORDS` words, `LCP_TH` too high, different model, or different `WORDS_PER_BLOCK` than when the cache was saved. |
 | `422` from the proxy | Malformed JSON body. |
+| `400` `request blocked by keyword prefilter: "..."` | `PREFILTER_BLOCKLIST` matched the request's message contents; the request never reached the backend. Adjust/remove the keyword, or unset `PREFILTER_BLOCKLIST` to disable the prefilter. |
 | `502` `provider non-JSON body` | The backend answered 200 but with a JSON body that is not an object (e.g. an array); the response is unusable. |
 | 200 response with `{"object":"error", ...}` payload | The backend answered 200 with a non-JSON body; the raw snippet is included. |
 | Logs too quiet | `LOG_LEVEL=DEBUG` (or `RUST_LOG=lpcache=debug`). Key lines: `before_acquire`, `after_acquire`, `dispatch`, `restore_candidate`, `restore_before_chat`, `json_done`, `stream_reader_done`. With `COALESCE_REQUESTS` on, also `coalesce_lead`/`coalesce_join`. |

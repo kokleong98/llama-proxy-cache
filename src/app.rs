@@ -17,6 +17,14 @@
 //!     upstream request to llama-server the same way
 //!   - 503 when no slot could be acquired within the 300 s timeout
 //!
+//! Request prefilter (optional): when `PREFILTER_BLOCKLIST` is set,
+//! every request is checked by the prefilter adapter
+//! (`crate::prefilter`) right after body parsing / cache-key
+//! computation and **before** coalescing, slot acquisition and backend
+//! dispatch: rejected requests get an immediate JSON error and never
+//! reach the llama-server backend (no slot, no restore/save, no meta
+//! file, no coalescing group).
+//!
 //! Concurrent-request coalescing (`COALESCE_REQUESTS`): when enabled,
 //! concurrent requests with the same cache key and identical generation
 //! parameters (the request body minus `messages`) form one group; the first
@@ -28,6 +36,7 @@ use crate::coalesce::{Flight, SharedOutcome, SingleFlight};
 use crate::config::Config;
 use crate::hashing;
 use crate::llama_client::{BackendError, JsonChat, LlamaBackend};
+use crate::prefilter::{Prefilter, PrefilterDecision, PrefilterRequest};
 use crate::slot_manager::{AcquireTimeout, GSlot, SlotGuard, SlotManager};
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -51,6 +60,10 @@ pub struct AppState {
     /// In-flight coalesced request groups (active when
     /// `config.coalesce_requests` is enabled).
     pub sf: Arc<SingleFlight>,
+    /// Optional prefilter adapter consulted before any slot/backend work
+    /// (`None` when `PREFILTER_BLOCKLIST` is unset — the default; see the
+    /// `prefilter` module).
+    pub prefilter: Option<Arc<dyn Prefilter>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -103,6 +116,40 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
     let blocks = hashing::block_hashes_from_text(&prefix, state.config.words_per_block);
     let n_words = hashing::words_from_text(&prefix).len();
     let is_big = n_words > state.config.big_threshold_words;
+
+    // Prefilter adapter: accept/reject the request before coalescing,
+    // slot acquisition, or backend dispatch. Rejected requests get an
+    // immediate JSON error and never reach the llama-server backend (no
+    // slot, no restore/save, no meta file, no coalescing group).
+    if let Some(pf) = &state.prefilter {
+        let preq = PrefilterRequest {
+            body: body.clone(),
+            messages: Value::Array(messages.clone()),
+            model: client_model.clone(),
+            backend_model_id: backend_model_id.clone(),
+            stream,
+            key: key.clone(),
+            n_words,
+            is_big,
+        };
+        match pf.check(&preq).await {
+            PrefilterDecision::Accept => {
+                tracing::debug!(
+                    "prefilter_accept filter={} key={}",
+                    pf.name(),
+                    short16(&key)
+                );
+            }
+            PrefilterDecision::Reject { status, message } => {
+                tracing::info!(
+                    "prefilter_reject filter={} key={} status={status} n_words={n_words}",
+                    pf.name(),
+                    short16(&key)
+                );
+                return json_error(status, message);
+            }
+        }
+    }
 
     // Concurrent-request coalescing (`COALESCE_REQUESTS`): concurrent
     // requests with the same cache key share one backend call — the first

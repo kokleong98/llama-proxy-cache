@@ -10,28 +10,39 @@ full prefill cost every time.
 
 ## How it works
 
-1. **Prefix hashing** — the concatenated message contents (roles
+1. **Request prefilter** (optional) — when `PREFILTER_BLOCKLIST` is set,
+   every chat request is checked by a prefilter adapter
+   (`src/prefilter.rs`) right after body parsing and cache-key
+   computation and **before** coalescing, slot acquisition, or backend
+   dispatch. The built-in adapter rejects requests whose message
+   contents contain a blocked keyword (plain substring match,
+   case-insensitive by default, `PREFILTER_CASE_INSENSITIVE`) with a
+   `400` JSON error; the request never reaches llama-server — no slot is
+   acquired, no KV cache is restored or saved, no meta file is written,
+   and the request never leads or joins a coalescing group. Custom
+   accept/reject logic plugs in through the `Prefilter` trait.
+2. **Prefix hashing** — the concatenated message contents (roles
    stripped) are split into words (`\w+`, lowercased), chunked into blocks
    of `WORDS_PER_BLOCK` (default 100) words, and each block is SHA256-hashed.
    The cache key is `sha256(backend_model_id + "\n" + raw_prefix)`.
-2. **Big/small requests** — requests with more than `BIG_THRESHOLD_WORDS`
+3. **Big/small requests** — requests with more than `BIG_THRESHOLD_WORDS`
    (default 500) words are "big": they run with `cache_prompt=true` and
    their KV cache is saved to the backend after completion, with a
    `<key>.meta.json` file (block hashes, model id, wpb, timestamp) written
    to `META_DIR`.
-3. **Restore candidates** — before a big request, the proxy scans the meta
+4. **Restore candidates** — before a big request, the proxy scans the meta
    files and looks for one with the same model and `wpb` whose block list
    shares the longest common prefix; if the LCP ratio is at least `LCP_TH`
    (default 0.1), that cache is restored into the chosen slot *before* the
    chat is dispatched.
-4. **Slot management** — every llama.cpp slot is guarded by a lock
+5. **Slot management** — every llama.cpp slot is guarded by a lock
    The proxy picks a never-used slot first, otherwise the
    least recently used one, waits up to 300 s for it (`503 all slots busy`
    on timeout), and releases it when the response is fully handled.
-5. **Streaming** — SSE responses are passed through byte-for-byte via a
+6. **Streaming** — SSE responses are passed through byte-for-byte via a
    background reader task; the reader's cleanup step always saves the KV
    cache and writes the meta file, then releases the slot.
-6. **Bounded cache** — after each save the proxy keeps at most `META_MAX`
+7. **Bounded cache** — after each save the proxy keeps at most `META_MAX`
    (default 10) meta files: the oldest ones (by last save/restore
    timestamp) are deleted, together with the KV files of the same name in
    the configured `--slot-save-path` directories. `META_MAX=0` disables
@@ -63,13 +74,17 @@ and the query string ((llama.cpp accepts it in several places depending on the b
 | `LOG_LEVEL`         | `INFO`              | log level (`RUST_LOG` overrides it)            |
 | `STREAM_QUEUE_SIZE` | `16`                | per-request SSE channel capacity (must be >= 1) |
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
+| `PREFILTER_BLOCKLIST` | —                 | comma-separated keywords; requests whose message contents contain any are rejected with `400` before the backend (default: no prefilter) |
+| `PREFILTER_CASE_INSENSITIVE` | `true`     | keyword matching is case-insensitive           |
 
 Every variable is also available as a command-line flag (see
 `./target/release/lpcache --help`): `--backends`, `--llama-url`,
 `--n-slots`, `--words-per-block`, `--big-threshold-words`, `--lcp-th`,
 `--meta-dir`, `--meta-max`, `--slot-save-path`, `--request-timeout`,
 `--model-id`, `--port`, `--api-key` (→ `LLAMA_API_KEY`), `--log-level`,
-`--stream-queue-size`, `--coalesce-requests`.
+`--stream-queue-size`,
+`--coalesce-requests`, `--prefilter-blocklist` (→ `PREFILTER_BLOCKLIST`),
+`--prefilter-case-insensitive` (→ `PREFILTER_CASE_INSENSITIVE`).
 `-h`/`--help` shows the full help; `-V`/`--version` prints the proxy version
 (also logged in the `app_start` line at startup).
 Explicit flags take precedence over environment variables, which take
@@ -140,6 +155,26 @@ cargo test
   of a cooled-down backend, failing-slot non-pinning, LRU meta+KV pruning,
   streaming with a minimal `STREAM_QUEUE_SIZE` on the leader and
   coalesced-follower paths).
+- **Unit tests** (76): config parsing/defaults (incl. `META_MAX` /
+  `SLOT_SAVE_PATH` / `PREFILTER_*`), raw-prefix construction, word
+  tokenization, block hashing, LCP, SHA256 vectors, meta file round-trips,
+  candidate filtering/thresholds, LRU pruning, slot selection (free/oldest
+  ordering, idle-aware, multi-backend, circuit breaker, escalating
+  backoff, success/probe recovery, retry slot exclusion), per-slot locking,
+  acquire timeout, save semantics, prefilter adapter (keyword matching,
+  case sensitivity, content-part arrays, comma-list parsing, trait
+  dispatch).
+- **Integration tests** (46): `LlamaClient` against the mock backend
+  (slot pinning in body/options/query, save/restore status codes, JSON vs
+  non-JSON provider answers, streaming), and end-to-end proxy behaviour
+  (small vs big requests, meta file creation, restore on the second big
+  request, SSE passthrough, provider error mapping, 422 on bad JSON, dead
+  backend failover, transparent retry on connection failure, probe recovery
+  of a cooled-down backend, failing-slot non-pinning, LRU meta+KV pruning,
+  prefilter accept/reject before the backend — keyword reject with zero
+  backend calls, case-insensitive matching, content-part inspection,
+  stream/big-request rejection, reject-before-coalescing, custom
+  `Prefilter` adapter).
 
 `cargo clippy --all-targets` and `cargo fmt --check` are clean.
 

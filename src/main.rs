@@ -55,11 +55,22 @@ async fn main() {
     }
 
     let sm = Arc::new(SlotManager::new(&config.backends, clients.clone()));
+    // Optional prefilter adapter (PREFILTER_BLOCKLIST): rejects matching
+    // requests before any slot/backend work.
+    let prefilter = config.prefilter();
+    if let Some(pf) = &prefilter {
+        tracing::info!(
+            "prefilter enabled: filter={} keywords={}",
+            pf.name(),
+            config.prefilter_blocklist.len()
+        );
+    }
     let state = AppState {
         config: Arc::new(config.clone()),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
 
     // Warn early if a configured --slot-save-path dir is missing: pruning
