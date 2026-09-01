@@ -198,7 +198,7 @@ impl Config {
         self.stream_queue_size = size.max(1);
         self
     }
-    
+
     /// Override the prefilter blocklist (`PREFILTER_BLOCKLIST`).
     pub fn with_prefilter_blocklist(mut self, keywords: Vec<String>) -> Self {
         self.prefilter_blocklist = keywords;

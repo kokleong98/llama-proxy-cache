@@ -26,11 +26,11 @@
 //! file, no coalescing group).
 //!
 //! Concurrent-request coalescing (`COALESCE_REQUESTS`): when enabled,
-//! concurrent requests with the same cache key and identical generation
-//! parameters (the request body minus `messages`) form one group; the first
-//! request ("leader") runs the pipeline above and every other request
-//! ("follower") waits for the leader and receives its result. Followers
-//! never touch slots, backends or meta files. See the `coalesce` module.
+//! concurrent requests with the same cache key form one group regardless
+//! of generation parameters; the first request ("leader") runs the
+//! pipeline above and every other request ("follower") waits for the
+//! leader and receives its result. Followers never touch slots, backends
+//! or meta files. See the `coalesce` module.
 
 use crate::coalesce::{Flight, SharedOutcome, SingleFlight};
 use crate::config::Config;
@@ -577,7 +577,8 @@ async fn run_pipeline(
                     let save_ok = if is_big {
                         match save_big(state, g, key, prefix, blocks, backend_model_id).await {
                             Ok(ok) => ok,
-                            Err((resp, o)) => {
+                            Err(b) => {
+                                let (resp, o) = *b;
                                 state.sm.release(guard);
                                 return (resp, Some(o));
                             }
@@ -602,7 +603,8 @@ async fn run_pipeline(
                     let save_ok = if is_big {
                         match save_big(state, g, key, prefix, blocks, backend_model_id).await {
                             Ok(ok) => ok,
-                            Err((resp, o)) => {
+                            Err(b) => {
+                                let (resp, o) = *b;
                                 state.sm.release(guard);
                                 return (resp, Some(o));
                             }
@@ -766,7 +768,7 @@ async fn save_big(
     prefix: &str,
     blocks: &[String],
     backend_model_id: &str,
-) -> Result<bool, (Response, SharedOutcome)> {
+) -> Result<bool, Box<(Response, SharedOutcome)>> {
     let ok = state.sm.save_after(g, key).await.map_err(|e| {
         if matches!(e, BackendError::Other(_)) {
             tracing::warn!("save_error g={g} key={}: {e}", short16(key));
@@ -774,10 +776,10 @@ async fn save_big(
         }
         state.sm.mark_used(g);
         let msg = e.to_string();
-        (
+        Box::new((
             json_error(500, msg.clone()),
             SharedOutcome::Json(500, json!({ "error": msg })),
-        )
+        ))
     })?;
     hashing::write_meta(
         &state.config.meta_dir,
@@ -789,10 +791,10 @@ async fn save_big(
     )
     .map_err(|e| {
         let msg = e.to_string();
-        (
+        Box::new((
             json_error(500, msg.clone()),
             SharedOutcome::Json(500, json!({ "error": msg })),
-        )
+        ))
     })?;
     prune_cache(&state.config);
     Ok(ok)

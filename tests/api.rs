@@ -21,12 +21,19 @@ async fn make_state(
     n_slots: usize,
     acquire_timeout: Option<Duration>,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, acquire_timeout, false, DEFAULT_STREAM_QUEUE_SIZE).await
+    make_state_inner(
+        n_slots,
+        acquire_timeout,
+        false,
+        DEFAULT_STREAM_QUEUE_SIZE,
+        None,
+    )
+    .await
 }
 
 /// Like [`make_state`], but with concurrent-request coalescing enabled.
 async fn make_state_coalesce(n_slots: usize) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, true, DEFAULT_STREAM_QUEUE_SIZE).await
+    make_state_inner(n_slots, None, true, DEFAULT_STREAM_QUEUE_SIZE, None).await
 }
 
 /// Like [`make_state`], but with a custom `STREAM_QUEUE_SIZE`.
@@ -34,7 +41,7 @@ async fn make_state_stream_queue(
     n_slots: usize,
     stream_queue_size: usize,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, false, stream_queue_size).await
+    make_state_inner(n_slots, None, false, stream_queue_size, None).await
 }
 
 /// Like [`make_state_coalesce`], but with a custom `STREAM_QUEUE_SIZE`.
@@ -42,7 +49,7 @@ async fn make_state_coalesce_stream_queue(
     n_slots: usize,
     stream_queue_size: usize,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, true, stream_queue_size).await
+    make_state_inner(n_slots, None, true, stream_queue_size, None).await
 }
 
 /// Like [`make_state`], but with the built-in keyword prefilter enabled
@@ -51,7 +58,14 @@ async fn make_state_prefilter(
     n_slots: usize,
     keywords: &[&str],
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, false, Some((keywords, true))).await
+    make_state_inner(
+        n_slots,
+        None,
+        false,
+        DEFAULT_STREAM_QUEUE_SIZE,
+        Some((keywords, true)),
+    )
+    .await
 }
 
 /// Like [`make_state_coalesce`], but with the built-in keyword prefilter
@@ -59,7 +73,14 @@ async fn make_state_prefilter(
 async fn make_state_prefilter_coalesce(
     keywords: &[&str],
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(2, None, true, Some((keywords, true))).await
+    make_state_inner(
+        2,
+        None,
+        true,
+        DEFAULT_STREAM_QUEUE_SIZE,
+        Some((keywords, true)),
+    )
+    .await
 }
 
 async fn make_state_inner(
@@ -67,10 +88,11 @@ async fn make_state_inner(
     acquire_timeout: Option<Duration>,
     coalesce: bool,
     stream_queue_size: usize,
+    prefilter: Option<(&[&str], bool)>,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
     let mock = MockLlama::start(BACKEND_MODEL).await;
     let td = tempfile::tempdir().expect("tempdir");
-    let cfg = Config::new(
+    let mut cfg = Config::new(
         vec![BackendConf {
             url: mock.url(),
             n_slots,
@@ -86,6 +108,11 @@ async fn make_state_inner(
     )
     .with_coalesce_requests(coalesce)
     .with_stream_queue_size(stream_queue_size);
+    if let Some((keywords, case_insensitive)) = prefilter {
+        cfg = cfg
+            .with_prefilter_blocklist(keywords.iter().map(ToString::to_string).collect())
+            .with_prefilter_case_insensitive(case_insensitive);
+    }
     let client = Arc::new(
         LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
     );

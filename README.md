@@ -53,7 +53,7 @@ full prefill cost every time.
 
 Rust 2024, `axum` 0.8 + `tokio` + `reqwest` (rustls) + `serde` + `sha2` +
 `tracing`. The slot pin is duplicated in the request body root, `options`
-and the query string ((llama.cpp accepts it in several places depending on the build).
+and the query string (llama.cpp accepts it in several places depending on the build).
 
 ## Configuration
 
@@ -71,6 +71,7 @@ and the query string ((llama.cpp accepts it in several places depending on the b
 | `REQUEST_TIMEOUT`   | `600` (s)           | per-request timeout to the backend             |
 | `MODEL_ID`          | `llama.cpp`         | model id advertised by `/v1/models` and used as default |
 | `PORT`              | `8081`              | proxy listen port (0.0.0.0)                    |
+| `LLAMA_API_KEY`     | —                   | sent to the backend as `Authorization: Bearer <KEY>` (blank = no auth) |
 | `LOG_LEVEL`         | `INFO`              | log level (`RUST_LOG` overrides it)            |
 | `STREAM_QUEUE_SIZE` | `16`                | per-request SSE channel capacity (must be >= 1) |
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
@@ -139,23 +140,7 @@ words appended — the second request logs
 cargo test
 ```
 
-- **Unit tests** (67): config parsing/defaults (incl. `META_MAX` /
-  `SLOT_SAVE_PATH` / `STREAM_QUEUE_SIZE`, CLI-over-env precedence), raw-prefix
-  construction, word tokenization, block hashing, LCP, SHA256 vectors, meta
-  file round-trips, candidate filtering/thresholds, LRU pruning, slot
-  selection (free/oldest ordering, idle-aware, multi-backend, circuit
-  breaker, escalating backoff, success/probe recovery, retry slot
-  exclusion), per-slot locking, acquire timeout, save semantics.
-- **Integration tests** (40): `LlamaClient` against the mock backend
-  (slot pinning in body/options/query, save/restore status codes, JSON vs
-  non-JSON provider answers, streaming), and end-to-end proxy behaviour
-  (small vs big requests, meta file creation, restore on the second big
-  request, SSE passthrough, provider error mapping, 422 on bad JSON, dead
-  backend failover, transparent retry on connection failure, probe recovery
-  of a cooled-down backend, failing-slot non-pinning, LRU meta+KV pruning,
-  streaming with a minimal `STREAM_QUEUE_SIZE` on the leader and
-  coalesced-follower paths).
-- **Unit tests** (76): config parsing/defaults (incl. `META_MAX` /
+- **Unit tests** (77): config parsing/defaults (incl. `META_MAX` /
   `SLOT_SAVE_PATH` / `PREFILTER_*`), raw-prefix construction, word
   tokenization, block hashing, LCP, SHA256 vectors, meta file round-trips,
   candidate filtering/thresholds, LRU pruning, slot selection (free/oldest
@@ -164,7 +149,7 @@ cargo test
   acquire timeout, save semantics, prefilter adapter (keyword matching,
   case sensitivity, content-part arrays, comma-list parsing, trait
   dispatch).
-- **Integration tests** (46): `LlamaClient` against the mock backend
+- **Integration tests** (48): `LlamaClient` against the mock backend
   (slot pinning in body/options/query, save/restore status codes, JSON vs
   non-JSON provider answers, streaming), and end-to-end proxy behaviour
   (small vs big requests, meta file creation, restore on the second big

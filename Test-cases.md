@@ -4,27 +4,27 @@ Complete catalog of the **lpcache** regression suite (KV-cache-aware,
 OpenAI-compatible proxy for llama.cpp). Every entry maps 1:1 to a test
 function; the full suite runs with `cargo test`.
 
-**Total: 122 test cases** — 76 unit + 31 API integration + 15 client
+**Total: 125 test cases** — 77 unit + 33 API integration + 15 client
 integration.
 
 | # | Suite | Location | Tests |
 |---|-------|----------|-------|
-| 1 | Configuration (env vars, CLI, precedence) | `src/config.rs` | 24 |
+| 1 | Configuration (env vars, CLI, precedence) | `src/config.rs` | 25 |
 | 2 | Request prefilter adapter | `src/prefilter.rs` | 9 |
 | 3 | Hashing, meta files, pruning | `src/hashing.rs` | 19 |
 | 4 | Request coalescing (`SingleFlight`) | `src/coalesce.rs` | 4 |
 | 5 | Backend client — slot pinning | `src/llama_client.rs` | 3 |
 | 6 | Slot management (selection, locks, breaker) | `src/slot_manager.rs` | 17 |
-| 7 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 31 |
+| 7 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 33 |
 | 8 | Backend client — HTTP behavior | `tests/client.rs` | 15 |
 
 ## How to run
 
 ```sh
 cd lpcache
-cargo test                    # full regression suite (122 tests, ~4 s)
-cargo test --lib              # 76 unit tests only
-cargo test --test api         # 31 API integration tests
+cargo test                    # full regression suite (125 tests, ~4 s)
+cargo test --lib              # 77 unit tests only
+cargo test --test api         # 33 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test <name-substring>   # run a single test by name filter
 cargo clippy --all-targets    # lint gate (expected: 0 warnings)
@@ -34,7 +34,7 @@ Integration tests start `MockLlama` — an in-process mock of the llama.cpp
 server (`src/mock_backend.rs`) on free localhost ports — so the suite needs
 no real `llama-server`, model files, or network access.
 
-## 1. Configuration — `src/config.rs` (24)
+## 1. Configuration — `src/config.rs` (25)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -57,14 +57,12 @@ no real `llama-server`, model files, or network access.
 | 17 | `cli_help_flags` | `--help` / `-h`, also among other options | `help` flag set |
 | 18 | `cli_version_flags` | `--version` / `-V`, also among other options | `version` flag set |
 | 19 | `version_string_is_crate_name_and_version` | `version_string()` output | starts with `lpcache `, ends with the crate version |
-| 20 | `cli_usage_lists_all_flags_and_env_vars` | completeness of `--help` text | all 17 flags and 15 env vars listed |
+| 20 | `cli_usage_lists_all_flags_and_env_vars` | completeness of `--help` text | all 20 flags and 18 env vars listed |
 | 21 | `coalesce_requests_flag` | `COALESCE_REQUESTS` env + CLI | off by default; `true`/`1` on; `0`/invalid off; CLI overrides env |
 | 22 | `stream_queue_size_env_and_cli` | `STREAM_QUEUE_SIZE` env + CLI | default 16; env `64` applied; `0` / invalid → default; CLI `--stream-queue-size 8` overrides env; builder clamps below 1 to 1 |
-| 23 | `config_precedence_cli_over_env_over_defaults` | CLI > env > default (merged env map **and** final Config) | CLI overrides; env applies to unset flags; unset flags add nothing; default otherwise |
-| 24 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
-| 25 | `config_precedence_cli_over_env_over_defaults` | CLI > env > default (merged env map **and** final Config) | CLI overrides; env applies to unset flags; unset flags add nothing; default otherwise |
-| 26 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
-| 27 | `prefilter_env_and_cli` | `PREFILTER_BLOCKLIST` / `PREFILTER_CASE_INSENSITIVE` env + CLI | default disabled (empty list, case-insensitive); comma list trimmed with empty entries dropped; blank list = disabled; invalid bool → default; CLI wins over env |
+| 23 | `prefilter_env_and_cli` | `PREFILTER_BLOCKLIST` / `PREFILTER_CASE_INSENSITIVE` env + CLI | default disabled (empty list, case-insensitive); comma list trimmed with empty entries dropped; blank list = disabled; invalid bool → default; CLI wins over env |
+| 24 | `config_precedence_cli_over_env_over_defaults` | CLI > env > default (merged env map **and** final Config) | CLI overrides; env applies to unset flags; unset flags add nothing; default otherwise |
+| 25 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
 
 ## 2. Request prefilter adapter — `src/prefilter.rs` (9)
 
@@ -107,7 +105,7 @@ The accept/reject adapter consulted before any slot/backend work (see the
 | 18 | `prune_meta_noop_under_limit_and_zero_max` | under limit / `max=0` / missing dir | nothing pruned, no error |
 | 19 | `prune_meta_corrupt_file_pruned_first` | unparseable meta among healthy ones | treated as oldest, removed first |
 
-## 3. Request coalescing — `src/coalesce.rs` (4)
+## 4. Request coalescing — `src/coalesce.rs` (4)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -149,7 +147,7 @@ save/restore semantics and the backend circuit breaker.
 | 16 | `probe_down_backends_recovers_up_backend` | probe recovery | one probe round recovers a live backend; healthy backends not counted |
 | 17 | `acquire_excluding_picks_other_backend` | retry on a different backend | exclude be0 → be1 slot 0; single backend → fast error (no 300 s wait) |
 
-## 7. API end-to-end — `tests/api.rs` (31)
+## 7. API end-to-end — `tests/api.rs` (33)
 
 The real proxy router (axum) in front of `MockLlama`, which records every
 chat body/query, restore and save. Default setup: 1 backend, 2 slots,
@@ -238,7 +236,7 @@ client-disconnect behaviour.
 | Request prefilter adapter (Rust-only feature) | 9 unit + 8 E2E prefilter tests |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 
-**Suite health (2026-08-31).** 122/122 passing, clippy clean, ~4 s wall
+**Suite health (2026-08-31).** 125/125 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
 On 2026-08-31 the configurable `STREAM_QUEUE_SIZE` (env var +
 `--stream-queue-size` flag) added three cases: `stream_queue_size_env_and_cli`

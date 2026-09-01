@@ -155,7 +155,7 @@ Expected startup logs:
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
 slot_manager n_backends=2 total_slots=6
-app_start version=0.1.0 n_backends=2 port=8081 meta_max=10
+app_start version=0.1.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
 
@@ -286,7 +286,7 @@ Then, with a >500-word prompt in the messages, send the prompt twice
 ```
 
 This is the same flow the test-suite validates; the identical flows are
-covered by `cargo test` (122 tests) against the in-process mock.
+covered by `cargo test` (125 tests) against the in-process mock.
 
 ---
 
