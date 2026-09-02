@@ -155,7 +155,7 @@ Expected startup logs:
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
 slot_manager n_backends=2 total_slots=6
-app_start version=0.1.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
+app_start version=0.2.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
 
