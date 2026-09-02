@@ -149,14 +149,18 @@ cargo test
   acquire timeout, save semantics, prefilter adapter (keyword matching,
   case sensitivity, content-part arrays, comma-list parsing, trait
   dispatch).
-- **Integration tests** (48): `LlamaClient` against the mock backend
+- **Integration tests** (52): `LlamaClient` against the mock backend
   (slot pinning in body/options/query, save/restore status codes, JSON vs
   non-JSON provider answers, streaming), and end-to-end proxy behaviour
   (small vs big requests, meta file creation, restore on the second big
   request, SSE passthrough, provider error mapping, 422 on bad JSON, dead
   backend failover, transparent retry on connection failure, probe recovery
   of a cooled-down backend, failing-slot non-pinning, LRU meta+KV pruning,
-  prefilter accept/reject before the backend — keyword reject with zero
+  restore of surviving entries after a prune with graceful fallback for
+  pruned keys, LRU timestamp bump on successful restore, stale-meta
+  cleanup after a rejected restore (KV file gone from all slot-save
+  dirs), prefilter
+  accept/reject before the backend — keyword reject with zero
   backend calls, case-insensitive matching, content-part inspection,
   stream/big-request rejection, reject-before-coalescing, custom
   `Prefilter` adapter).

@@ -4,7 +4,7 @@ Complete catalog of the **lpcache** regression suite (KV-cache-aware,
 OpenAI-compatible proxy for llama.cpp). Every entry maps 1:1 to a test
 function; the full suite runs with `cargo test`.
 
-**Total: 125 test cases** — 77 unit + 33 API integration + 15 client
+**Total: 129 test cases** — 77 unit + 37 API integration + 15 client
 integration.
 
 | # | Suite | Location | Tests |
@@ -22,9 +22,9 @@ integration.
 
 ```sh
 cd lpcache
-cargo test                    # full regression suite (125 tests, ~4 s)
+cargo test                    # full regression suite (129 tests, ~4 s)
 cargo test --lib              # 77 unit tests only
-cargo test --test api         # 33 API integration tests
+cargo test --test api         # 37 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test <name-substring>   # run a single test by name filter
 cargo clippy --all-targets    # lint gate (expected: 0 warnings)
@@ -147,7 +147,7 @@ save/restore semantics and the backend circuit breaker.
 | 16 | `probe_down_backends_recovers_up_backend` | probe recovery | one probe round recovers a live backend; healthy backends not counted |
 | 17 | `acquire_excluding_picks_other_backend` | retry on a different backend | exclude be0 → be1 slot 0; single backend → fast error (no 300 s wait) |
 
-## 7. API end-to-end — `tests/api.rs` (33)
+## 7. API end-to-end — `tests/api.rs` (37)
 
 The real proxy router (axum) in front of `MockLlama`, which records every
 chat body/query, restore and save. Default setup: 1 backend, 2 slots,
@@ -190,6 +190,10 @@ behaviour requires a real connection).
 | 31 | `prefilter_rejects_big_request_without_save_or_meta` | 600-word prompt containing a keyword | 400; no save, no restore, no meta file |
 | 32 | `prefilter_rejects_before_coalescing` | coalescing on; 2 concurrent same-key blocked requests | both 400 immediately; no group forms; no backend call |
 | 33 | `custom_prefilter_adapter_accepts_and_rejects` | custom `Prefilter` trait impl (rejects >5-word prompts with 413) | short prompt 200 (1 backend call); long prompt 413 with the adapter's own status/message |
+| 34 | `restore_works_after_prune_and_pruned_key_falls_back` | `META_MAX=2`; 3 saves (prunes A); then B+tail; then A again | B (a surviving entry) is still restored after the prune (ratio 5/6); pruned A gets **no** restore (full prefill), still 200, and is re-saved; bound stays at 2 |
+| 35 | `restore_touches_lru_timestamp_so_prune_keeps_hot_entry` | `META_MAX=2`; saves A, B, C (prunes A); then B+tail restores B and saves B' | the successful restore bumps B's LRU timestamp → B's own post-save prune evicts C (the true oldest), not the just-restored B |
+| 36 | `restore_rejected_cleans_up_stale_meta` | save A (KV created); delete A's KV; mock restore → 400; A+tail; A+tail again; delete KV; A+tail2 | 400 with the KV absent from every slot-save dir → stale meta removed (`stale_meta_removed`); 400 with the KV still present → meta **kept** (may be transient); final request saves a fresh entry |
+| 37 | `restore_rejected_keeps_meta_when_save_dir_unvisible` | configured slot-save dir does not exist on the proxy's host; mock restore → 400 | absence of the KV file can't be verified (remote backend) → meta kept (status quo) |
 
 ## 8. Backend client — HTTP behavior — `tests/client.rs` (15)
 
@@ -211,7 +215,7 @@ tests capture the raw request on a one-shot TCP server.
 | 11 | `chat_stream_chunks` | 200 SSE stream | chunks contain Hello, world, `[DONE]` |
 | 12 | `chat_stream_error_status` | 500 stream | `StreamChat { status: 500 }` + error body passes through |
 | 13 | `save_slot_statuses` | `POST /slot/{id}/save` | 200 → `true`, 500 → `false`, 404 → `Err(HttpStatus)`; calls recorded in order |
-| 14 | `restore_slot_statuses` | `POST /slot/{id}/restore` | 200 → `true`, 500 → `false` (no error); calls recorded |
+| 14 | `restore_slot_statuses` | `POST /slot/{id}/restore` | 200 → `Restored`, 400 → `Rejected`, 500 → `Failed` (no error); calls recorded |
 | 15 | `base_url_trailing_slash_normalized` | backend URL with a trailing `/` | works — model id resolved |
 
 ## Coverage notes
@@ -236,7 +240,7 @@ client-disconnect behaviour.
 | Request prefilter adapter (Rust-only feature) | 9 unit + 8 E2E prefilter tests |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 
-**Suite health (2026-08-31).** 125/125 passing, clippy clean, ~4 s wall
+**Suite health (2026-09-02).** 129/129 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
 On 2026-08-31 the configurable `STREAM_QUEUE_SIZE` (env var +
 `--stream-queue-size` flag) added three cases: `stream_queue_size_env_and_cli`

@@ -11,6 +11,7 @@ use lpcache::slot_manager::SlotManager;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -956,6 +957,221 @@ async fn prune_removes_oldest_meta_and_kv_files() {
     }
 }
 
+#[tokio::test]
+async fn restore_works_after_prune_and_pruned_key_falls_back() {
+    // META_MAX=2: after three distinct saves the oldest entry (A) is
+    // pruned (meta AND KV file). Then verify that:
+    //   (a) a request matching a *surviving* entry (B) is still restored
+    //       (restore keeps working after a prune operation), and
+    //   (b) a request matching the *pruned* entry (A) is not restored
+    //       (its meta is gone -> full prefill) but is re-saved afterwards.
+    let kv = tempfile::tempdir().expect("kv dir");
+    let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv.path()).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_meta_max(2);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+    };
+    let app = router(state);
+
+    // three distinct "big" requests (first blocks differ -> no restores);
+    // after the 3rd save META_MAX=2 prunes the oldest entry (A)
+    let pa = format!("promptA {}", words(518));
+    let pb = format!("promptB {}", words(518));
+    let pc = format!("promptC {}", words(518));
+    for p in [&pa, &pb, &pc] {
+        let body = json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{ "role": "user", "content": p }]
+        });
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+        // keep the LRU order deterministic (same pattern as
+        // prune_removes_oldest_meta_and_kv_files)
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let key_a = expected_key(&pa);
+    let key_b = expected_key(&pb);
+    assert!(
+        !td.path().join(format!("{key_a}.meta.json")).exists(),
+        "A must be pruned after the 3rd save"
+    );
+    assert!(td.path().join(format!("{key_b}.meta.json")).exists());
+    assert!(!kv.path().join(&key_a).exists());
+    assert!(kv.path().join(&key_b).exists());
+
+    // (a) the surviving entry B is still restorable after the prune:
+    // B + a short tail -> LCP ratio 5/6 >= 0.6 -> restore key_b
+    let pb_tail = format!("{pb} tail x y z");
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": pb_tail }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    let calls = mock.state.calls.lock().await;
+    assert_eq!(calls.restores, vec![(1usize, key_b.clone())]);
+    drop(calls);
+    // the post-save prune kept the bound at META_MAX
+    let n_meta = std::fs::read_dir(td.path())
+        .expect("read meta dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
+        .count();
+    assert!(n_meta <= 2, "meta bound exceeded: {n_meta}");
+
+    // (b) the pruned entry A: no meta -> no restore candidate -> full
+    // prefill; the response is still 200 and A is re-saved (meta + KV
+    // come back, and the prune keeps the bound at META_MAX)
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": pa }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    let calls = mock.state.calls.lock().await;
+    // no new restore happened for the pruned key A
+    assert_eq!(calls.restores, vec![(1usize, key_b)]);
+    drop(calls);
+    assert!(
+        td.path().join(format!("{key_a}.meta.json")).exists(),
+        "A must be re-saved after the fallback prefill"
+    );
+    assert!(kv.path().join(&key_a).exists());
+    let n_meta = std::fs::read_dir(td.path())
+        .expect("read meta dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
+        .count();
+    assert_eq!(n_meta, 2, "bound must hold after the re-save");
+}
+
+#[tokio::test]
+async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
+    // META_MAX=2: saves A, B, C prune A. Then B+tail restores B and saves
+    // the new key B'. The successful restore must bump B's LRU timestamp
+    // (README: pruning is by last save/restore time), so B's own post-save
+    // prune evicts C — the true oldest — and NOT the just-restored B.
+    // (Without the touch, B — the oldest by last *save* — would be evicted
+    // by the very request that just restored it.)
+    let kv = tempfile::tempdir().expect("kv dir");
+    let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv.path()).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_meta_max(2);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+    };
+    let app = router(state);
+
+    // three distinct "big" requests; after the 3rd save A is pruned
+    let pa = format!("promptA {}", words(518));
+    let pb = format!("promptB {}", words(518));
+    let pc = format!("promptC {}", words(518));
+    for p in [&pa, &pb, &pc] {
+        let body = json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{ "role": "user", "content": p }]
+        });
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+        // keep the LRU order deterministic (same pattern as
+        // prune_removes_oldest_meta_and_kv_files)
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let key_a = expected_key(&pa);
+    let key_b = expected_key(&pb);
+    let key_c = expected_key(&pc);
+    assert!(!td.path().join(format!("{key_a}.meta.json")).exists());
+
+    // B + a short tail -> restores B (ratio 5/6) and saves new key B'
+    let pb_tail = format!("{pb} tail x y z");
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": pb_tail }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert_eq!(
+        mock.state.calls.lock().await.restores,
+        vec![(1usize, key_b.clone())]
+    );
+
+    // the restore bumped B's timestamp -> the post-save prune evicts C
+    // (the true oldest) and the just-restored B survives
+    assert!(
+        td.path().join(format!("{key_b}.meta.json")).exists(),
+        "a just-restored entry must survive its own post-save prune"
+    );
+    assert!(
+        !td.path().join(format!("{key_c}.meta.json")).exists(),
+        "the true oldest entry (C) must be pruned instead"
+    );
+    let n_meta = std::fs::read_dir(td.path())
+        .expect("read meta dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
+        .count();
+    assert_eq!(n_meta, 2, "bound must hold");
+}
+
 // ---------------------------------------------------------------------------
 // Concurrent-request coalescing (COALESCE_REQUESTS)
 // ---------------------------------------------------------------------------
@@ -1459,4 +1675,181 @@ async fn custom_prefilter_adapter_accepts_and_rejects() {
 
     // only the accepted (short) request reached the backend
     assert_eq!(mock.state.chat_bodies().await.len(), 1);
+}
+
+/// State with a mock that emulates `--slot-save-path` (successful saves
+/// create a KV file) and an explicit META_MAX.
+async fn make_state_with_save_dir(
+    kv: &std::path::Path,
+    meta_max: usize,
+) -> (AppState, MockLlama, tempfile::TempDir) {
+    let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some(kv.to_string_lossy().into_owned()),
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_meta_max(meta_max);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+    };
+    (state, mock, td)
+}
+
+#[tokio::test]
+async fn restore_rejected_cleans_up_stale_meta() {
+    // Orphaned meta: the KV file is gone from `--slot-save-path` but the
+    // meta entry survived (e.g. manual cleanup). A matching request gets a
+    // *rejected* restore (400) and falls back to full prefill. The proxy
+    // must then remove the stale meta so later requests stop retrying a
+    // doomed restore — but only when the KV file is verifiably absent
+    // from every configured slot-save dir (a 400 with the file still
+    // present may be transient, e.g. "no available space in KV cache").
+    let kv = tempfile::tempdir().expect("kv dir");
+    let (state, mock, td) = make_state_with_save_dir(kv.path(), 0).await; // 0 = unlimited
+    let app = router(state);
+
+    let prefix = format!("prompt {}", words(518));
+    let key1 = expected_key(&prefix);
+    let tail = format!("{prefix} tail words");
+    let key2 = expected_key(&tail);
+
+    // 1) save key1 (the mock creates its KV file)
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": prefix }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(td.path().join(format!("{key1}.meta.json")).exists());
+    assert!(kv.path().join(&key1).exists());
+
+    // 2) orphan key1's meta and make the backend reject restores
+    std::fs::remove_file(kv.path().join(&key1)).expect("rm kv");
+    mock.state.restore_status.store(400, Ordering::SeqCst);
+
+    // 3) matching request: rejected restore -> full prefill -> key2 saved;
+    //    the cleanup must remove key1's stale meta (KV absent everywhere)
+    let body2 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": tail }]
+    });
+    let resp = app.clone().oneshot(post_json(&body2)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        !td.path().join(format!("{key1}.meta.json")).exists(),
+        "stale meta must be removed after a rejected restore"
+    );
+    assert!(td.path().join(format!("{key2}.meta.json")).exists());
+    assert!(kv.path().join(&key2).exists());
+
+    // 4) same request again: key2's restore is rejected too, but its KV
+    //    file still exists -> the meta must be KEPT
+    let resp = app.clone().oneshot(post_json(&body2)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        td.path().join(format!("{key2}.meta.json")).exists(),
+        "meta with a present KV file must be kept on a rejected restore"
+    );
+
+    // 5) orphan key2 as well: a *different* prompt matching key2 triggers
+    //    the cleanup, which removes key2's stale meta (the request itself
+    //    then saves a fresh entry, key3)
+    std::fs::remove_file(kv.path().join(&key2)).expect("rm kv");
+    let tail3 = format!("{tail} more words");
+    let key3 = expected_key(&tail3);
+    let body3 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": tail3 }]
+    });
+    let resp = app.clone().oneshot(post_json(&body3)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(!td.path().join(format!("{key2}.meta.json")).exists());
+    assert!(td.path().join(format!("{key3}.meta.json")).exists());
+}
+
+#[tokio::test]
+async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
+    // When the configured slot-save dir is not visible from the proxy's
+    // host (e.g. a remote backend), a rejected restore can't be verified
+    // as "file gone" -> the meta must be kept (status quo).
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some("/nonexistent/lpcache-unvisible-dir".to_string()),
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_meta_max(0); // 0 = unlimited
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+    };
+    let app = router(state);
+
+    let prefix = format!("prompt {}", words(518));
+    let key1 = expected_key(&prefix);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": prefix }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(td.path().join(format!("{key1}.meta.json")).exists());
+
+    mock.state.restore_status.store(400, Ordering::SeqCst);
+    let tail = format!("{prefix} tail words");
+    let body2 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": tail }]
+    });
+    let resp = app.clone().oneshot(post_json(&body2)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        td.path().join(format!("{key1}.meta.json")).exists(),
+        "meta must be kept when the slot-save dir is not visible locally"
+    );
 }

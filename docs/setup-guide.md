@@ -242,7 +242,7 @@ json_done g=(0, 0) key=... saved=true is_big=true dur_ms=...
 
 # second request (shared prefix):
 restore_candidate basename=... ratio=1.000
-after_acquire g=(0, 0) restored=true
+after_acquire g=(0, 0) restored=Some(Restored)
 json_done g=(0, 0) key=... saved=true is_big=true dur_ms=...
 ```
 
@@ -352,7 +352,7 @@ journalctl -u lpcache -f
 | `503 all slots busy, please retry later` | All slots locked for > 300 s — a client is stuck mid-stream, or `n_slots` exceeds the real `-np`. Check the `llama-server` logs. |
 | `backend_down be=N` / `chat_error` warnings (usually no client-visible errors) | Backend N became unreachable (crash, OOM, restart). The proxy skips it for 5 s (circuit breaker; 10/20/40/60 s on repeated failures), transparently retries the failing request once on another backend, and probes it every second — a recovered backend rejoins within ~1 s (`backend_up be=N`). A 500 is only returned when no other backend could serve the request. Check that backend's log / restart it. |
 | `save_slot_500` warnings, restore never happens | llama.cpp started without `--slot-save-path`, or an old build without the slot save/restore API. |
-| `restore_before_chat ... ok=false` | The KV `.bin` for that key is missing from `--slot-save-path` (deleted, or a different server/build). The request proceeds without the restore. |
+| `restore_before_chat ... ok=false` | The KV `.bin` for that key is missing from `--slot-save-path` (deleted, or a different server/build). The request proceeds without the restore. When the backend *rejects* the restore (HTTP 400) and the KV file is absent from **every** configured slot-save dir, the proxy also removes the stale meta entry (`stale_meta_removed` in the proxy log) so later requests stop retrying the doomed restore; if the file still exists somewhere (or the dir isn't visible from the proxy's host), the meta is kept. |
 | No `restore_candidate` on repeated prompts | Prompt below `BIG_THRESHOLD_WORDS` words, `LCP_TH` too high, different model, or different `WORDS_PER_BLOCK` than when the cache was saved. |
 | `422` from the proxy | Malformed JSON body. |
 | `400` `request blocked by keyword prefilter: "..."` | `PREFILTER_BLOCKLIST` matched the request's message contents; the request never reached the backend. Adjust/remove the keyword, or unset `PREFILTER_BLOCKLIST` to disable the prefilter. |

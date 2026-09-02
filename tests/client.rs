@@ -1,7 +1,7 @@
 //! Direct tests of `LlamaClient` against the mock llama.cpp backend.
 
 use futures::StreamExt;
-use lpcache::llama_client::{BackendError, JsonChat, LlamaBackend, LlamaClient};
+use lpcache::llama_client::{BackendError, JsonChat, LlamaBackend, LlamaClient, RestoreOutcome};
 use lpcache::mock_backend::MockLlama;
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
@@ -246,15 +246,23 @@ async fn save_slot_statuses() {
 #[tokio::test]
 async fn restore_slot_statuses() {
     let (c, mock) = client_and_mock().await;
-    // 200 -> true
-    assert!(c.restore_slot(0, "abc").await);
-    // non-200 -> false (warning, no error)
+    // 200 -> Restored
+    assert_eq!(c.restore_slot(0, "abc").await, RestoreOutcome::Restored);
+    // 400 -> Rejected (the backend could not load the file: missing,
+    // corrupt, or no available space in the slot's KV cache)
+    mock.state.restore_status.store(400, Ordering::SeqCst);
+    assert_eq!(c.restore_slot(0, "abc").await, RestoreOutcome::Rejected);
+    // other non-200 -> Failed (warning, no error)
     mock.state.restore_status.store(500, Ordering::SeqCst);
-    assert!(!c.restore_slot(1, "abc").await);
+    assert_eq!(c.restore_slot(1, "abc").await, RestoreOutcome::Failed);
     let restores = mock.state.calls.lock().await.restores.clone();
     assert_eq!(
         restores,
-        vec![(0usize, "abc".to_string()), (1usize, "abc".to_string())]
+        vec![
+            (0usize, "abc".to_string()),
+            (0usize, "abc".to_string()),
+            (1usize, "abc".to_string())
+        ]
     );
 }
 
