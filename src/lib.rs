@@ -20,4 +20,5 @@ pub mod config;
 pub mod hashing;
 pub mod llama_client;
 pub mod mock_backend;
+pub mod prefilter;
 pub mod slot_manager;

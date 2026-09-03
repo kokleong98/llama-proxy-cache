@@ -11,6 +11,7 @@ use lpcache::slot_manager::SlotManager;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -21,12 +22,19 @@ async fn make_state(
     n_slots: usize,
     acquire_timeout: Option<Duration>,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, acquire_timeout, false, DEFAULT_STREAM_QUEUE_SIZE).await
+    make_state_inner(
+        n_slots,
+        acquire_timeout,
+        false,
+        DEFAULT_STREAM_QUEUE_SIZE,
+        None,
+    )
+    .await
 }
 
 /// Like [`make_state`], but with concurrent-request coalescing enabled.
 async fn make_state_coalesce(n_slots: usize) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, true, DEFAULT_STREAM_QUEUE_SIZE).await
+    make_state_inner(n_slots, None, true, DEFAULT_STREAM_QUEUE_SIZE, None).await
 }
 
 /// Like [`make_state`], but with a custom `STREAM_QUEUE_SIZE`.
@@ -34,7 +42,7 @@ async fn make_state_stream_queue(
     n_slots: usize,
     stream_queue_size: usize,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, false, stream_queue_size).await
+    make_state_inner(n_slots, None, false, stream_queue_size, None).await
 }
 
 /// Like [`make_state_coalesce`], but with a custom `STREAM_QUEUE_SIZE`.
@@ -42,7 +50,38 @@ async fn make_state_coalesce_stream_queue(
     n_slots: usize,
     stream_queue_size: usize,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, true, stream_queue_size).await
+    make_state_inner(n_slots, None, true, stream_queue_size, None).await
+}
+
+/// Like [`make_state`], but with the built-in keyword prefilter enabled
+/// (`keywords`, case-insensitive).
+async fn make_state_prefilter(
+    n_slots: usize,
+    keywords: &[&str],
+) -> (AppState, MockLlama, tempfile::TempDir) {
+    make_state_inner(
+        n_slots,
+        None,
+        false,
+        DEFAULT_STREAM_QUEUE_SIZE,
+        Some((keywords, true)),
+    )
+    .await
+}
+
+/// Like [`make_state_coalesce`], but with the built-in keyword prefilter
+/// enabled (`keywords`, case-insensitive).
+async fn make_state_prefilter_coalesce(
+    keywords: &[&str],
+) -> (AppState, MockLlama, tempfile::TempDir) {
+    make_state_inner(
+        2,
+        None,
+        true,
+        DEFAULT_STREAM_QUEUE_SIZE,
+        Some((keywords, true)),
+    )
+    .await
 }
 
 async fn make_state_inner(
@@ -50,10 +89,11 @@ async fn make_state_inner(
     acquire_timeout: Option<Duration>,
     coalesce: bool,
     stream_queue_size: usize,
+    prefilter: Option<(&[&str], bool)>,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
     let mock = MockLlama::start(BACKEND_MODEL).await;
     let td = tempfile::tempdir().expect("tempdir");
-    let cfg = Config::new(
+    let mut cfg = Config::new(
         vec![BackendConf {
             url: mock.url(),
             n_slots,
@@ -69,6 +109,11 @@ async fn make_state_inner(
     )
     .with_coalesce_requests(coalesce)
     .with_stream_queue_size(stream_queue_size);
+    if let Some((keywords, case_insensitive)) = prefilter {
+        cfg = cfg
+            .with_prefilter_blocklist(keywords.iter().map(ToString::to_string).collect())
+            .with_prefilter_case_insensitive(case_insensitive);
+    }
     let client = Arc::new(
         LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
     );
@@ -79,11 +124,13 @@ async fn make_state_inner(
         None => sm,
     };
     let sm = Arc::new(sm);
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     (state, mock, td)
 }
@@ -582,11 +629,13 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
         SlotManager::new(&cfg.backends, clients.clone())
             .with_backend_cooldown(Duration::from_secs(60)),
     );
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -654,11 +703,13 @@ async fn connection_failure_retries_on_other_backend() {
         Arc::clone(&c1) as Arc<dyn LlamaBackend>,
     ];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -722,11 +773,13 @@ async fn probe_recovers_cooled_down_backend() {
         SlotManager::new(&cfg.backends, clients.clone())
             .with_backend_cooldown(Duration::from_secs(60)),
     );
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm: Arc::clone(&sm),
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -803,11 +856,13 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         Arc::clone(&c1) as Arc<dyn LlamaBackend>,
     ];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -858,11 +913,13 @@ async fn prune_removes_oldest_meta_and_kv_files() {
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
+        prefilter,
     };
     let app = router(state);
 
@@ -898,6 +955,221 @@ async fn prune_removes_oldest_meta_and_kv_files() {
         assert!(td.path().join(format!("{key}.meta.json")).exists());
         assert!(kv.path().join(key).exists());
     }
+}
+
+#[tokio::test]
+async fn restore_works_after_prune_and_pruned_key_falls_back() {
+    // META_MAX=2: after three distinct saves the oldest entry (A) is
+    // pruned (meta AND KV file). Then verify that:
+    //   (a) a request matching a *surviving* entry (B) is still restored
+    //       (restore keeps working after a prune operation), and
+    //   (b) a request matching the *pruned* entry (A) is not restored
+    //       (its meta is gone -> full prefill) but is re-saved afterwards.
+    let kv = tempfile::tempdir().expect("kv dir");
+    let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv.path()).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_meta_max(2);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+    };
+    let app = router(state);
+
+    // three distinct "big" requests (first blocks differ -> no restores);
+    // after the 3rd save META_MAX=2 prunes the oldest entry (A)
+    let pa = format!("promptA {}", words(518));
+    let pb = format!("promptB {}", words(518));
+    let pc = format!("promptC {}", words(518));
+    for p in [&pa, &pb, &pc] {
+        let body = json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{ "role": "user", "content": p }]
+        });
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+        // keep the LRU order deterministic (same pattern as
+        // prune_removes_oldest_meta_and_kv_files)
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let key_a = expected_key(&pa);
+    let key_b = expected_key(&pb);
+    assert!(
+        !td.path().join(format!("{key_a}.meta.json")).exists(),
+        "A must be pruned after the 3rd save"
+    );
+    assert!(td.path().join(format!("{key_b}.meta.json")).exists());
+    assert!(!kv.path().join(&key_a).exists());
+    assert!(kv.path().join(&key_b).exists());
+
+    // (a) the surviving entry B is still restorable after the prune:
+    // B + a short tail -> LCP ratio 5/6 >= 0.6 -> restore key_b
+    let pb_tail = format!("{pb} tail x y z");
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": pb_tail }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    let calls = mock.state.calls.lock().await;
+    assert_eq!(calls.restores, vec![(1usize, key_b.clone())]);
+    drop(calls);
+    // the post-save prune kept the bound at META_MAX
+    let n_meta = std::fs::read_dir(td.path())
+        .expect("read meta dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
+        .count();
+    assert!(n_meta <= 2, "meta bound exceeded: {n_meta}");
+
+    // (b) the pruned entry A: no meta -> no restore candidate -> full
+    // prefill; the response is still 200 and A is re-saved (meta + KV
+    // come back, and the prune keeps the bound at META_MAX)
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": pa }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    let calls = mock.state.calls.lock().await;
+    // no new restore happened for the pruned key A
+    assert_eq!(calls.restores, vec![(1usize, key_b)]);
+    drop(calls);
+    assert!(
+        td.path().join(format!("{key_a}.meta.json")).exists(),
+        "A must be re-saved after the fallback prefill"
+    );
+    assert!(kv.path().join(&key_a).exists());
+    let n_meta = std::fs::read_dir(td.path())
+        .expect("read meta dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
+        .count();
+    assert_eq!(n_meta, 2, "bound must hold after the re-save");
+}
+
+#[tokio::test]
+async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
+    // META_MAX=2: saves A, B, C prune A. Then B+tail restores B and saves
+    // the new key B'. The successful restore must bump B's LRU timestamp
+    // (README: pruning is by last save/restore time), so B's own post-save
+    // prune evicts C — the true oldest — and NOT the just-restored B.
+    // (Without the touch, B — the oldest by last *save* — would be evicted
+    // by the very request that just restored it.)
+    let kv = tempfile::tempdir().expect("kv dir");
+    let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv.path()).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_meta_max(2);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+    };
+    let app = router(state);
+
+    // three distinct "big" requests; after the 3rd save A is pruned
+    let pa = format!("promptA {}", words(518));
+    let pb = format!("promptB {}", words(518));
+    let pc = format!("promptC {}", words(518));
+    for p in [&pa, &pb, &pc] {
+        let body = json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{ "role": "user", "content": p }]
+        });
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+        // keep the LRU order deterministic (same pattern as
+        // prune_removes_oldest_meta_and_kv_files)
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let key_a = expected_key(&pa);
+    let key_b = expected_key(&pb);
+    let key_c = expected_key(&pc);
+    assert!(!td.path().join(format!("{key_a}.meta.json")).exists());
+
+    // B + a short tail -> restores B (ratio 5/6) and saves new key B'
+    let pb_tail = format!("{pb} tail x y z");
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": pb_tail }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert_eq!(
+        mock.state.calls.lock().await.restores,
+        vec![(1usize, key_b.clone())]
+    );
+
+    // the restore bumped B's timestamp -> the post-save prune evicts C
+    // (the true oldest) and the just-restored B survives
+    assert!(
+        td.path().join(format!("{key_b}.meta.json")).exists(),
+        "a just-restored entry must survive its own post-save prune"
+    );
+    assert!(
+        !td.path().join(format!("{key_c}.meta.json")).exists(),
+        "the true oldest entry (C) must be pruned instead"
+    );
+    let n_meta = std::fs::read_dir(td.path())
+        .expect("read meta dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
+        .count();
+    assert_eq!(n_meta, 2, "bound must hold");
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,4 +1466,390 @@ async fn coalesce_stream_queue_size_one_follower_receives_full_stream() {
     let s = String::from_utf8(streams[0].to_vec()).expect("utf8");
     assert!(s.contains("Hello"), "stream: {s}");
     assert!(s.ends_with("data: [DONE]\n\n"), "stream: {s}");
+}
+// ---------------------------------------------------------------------------
+// Prefilter adapter (accept/reject before any slot/backend work)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn prefilter_rejects_keyword_request_before_backend() {
+    let (state, mock, td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "this is forbidden content" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    let v = read_body(resp).await;
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("forbidden"),
+        "body: {v}"
+    );
+
+    // The request never reached the backend: no chat, no save, no
+    // restore, no meta files.
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+    assert!(calls.saves.is_empty());
+    assert!(calls.restores.is_empty());
+    assert_eq!(std::fs::read_dir(td.path()).expect("read dir").count(), 0);
+}
+
+#[tokio::test]
+async fn prefilter_accepts_clean_request() {
+    let (state, mock, _td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["choices"][0]["message"]["content"], "mock reply");
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+}
+
+#[tokio::test]
+async fn prefilter_is_case_insensitive_by_default() {
+    let (state, mock, _td) = make_state_prefilter(2, &["ForBIDDEN"]).await;
+    let app = router(state);
+    let body = json!({
+        "messages": [{ "role": "user", "content": "say FORBIDDEN please" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+}
+
+#[tokio::test]
+async fn prefilter_inspects_content_part_arrays() {
+    let (state, mock, _td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "part one" },
+                { "type": "image_url", "image_url": "http://x" },
+                { "type": "text", "text": "part two FORBIDDEN" }
+            ]
+        }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+}
+
+#[tokio::test]
+async fn prefilter_rejects_stream_request_with_json_error() {
+    let (state, mock, _td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "forbidden" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    // JSON error, not an SSE stream.
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .expect("content-type")
+        .to_str()
+        .expect("str")
+        .to_string();
+    assert!(
+        ctype.starts_with("application/json"),
+        "content-type: {ctype}"
+    );
+    let v = read_body(resp).await;
+    assert!(v["error"].as_str().unwrap_or("").contains("forbidden"));
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+}
+
+#[tokio::test]
+async fn prefilter_rejects_big_request_without_save_or_meta() {
+    let (state, mock, td) = make_state_prefilter(2, &["forbidden"]).await;
+    let app = router(state);
+    // > 500 words -> would be "big" (cache_prompt, save, meta) if accepted.
+    let content = format!("{} forbidden {}", words(300), words(300));
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": content }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+    assert!(calls.saves.is_empty());
+    assert!(calls.restores.is_empty());
+    assert_eq!(std::fs::read_dir(td.path()).expect("read dir").count(), 0);
+}
+
+#[tokio::test]
+async fn prefilter_rejects_before_coalescing() {
+    // Coalescing enabled + keyword prefilter: two concurrent same-key
+    // requests are both rejected at the prefilter — no group forms (a
+    // rejected request never leads or joins one) and the backend is
+    // never called.
+    let (state, mock, _td) = make_state_prefilter_coalesce(&["forbidden"]).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "forbidden thing" }]
+    });
+    let (r1, r2) = tokio::join!(
+        app.clone().oneshot(post_json(&body)),
+        app.clone().oneshot(post_json(&body)),
+    );
+    assert_eq!(r1.expect("resp").status(), 400);
+    assert_eq!(r2.expect("resp").status(), 400);
+    let calls = mock.state.calls.lock().await;
+    assert!(calls.chat_bodies.is_empty());
+}
+
+/// A custom prefilter adapter: rejects prompts longer than `max_words`.
+/// Proves the `Prefilter` trait is a working extension point beyond the
+/// built-in keyword filter.
+struct LongPromptFilter {
+    max_words: usize,
+}
+
+#[async_trait::async_trait]
+impl lpcache::prefilter::Prefilter for LongPromptFilter {
+    fn name(&self) -> &str {
+        "long_prompt"
+    }
+
+    async fn check(
+        &self,
+        req: &lpcache::prefilter::PrefilterRequest,
+    ) -> lpcache::prefilter::PrefilterDecision {
+        if req.n_words > self.max_words {
+            lpcache::prefilter::PrefilterDecision::Reject {
+                status: 413,
+                message: format!(
+                    "prompt too long: {} words (max {})",
+                    req.n_words, self.max_words
+                ),
+            }
+        } else {
+            lpcache::prefilter::PrefilterDecision::Accept
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_prefilter_adapter_accepts_and_rejects() {
+    let (mut state, mock, _td) = make_state(2, None).await;
+    state.prefilter = Some(Arc::new(LongPromptFilter { max_words: 5 }));
+    let app = router(state);
+
+    // short prompt -> accepted, reaches the backend
+    let short = json!({
+        "model": "m1",
+        "messages": [{ "role": "user", "content": "hi there" }]
+    });
+    let resp = app.clone().oneshot(post_json(&short)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+
+    // long prompt -> rejected with the adapter's own status/message
+    let long = json!({
+        "model": "m1",
+        "messages": [{ "role": "user", "content": words(50) }]
+    });
+    let resp = app.clone().oneshot(post_json(&long)).await.expect("resp");
+    assert_eq!(resp.status(), 413);
+    let v = read_body(resp).await;
+    assert!(v["error"].as_str().unwrap_or("").contains("too long"));
+
+    // only the accepted (short) request reached the backend
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+}
+
+/// State with a mock that emulates `--slot-save-path` (successful saves
+/// create a KV file) and an explicit META_MAX.
+async fn make_state_with_save_dir(
+    kv: &std::path::Path,
+    meta_max: usize,
+) -> (AppState, MockLlama, tempfile::TempDir) {
+    let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some(kv.to_string_lossy().into_owned()),
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_meta_max(meta_max);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+    };
+    (state, mock, td)
+}
+
+#[tokio::test]
+async fn restore_rejected_cleans_up_stale_meta() {
+    // Orphaned meta: the KV file is gone from `--slot-save-path` but the
+    // meta entry survived (e.g. manual cleanup). A matching request gets a
+    // *rejected* restore (400) and falls back to full prefill. The proxy
+    // must then remove the stale meta so later requests stop retrying a
+    // doomed restore — but only when the KV file is verifiably absent
+    // from every configured slot-save dir (a 400 with the file still
+    // present may be transient, e.g. "no available space in KV cache").
+    let kv = tempfile::tempdir().expect("kv dir");
+    let (state, mock, td) = make_state_with_save_dir(kv.path(), 0).await; // 0 = unlimited
+    let app = router(state);
+
+    let prefix = format!("prompt {}", words(518));
+    let key1 = expected_key(&prefix);
+    let tail = format!("{prefix} tail words");
+    let key2 = expected_key(&tail);
+
+    // 1) save key1 (the mock creates its KV file)
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": prefix }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(td.path().join(format!("{key1}.meta.json")).exists());
+    assert!(kv.path().join(&key1).exists());
+
+    // 2) orphan key1's meta and make the backend reject restores
+    std::fs::remove_file(kv.path().join(&key1)).expect("rm kv");
+    mock.state.restore_status.store(400, Ordering::SeqCst);
+
+    // 3) matching request: rejected restore -> full prefill -> key2 saved;
+    //    the cleanup must remove key1's stale meta (KV absent everywhere)
+    let body2 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": tail }]
+    });
+    let resp = app.clone().oneshot(post_json(&body2)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        !td.path().join(format!("{key1}.meta.json")).exists(),
+        "stale meta must be removed after a rejected restore"
+    );
+    assert!(td.path().join(format!("{key2}.meta.json")).exists());
+    assert!(kv.path().join(&key2).exists());
+
+    // 4) same request again: key2's restore is rejected too, but its KV
+    //    file still exists -> the meta must be KEPT
+    let resp = app.clone().oneshot(post_json(&body2)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        td.path().join(format!("{key2}.meta.json")).exists(),
+        "meta with a present KV file must be kept on a rejected restore"
+    );
+
+    // 5) orphan key2 as well: a *different* prompt matching key2 triggers
+    //    the cleanup, which removes key2's stale meta (the request itself
+    //    then saves a fresh entry, key3)
+    std::fs::remove_file(kv.path().join(&key2)).expect("rm kv");
+    let tail3 = format!("{tail} more words");
+    let key3 = expected_key(&tail3);
+    let body3 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": tail3 }]
+    });
+    let resp = app.clone().oneshot(post_json(&body3)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(!td.path().join(format!("{key2}.meta.json")).exists());
+    assert!(td.path().join(format!("{key3}.meta.json")).exists());
+}
+
+#[tokio::test]
+async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
+    // When the configured slot-save dir is not visible from the proxy's
+    // host (e.g. a remote backend), a rejected restore can't be verified
+    // as "file gone" -> the meta must be kept (status quo).
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some("/nonexistent/lpcache-unvisible-dir".to_string()),
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_meta_max(0); // 0 = unlimited
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+    };
+    let app = router(state);
+
+    let prefix = format!("prompt {}", words(518));
+    let key1 = expected_key(&prefix);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": prefix }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(td.path().join(format!("{key1}.meta.json")).exists());
+
+    mock.state.restore_status.store(400, Ordering::SeqCst);
+    let tail = format!("{prefix} tail words");
+    let body2 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": tail }]
+    });
+    let resp = app.clone().oneshot(post_json(&body2)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        td.path().join(format!("{key1}.meta.json")).exists(),
+        "meta must be kept when the slot-save dir is not visible locally"
+    );
 }

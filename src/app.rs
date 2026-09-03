@@ -17,17 +17,26 @@
 //!     upstream request to llama-server the same way
 //!   - 503 when no slot could be acquired within the 300 s timeout
 //!
+//! Request prefilter (optional): when `PREFILTER_BLOCKLIST` is set,
+//! every request is checked by the prefilter adapter
+//! (`crate::prefilter`) right after body parsing / cache-key
+//! computation and **before** coalescing, slot acquisition and backend
+//! dispatch: rejected requests get an immediate JSON error and never
+//! reach the llama-server backend (no slot, no restore/save, no meta
+//! file, no coalescing group).
+//!
 //! Concurrent-request coalescing (`COALESCE_REQUESTS`): when enabled,
-//! concurrent requests with the same cache key and identical generation
-//! parameters (the request body minus `messages`) form one group; the first
-//! request ("leader") runs the pipeline above and every other request
-//! ("follower") waits for the leader and receives its result. Followers
-//! never touch slots, backends or meta files. See the `coalesce` module.
+//! concurrent requests with the same cache key form one group regardless
+//! of generation parameters; the first request ("leader") runs the
+//! pipeline above and every other request ("follower") waits for the
+//! leader and receives its result. Followers never touch slots, backends
+//! or meta files. See the `coalesce` module.
 
 use crate::coalesce::{Flight, SharedOutcome, SingleFlight};
 use crate::config::Config;
 use crate::hashing;
-use crate::llama_client::{BackendError, JsonChat, LlamaBackend};
+use crate::llama_client::{BackendError, JsonChat, LlamaBackend, RestoreOutcome};
+use crate::prefilter::{Prefilter, PrefilterDecision, PrefilterRequest};
 use crate::slot_manager::{AcquireTimeout, GSlot, SlotGuard, SlotManager};
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -51,6 +60,10 @@ pub struct AppState {
     /// In-flight coalesced request groups (active when
     /// `config.coalesce_requests` is enabled).
     pub sf: Arc<SingleFlight>,
+    /// Optional prefilter adapter consulted before any slot/backend work
+    /// (`None` when `PREFILTER_BLOCKLIST` is unset — the default; see the
+    /// `prefilter` module).
+    pub prefilter: Option<Arc<dyn Prefilter>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -103,6 +116,40 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
     let blocks = hashing::block_hashes_from_text(&prefix, state.config.words_per_block);
     let n_words = hashing::words_from_text(&prefix).len();
     let is_big = n_words > state.config.big_threshold_words;
+
+    // Prefilter adapter: accept/reject the request before coalescing,
+    // slot acquisition, or backend dispatch. Rejected requests get an
+    // immediate JSON error and never reach the llama-server backend (no
+    // slot, no restore/save, no meta file, no coalescing group).
+    if let Some(pf) = &state.prefilter {
+        let preq = PrefilterRequest {
+            body: body.clone(),
+            messages: Value::Array(messages.clone()),
+            model: client_model.clone(),
+            backend_model_id: backend_model_id.clone(),
+            stream,
+            key: key.clone(),
+            n_words,
+            is_big,
+        };
+        match pf.check(&preq).await {
+            PrefilterDecision::Accept => {
+                tracing::debug!(
+                    "prefilter_accept filter={} key={}",
+                    pf.name(),
+                    short16(&key)
+                );
+            }
+            PrefilterDecision::Reject { status, message } => {
+                tracing::info!(
+                    "prefilter_reject filter={} key={} status={status} n_words={n_words}",
+                    pf.name(),
+                    short16(&key)
+                );
+                return json_error(status, message);
+            }
+        }
+    }
 
     // Concurrent-request coalescing (`COALESCE_REQUESTS`): concurrent
     // requests with the same cache key share one backend call — the first
@@ -263,6 +310,14 @@ async fn run_pipeline(
     };
     let mut g: GSlot = guard.slot;
     tracing::info!("after_acquire g={g} restored={:?}", guard.restored);
+    // LRU bookkeeping: a successful restore counts as a "use" of the
+    // cached entry — bump its meta timestamp so the post-save prune of
+    // this very request cannot evict a cache that was just used
+    // (README: pruning is by last save/restore time). A rejected restore
+    // may instead remove a stale meta (KV file gone from all slot-save
+    // dirs).
+    touch_restored_meta(state, &guard, &restore_key);
+    remove_stale_meta(state, &guard, &restore_key);
 
     // Up to 2 attempts: a connection-level failure (backend unreachable)
     // retries once on a slot of a *different* backend before the client
@@ -295,6 +350,8 @@ async fn run_pipeline(
                     {
                         Some(g2) => {
                             g = g2.slot;
+                            touch_restored_meta(state, &g2, &restore_key);
+                            remove_stale_meta(state, &g2, &restore_key);
                             guard = g2;
                             continue;
                         }
@@ -499,6 +556,8 @@ async fn run_pipeline(
                     {
                         Some(g2) => {
                             g = g2.slot;
+                            touch_restored_meta(state, &g2, &restore_key);
+                            remove_stale_meta(state, &g2, &restore_key);
                             guard = g2;
                             continue;
                         }
@@ -530,7 +589,8 @@ async fn run_pipeline(
                     let save_ok = if is_big {
                         match save_big(state, g, key, prefix, blocks, backend_model_id).await {
                             Ok(ok) => ok,
-                            Err((resp, o)) => {
+                            Err(b) => {
+                                let (resp, o) = *b;
                                 state.sm.release(guard);
                                 return (resp, Some(o));
                             }
@@ -555,7 +615,8 @@ async fn run_pipeline(
                     let save_ok = if is_big {
                         match save_big(state, g, key, prefix, blocks, backend_model_id).await {
                             Ok(ok) => ok,
-                            Err((resp, o)) => {
+                            Err(b) => {
+                                let (resp, o) = *b;
                                 state.sm.release(guard);
                                 return (resp, Some(o));
                             }
@@ -675,6 +736,65 @@ fn build_out_body(body: &Value, client_model: &str, is_big: bool, g: GSlot) -> V
     out_body
 }
 
+/// LRU bookkeeping: a successful restore counts as a "use" of the cached
+/// entry — bump its meta-file timestamp (see [`hashing::touch_meta`]).
+/// Without this, a just-restored entry could be evicted by this very
+/// request's post-save prune (README: pruning is by last save/restore
+/// time). A meta file that a concurrent prune already removed is a no-op
+/// with a warning.
+fn touch_restored_meta(state: &AppState, guard: &SlotGuard, restore_key: &Option<String>) {
+    if guard.restored == Some(RestoreOutcome::Restored)
+        && let Some(rk) = restore_key
+    {
+        hashing::touch_meta(&state.config.meta_dir, rk);
+    }
+}
+
+/// Stale-meta cleanup: a *rejected* restore (HTTP 400) means the backend
+/// could not load the KV file (missing, corrupt, or too big for the slot
+/// context). When the file is absent from every slot-save dir this host
+/// can see, the meta entry can never be restored again: remove it so the
+/// next matching request stops retrying a doomed restore (each retry
+/// logs an error on the backend, e.g. `llama_state_seq_load_file: failed
+/// to open ...`). If any visible dir still holds the file — or no dir is
+/// visible locally (remote backend) — keep the meta: the 400 may be
+/// transient for that one backend ("no available space in KV cache"), and
+/// meta files are not backend-specific, so in a multi-backend setup the
+/// file may live in another backend's dir.
+fn remove_stale_meta(state: &AppState, guard: &SlotGuard, restore_key: &Option<String>) {
+    if guard.restored == Some(RestoreOutcome::Rejected)
+        && let Some(rk) = restore_key
+    {
+        let dirs: Vec<&std::path::Path> = state
+            .config
+            .slot_save_dirs()
+            .into_iter()
+            .filter(|d| d.is_dir())
+            .collect();
+        if dirs.is_empty() {
+            // Backend storage not visible from this host: can't verify
+            // the file is gone — keep the meta (status quo).
+            return;
+        }
+        if dirs.iter().any(|d| d.join(rk).is_file()) {
+            // The file still exists somewhere (or the 400 was "no
+            // available space"): it may still restore — keep the meta.
+            return;
+        }
+        let path = state.config.meta_dir.join(format!("{rk}.meta.json"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::warn!(
+                "stale_meta_removed key={} (restore rejected; KV file missing from all slot-save dirs)",
+                short16(rk)
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!("stale_meta_missing key={} (already pruned)", short16(rk));
+            }
+            Err(e) => tracing::warn!("stale_meta_remove_fail key={}: {e}", short16(rk)),
+        }
+    }
+}
+
 /// Connection-level failure on slot `g`: log it, trip the circuit breaker,
 /// mark the slot used, release it, and — on the first attempt — acquire a
 /// slot of a *different* backend for the retry (the restore key is
@@ -719,7 +839,7 @@ async fn save_big(
     prefix: &str,
     blocks: &[String],
     backend_model_id: &str,
-) -> Result<bool, (Response, SharedOutcome)> {
+) -> Result<bool, Box<(Response, SharedOutcome)>> {
     let ok = state.sm.save_after(g, key).await.map_err(|e| {
         if matches!(e, BackendError::Other(_)) {
             tracing::warn!("save_error g={g} key={}: {e}", short16(key));
@@ -727,10 +847,10 @@ async fn save_big(
         }
         state.sm.mark_used(g);
         let msg = e.to_string();
-        (
+        Box::new((
             json_error(500, msg.clone()),
             SharedOutcome::Json(500, json!({ "error": msg })),
-        )
+        ))
     })?;
     hashing::write_meta(
         &state.config.meta_dir,
@@ -742,10 +862,10 @@ async fn save_big(
     )
     .map_err(|e| {
         let msg = e.to_string();
-        (
+        Box::new((
             json_error(500, msg.clone()),
             SharedOutcome::Json(500, json!({ "error": msg })),
-        )
+        ))
     })?;
     prune_cache(&state.config);
     Ok(ok)

@@ -11,7 +11,7 @@
 //! - `save_after` saves the KV cache and updates the LRU timestamp
 
 use crate::config::BackendConf;
-use crate::llama_client::{BackendError, LlamaBackend};
+use crate::llama_client::{BackendError, LlamaBackend, RestoreOutcome};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -48,8 +48,8 @@ pub struct AcquireTimeout;
 /// `acquire_for_request`.
 pub struct SlotGuard {
     pub slot: GSlot,
-    /// `Some(ok)` when a restore was attempted before the chat.
-    pub restored: Option<bool>,
+    /// `Some(outcome)` when a restore was attempted before the chat.
+    pub restored: Option<RestoreOutcome>,
     /// Holds the slot lock until the guard is dropped / released.
     #[allow(dead_code)]
     permit: OwnedSemaphorePermit,
@@ -346,9 +346,13 @@ impl SlotManager {
             permit,
         };
         if let Some(key) = restore_key {
-            let ok = self.clients[g.be].restore_slot(g.slot, key).await;
-            tracing::info!("restore_before_chat g={g} key={} ok={ok}", short(key));
-            guard.restored = Some(ok);
+            let outcome = self.clients[g.be].restore_slot(g.slot, key).await;
+            tracing::info!(
+                "restore_before_chat g={g} key={} ok={}",
+                short(key),
+                matches!(outcome, RestoreOutcome::Restored)
+            );
+            guard.restored = Some(outcome);
         }
         Ok(guard)
     }
@@ -395,7 +399,7 @@ fn short(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llama_client::{JsonChat, StreamChat};
+    use crate::llama_client::{JsonChat, RestoreOutcome, StreamChat};
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream;
@@ -410,6 +414,7 @@ mod tests {
         restores: Arc<Mutex<Vec<(usize, String)>>>,
         /// 0 = Ok(true), 1 = Ok(false) (backend 500), 2 = Err
         save_mode: Arc<AtomicU8>,
+        /// true = Restored, false = Failed
         restore_ok: Arc<AtomicBool>,
     }
 
@@ -437,12 +442,16 @@ mod tests {
                 _ => Err(BackendError::Other("mock save error".into())),
             }
         }
-        async fn restore_slot(&self, slot_id: usize, basename: &str) -> bool {
+        async fn restore_slot(&self, slot_id: usize, basename: &str) -> RestoreOutcome {
             self.restores
                 .lock()
                 .await
                 .push((slot_id, basename.to_string()));
-            self.restore_ok.load(std::sync::atomic::Ordering::SeqCst)
+            if self.restore_ok.load(std::sync::atomic::Ordering::SeqCst) {
+                RestoreOutcome::Restored
+            } else {
+                RestoreOutcome::Failed
+            }
         }
         async fn get_model_id(&self) -> String {
             "test-model".into()
@@ -522,7 +531,7 @@ mod tests {
     async fn restore_called_only_when_key_given() {
         let (sm, raw) = make(1, 2);
         let g = sm.acquire(Some("key-abcdef0123456789")).await.unwrap();
-        assert_eq!(g.restored, Some(true));
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
         sm.release(g);
         let g = sm.acquire(None).await.unwrap();
         assert_eq!(g.restored, None);
@@ -539,7 +548,7 @@ mod tests {
         sm.set_last_used_for_test(GSlot { be: 0, slot: 0 }, 1);
         sm.set_last_used_for_test(GSlot { be: 0, slot: 1 }, 2);
         let g = sm.acquire(Some("k2")).await.unwrap();
-        assert_eq!(g.restored, Some(false));
+        assert_eq!(g.restored, Some(RestoreOutcome::Failed));
         sm.release(g);
     }
 

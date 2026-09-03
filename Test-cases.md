@@ -4,26 +4,27 @@ Complete catalog of the **lpcache** regression suite (KV-cache-aware,
 OpenAI-compatible proxy for llama.cpp). Every entry maps 1:1 to a test
 function; the full suite runs with `cargo test`.
 
-**Total: 107 test cases** — 67 unit + 25 API integration + 15 client
+**Total: 129 test cases** — 77 unit + 37 API integration + 15 client
 integration.
 
 | # | Suite | Location | Tests |
 |---|-------|----------|-------|
-| 1 | Configuration (env vars, CLI, precedence) | `src/config.rs` | 24 |
-| 2 | Hashing, meta files, pruning | `src/hashing.rs` | 19 |
-| 3 | Request coalescing (`SingleFlight`) | `src/coalesce.rs` | 4 |
-| 4 | Backend client — slot pinning | `src/llama_client.rs` | 3 |
-| 5 | Slot management (selection, locks, breaker) | `src/slot_manager.rs` | 17 |
-| 6 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 25 |
-| 7 | Backend client — HTTP behavior | `tests/client.rs` | 15 |
+| 1 | Configuration (env vars, CLI, precedence) | `src/config.rs` | 25 |
+| 2 | Request prefilter adapter | `src/prefilter.rs` | 9 |
+| 3 | Hashing, meta files, pruning | `src/hashing.rs` | 19 |
+| 4 | Request coalescing (`SingleFlight`) | `src/coalesce.rs` | 4 |
+| 5 | Backend client — slot pinning | `src/llama_client.rs` | 3 |
+| 6 | Slot management (selection, locks, breaker) | `src/slot_manager.rs` | 17 |
+| 7 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 33 |
+| 8 | Backend client — HTTP behavior | `tests/client.rs` | 15 |
 
 ## How to run
 
 ```sh
 cd lpcache
-cargo test                    # full regression suite (107 tests, ~4 s)
-cargo test --lib              # 67 unit tests only
-cargo test --test api         # 25 API integration tests
+cargo test                    # full regression suite (129 tests, ~4 s)
+cargo test --lib              # 77 unit tests only
+cargo test --test api         # 37 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test <name-substring>   # run a single test by name filter
 cargo clippy --all-targets    # lint gate (expected: 0 warnings)
@@ -33,7 +34,7 @@ Integration tests start `MockLlama` — an in-process mock of the llama.cpp
 server (`src/mock_backend.rs`) on free localhost ports — so the suite needs
 no real `llama-server`, model files, or network access.
 
-## 1. Configuration — `src/config.rs` (24)
+## 1. Configuration — `src/config.rs` (25)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -56,13 +57,31 @@ no real `llama-server`, model files, or network access.
 | 17 | `cli_help_flags` | `--help` / `-h`, also among other options | `help` flag set |
 | 18 | `cli_version_flags` | `--version` / `-V`, also among other options | `version` flag set |
 | 19 | `version_string_is_crate_name_and_version` | `version_string()` output | starts with `lpcache `, ends with the crate version |
-| 20 | `cli_usage_lists_all_flags_and_env_vars` | completeness of `--help` text | all 18 flags and 16 env vars listed |
+| 20 | `cli_usage_lists_all_flags_and_env_vars` | completeness of `--help` text | all 20 flags and 18 env vars listed |
 | 21 | `coalesce_requests_flag` | `COALESCE_REQUESTS` env + CLI | off by default; `true`/`1` on; `0`/invalid off; CLI overrides env |
 | 22 | `stream_queue_size_env_and_cli` | `STREAM_QUEUE_SIZE` env + CLI | default 16; env `64` applied; `0` / invalid → default; CLI `--stream-queue-size 8` overrides env; builder clamps below 1 to 1 |
-| 23 | `config_precedence_cli_over_env_over_defaults` | CLI > env > default (merged env map **and** final Config) | CLI overrides; env applies to unset flags; unset flags add nothing; default otherwise |
-| 24 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
+| 23 | `prefilter_env_and_cli` | `PREFILTER_BLOCKLIST` / `PREFILTER_CASE_INSENSITIVE` env + CLI | default disabled (empty list, case-insensitive); comma list trimmed with empty entries dropped; blank list = disabled; invalid bool → default; CLI wins over env |
+| 24 | `config_precedence_cli_over_env_over_defaults` | CLI > env > default (merged env map **and** final Config) | CLI overrides; env applies to unset flags; unset flags add nothing; default otherwise |
+| 25 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
 
-## 2. Hashing, meta files, pruning — `src/hashing.rs` (19)
+## 2. Request prefilter adapter — `src/prefilter.rs` (9)
+
+The accept/reject adapter consulted before any slot/backend work (see the
+`prefilter` module docs).
+
+| # | Test case | What it verifies | Expected result |
+|---|-----------|------------------|-----------------|
+| 1 | `keyword_rejects_on_match` | request containing a blocked keyword | `Reject { 400, message naming the keyword }` |
+| 2 | `keyword_accepts_clean_request` | request with no blocked keyword | `Accept` |
+| 3 | `keyword_case_insensitive_by_default` | keyword `ForBIDDEN` vs text `FORBIDDEN` | case-insensitive matches; case-sensitive mode requires exact case |
+| 4 | `keyword_scans_all_messages` | keyword in a later message of a multi-turn conversation | `Reject` |
+| 5 | `keyword_inspects_content_part_arrays` | OpenAI content-part array (`text` parts + non-text parts) | text parts inspected, non-text skipped → `Reject` |
+| 6 | `keyword_empty_messages_accepts` | no messages / message without `content` | `Accept` |
+| 7 | `message_text_flattens_content` | string + array contents flattened | newline-joined text; empty/defensive inputs → `""` |
+| 8 | `from_comma_list_trims_and_drops_empty` | `PREFILTER_BLOCKLIST`-style parsing | trimmed list; whitespace-only/empty → `None` (disabled) |
+| 9 | `trait_object_dispatch` | adapter behind `Arc<dyn Prefilter>` (the `AppState` shape) | `name()` + `check()` dispatch correctly |
+
+## 3. Hashing, meta files, pruning — `src/hashing.rs` (19)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -86,7 +105,7 @@ no real `llama-server`, model files, or network access.
 | 18 | `prune_meta_noop_under_limit_and_zero_max` | under limit / `max=0` / missing dir | nothing pruned, no error |
 | 19 | `prune_meta_corrupt_file_pruned_first` | unparseable meta among healthy ones | treated as oldest, removed first |
 
-## 3. Request coalescing — `src/coalesce.rs` (4)
+## 4. Request coalescing — `src/coalesce.rs` (4)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -95,7 +114,7 @@ no real `llama-server`, model files, or network access.
 | 3 | `finish_wakes_waiters_with_outcome` | waiter wakeup on leader finish | follower receives the leader's `SharedOutcome` |
 | 4 | `sse_append_and_drain_is_ordered` | ordered incremental SSE drain | `"a"+"bc"` drains as `"abc"`, then `"d"`; full buffer `"abcd"` |
 
-## 4. Backend client — slot pinning — `src/llama_client.rs` (3)
+## 5. Backend client — slot pinning — `src/llama_client.rs` (3)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -103,7 +122,7 @@ no real `llama-server`, model files, or network access.
 | 2 | `slot_pinning_duplicated_in_root_options_query` | `slot = Some(1)` | `_slot_id`/`slot_id`/`id_slot` in body root **and** `options`, `slot_id`/`id_slot` in query; existing fields preserved |
 | 3 | `slot_pinning_adds_options_when_missing` | body without an `options` object | `options` object created with both pin fields |
 
-## 5. Slot management — `src/slot_manager.rs` (17)
+## 6. Slot management — `src/slot_manager.rs` (17)
 
 In-memory `TestClient` backends; verifies selection, per-slot locking,
 save/restore semantics and the backend circuit breaker.
@@ -128,7 +147,7 @@ save/restore semantics and the backend circuit breaker.
 | 16 | `probe_down_backends_recovers_up_backend` | probe recovery | one probe round recovers a live backend; healthy backends not counted |
 | 17 | `acquire_excluding_picks_other_backend` | retry on a different backend | exclude be0 → be1 slot 0; single backend → fast error (no 300 s wait) |
 
-## 6. API end-to-end — `tests/api.rs` (25)
+## 7. API end-to-end — `tests/api.rs` (37)
 
 The real proxy router (axum) in front of `MockLlama`, which records every
 chat body/query, restore and save. Default setup: 1 backend, 2 slots,
@@ -163,8 +182,20 @@ behaviour requires a real connection).
 | 23 | `coalesce_new_group_after_completion` | sequential identical requests | 2 backend calls (a new group starts after the leader finishes) |
 | 24 | `stream_queue_size_one_delivers_full_stream` | stream chat with `STREAM_QUEUE_SIZE=1` (maximal backpressure) | full SSE delivered (Hello/world/`[DONE]`); 3 chunks produced exactly once; reader cleanup still saves KV + writes meta |
 | 25 | `coalesce_stream_queue_size_one_follower_receives_full_stream` | 3 concurrent stream requests, coalescing on, queue size 1 | 1 backend stream; every follower receives the identical full stream ending `[DONE]` |
+| 26 | `prefilter_rejects_keyword_request_before_backend` | `PREFILTER_BLOCKLIST` keyword in a non-stream request | 400 JSON error naming the keyword; **zero** chat/save/restore calls; no meta file |
+| 27 | `prefilter_accepts_clean_request` | no blocked keyword | 200 mock reply; exactly 1 chat call reaches the backend |
+| 28 | `prefilter_is_case_insensitive_by_default` | keyword `ForBIDDEN` vs request text `FORBIDDEN` | 400; no backend call |
+| 29 | `prefilter_inspects_content_part_arrays` | keyword inside an OpenAI content-part array | 400; no backend call |
+| 30 | `prefilter_rejects_stream_request_with_json_error` | `stream: true` request containing a keyword | 400 `application/json` (not SSE); no backend call |
+| 31 | `prefilter_rejects_big_request_without_save_or_meta` | 600-word prompt containing a keyword | 400; no save, no restore, no meta file |
+| 32 | `prefilter_rejects_before_coalescing` | coalescing on; 2 concurrent same-key blocked requests | both 400 immediately; no group forms; no backend call |
+| 33 | `custom_prefilter_adapter_accepts_and_rejects` | custom `Prefilter` trait impl (rejects >5-word prompts with 413) | short prompt 200 (1 backend call); long prompt 413 with the adapter's own status/message |
+| 34 | `restore_works_after_prune_and_pruned_key_falls_back` | `META_MAX=2`; 3 saves (prunes A); then B+tail; then A again | B (a surviving entry) is still restored after the prune (ratio 5/6); pruned A gets **no** restore (full prefill), still 200, and is re-saved; bound stays at 2 |
+| 35 | `restore_touches_lru_timestamp_so_prune_keeps_hot_entry` | `META_MAX=2`; saves A, B, C (prunes A); then B+tail restores B and saves B' | the successful restore bumps B's LRU timestamp → B's own post-save prune evicts C (the true oldest), not the just-restored B |
+| 36 | `restore_rejected_cleans_up_stale_meta` | save A (KV created); delete A's KV; mock restore → 400; A+tail; A+tail again; delete KV; A+tail2 | 400 with the KV absent from every slot-save dir → stale meta removed (`stale_meta_removed`); 400 with the KV still present → meta **kept** (may be transient); final request saves a fresh entry |
+| 37 | `restore_rejected_keeps_meta_when_save_dir_unvisible` | configured slot-save dir does not exist on the proxy's host; mock restore → 400 | absence of the KV file can't be verified (remote backend) → meta kept (status quo) |
 
-## 7. Backend client — HTTP behavior — `tests/client.rs` (15)
+## 8. Backend client — HTTP behavior — `tests/client.rs` (15)
 
 Direct tests of `LlamaClient` against `MockLlama`; the two auth-header
 tests capture the raw request on a one-shot TCP server.
@@ -184,7 +215,7 @@ tests capture the raw request on a one-shot TCP server.
 | 11 | `chat_stream_chunks` | 200 SSE stream | chunks contain Hello, world, `[DONE]` |
 | 12 | `chat_stream_error_status` | 500 stream | `StreamChat { status: 500 }` + error body passes through |
 | 13 | `save_slot_statuses` | `POST /slot/{id}/save` | 200 → `true`, 500 → `false`, 404 → `Err(HttpStatus)`; calls recorded in order |
-| 14 | `restore_slot_statuses` | `POST /slot/{id}/restore` | 200 → `true`, 500 → `false` (no error); calls recorded |
+| 14 | `restore_slot_statuses` | `POST /slot/{id}/restore` | 200 → `Restored`, 400 → `Rejected`, 500 → `Failed` (no error); calls recorded |
 | 15 | `base_url_trailing_slash_normalized` | backend URL with a trailing `/` | works — model id resolved |
 
 ## Coverage notes
@@ -206,15 +237,18 @@ client-disconnect behaviour.
 | Idle-aware slot selection | `pick_skips_held_slot_in_favor_of_idle` |
 | Bounded cache pruning (`META_MAX`) | `prune_meta_*` (unit), `prune_removes_oldest_meta_and_kv_files` (E2E) |
 | Concurrent-request coalescing (Rust-only feature) | 4 unit + 6 E2E coalesce tests |
+| Request prefilter adapter (Rust-only feature) | 9 unit + 8 E2E prefilter tests |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 
-**Suite health (2026-08-31).** 107/107 passing, clippy clean, ~4 s wall
+**Suite health (2026-09-02).** 129/129 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
 On 2026-08-31 the configurable `STREAM_QUEUE_SIZE` (env var +
 `--stream-queue-size` flag) added three cases: `stream_queue_size_env_and_cli`
 (config) and `stream_queue_size_one_delivers_full_stream` /
 `coalesce_stream_queue_size_one_follower_receives_full_stream` (E2E,
 both with `STREAM_QUEUE_SIZE=1` for maximal channel backpressure).
+The 2026-08-31 prefilter adapter feature added 18 tests (+10 unit, +8 E2E)
+to the 2026-08-26 baseline of 104.
 De-duplicated from 109 tests on 2026-08-26: removed
 `stream_client_disconnect_aborts_upstream` (merged into the TCP variant),
 `failed_slot_mark_used_is_skipped_by_free_first` (subsumed by three other

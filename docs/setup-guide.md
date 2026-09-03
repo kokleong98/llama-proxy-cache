@@ -12,6 +12,7 @@ client (OpenAI API)                llama.cpp backend(s)
 │ lpcache (this project)                              │
 │  • prefix hashing  • big/small  • LCP restore lookup   │
 │  • slot locks (free-first, then LRU)  • SSE passthrough│
+│  • prefilter accept/reject (optional, PREFILTER_BLOCKLIST) │
 │  • saves KV cache + writes <key>.meta.json            │
 └────────────────────────────────────────────────────────┘
 ```
@@ -154,7 +155,7 @@ Expected startup logs:
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
 slot_manager n_backends=2 total_slots=6
-app_start version=0.1.0 n_backends=2 port=8081 meta_max=10
+app_start version=0.2.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
 
@@ -241,7 +242,7 @@ json_done g=(0, 0) key=... saved=true is_big=true dur_ms=...
 
 # second request (shared prefix):
 restore_candidate basename=... ratio=1.000
-after_acquire g=(0, 0) restored=true
+after_acquire g=(0, 0) restored=Some(Restored)
 json_done g=(0, 0) key=... saved=true is_big=true dur_ms=...
 ```
 
@@ -285,7 +286,7 @@ Then, with a >500-word prompt in the messages, send the prompt twice
 ```
 
 This is the same flow the test-suite validates; the identical flows are
-covered by `cargo test` (104 tests) against the in-process mock.
+covered by `cargo test` (125 tests) against the in-process mock.
 
 ---
 
@@ -338,6 +339,11 @@ journalctl -u lpcache -f
   cost is O(meta files), so a smaller bound is also faster.
 - **`WORDS_PER_BLOCK`** — changing it orphans existing caches (the restore
   filter skips mismatching `wpb`); only change it before caches are needed.
+- **`PREFILTER_BLOCKLIST`** — optional comma-separated keyword blocklist;
+  matching requests are rejected with `400` before any slot/backend work
+  (no KV cost at all). Matching is a plain case-insensitive substring by
+  default; set `PREFILTER_CASE_INSENSITIVE=false` for exact-case matches.
+  Unset/blank disables the prefilter entirely.
 
 ## 10. Troubleshooting
 
@@ -346,9 +352,10 @@ journalctl -u lpcache -f
 | `503 all slots busy, please retry later` | All slots locked for > 300 s — a client is stuck mid-stream, or `n_slots` exceeds the real `-np`. Check the `llama-server` logs. |
 | `backend_down be=N` / `chat_error` warnings (usually no client-visible errors) | Backend N became unreachable (crash, OOM, restart). The proxy skips it for 5 s (circuit breaker; 10/20/40/60 s on repeated failures), transparently retries the failing request once on another backend, and probes it every second — a recovered backend rejoins within ~1 s (`backend_up be=N`). A 500 is only returned when no other backend could serve the request. Check that backend's log / restart it. |
 | `save_slot_500` warnings, restore never happens | llama.cpp started without `--slot-save-path`, or an old build without the slot save/restore API. |
-| `restore_before_chat ... ok=false` | The KV `.bin` for that key is missing from `--slot-save-path` (deleted, or a different server/build). The request proceeds without the restore. |
+| `restore_before_chat ... ok=false` | The KV `.bin` for that key is missing from `--slot-save-path` (deleted, or a different server/build). The request proceeds without the restore. When the backend *rejects* the restore (HTTP 400) and the KV file is absent from **every** configured slot-save dir, the proxy also removes the stale meta entry (`stale_meta_removed` in the proxy log) so later requests stop retrying the doomed restore; if the file still exists somewhere (or the dir isn't visible from the proxy's host), the meta is kept. |
 | No `restore_candidate` on repeated prompts | Prompt below `BIG_THRESHOLD_WORDS` words, `LCP_TH` too high, different model, or different `WORDS_PER_BLOCK` than when the cache was saved. |
 | `422` from the proxy | Malformed JSON body. |
+| `400` `request blocked by keyword prefilter: "..."` | `PREFILTER_BLOCKLIST` matched the request's message contents; the request never reached the backend. Adjust/remove the keyword, or unset `PREFILTER_BLOCKLIST` to disable the prefilter. |
 | `502` `provider non-JSON body` | The backend answered 200 but with a JSON body that is not an object (e.g. an array); the response is unusable. |
 | 200 response with `{"object":"error", ...}` payload | The backend answered 200 with a non-JSON body; the raw snippet is included. |
 | Logs too quiet | `LOG_LEVEL=DEBUG` (or `RUST_LOG=lpcache=debug`). Key lines: `before_acquire`, `after_acquire`, `dispatch`, `restore_candidate`, `restore_before_chat`, `json_done`, `stream_reader_done`. With `COALESCE_REQUESTS` on, also `coalesce_lead`/`coalesce_join`. |

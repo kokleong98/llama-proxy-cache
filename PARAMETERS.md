@@ -66,6 +66,8 @@ precedence over the built-in defaults. `-h` / `--help` prints the built-in help.
 | `LOG_LEVEL` | `--log-level <LEVEL>` | `INFO` | `TRACE`..`ERROR`; **`RUST_LOG` env var overrides it when set** |
 | `STREAM_QUEUE_SIZE` | `--stream-queue-size <N>` | `16` | Capacity of the per-request bounded channel that buffers streamed SSE bytes between the background reader and the HTTP response. Must be `>= 1` (`0`/invalid fall back to the default with a warning). Smaller values backpressure a slow client faster; the default 16 matches the Python original |
 | `COALESCE_REQUESTS` | `--coalesce-requests <BOOL>` | `false` | Group concurrent requests with the same KV cache key into one backend call (followers receive the leader's result, regardless of generation parameters) |
+| `PREFILTER_BLOCKLIST` | `--prefilter-blocklist <LIST>` | — | Comma-separated keywords (surrounding whitespace ignored, empty entries dropped). When set, requests whose message contents (string content or text content parts) contain any keyword are **rejected with `400` before any slot/backend work** — no slot is acquired, no KV cache is restored/saved, no meta file is written, and the request never joins a coalescing group. Unset/blank = no prefilter |
+| `PREFILTER_CASE_INSENSITIVE` | `--prefilter-case-insensitive <BOOL>` | `true` | Prefilter keyword matching is case-insensitive |
 | — | `-V`, `--version` | — | Print the proxy version (from `Cargo.toml`) and exit; the version is also logged in the `app_start` line at startup |
 | — | `-h`, `--help` | — | Show help and exit |
 

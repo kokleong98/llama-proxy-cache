@@ -36,6 +36,25 @@ impl std::fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// Outcome of a restore attempt.
+///
+/// Python only distinguished "failed"; the `Rejected` (HTTP 400) case is
+/// split out so the proxy can tell a *useless KV file* (missing, corrupt,
+/// or too big for the slot's context) from a *transient* failure and clean
+/// up the stale meta entry (see `app::remove_stale_meta`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// The backend loaded the KV file into the slot (HTTP 200).
+    Restored,
+    /// The backend rejected the file (HTTP 400): it could not be loaded
+    /// on that backend (missing, corrupt, or no available space in the
+    /// slot's KV cache).
+    Rejected,
+    /// Any other failure (non-2xx other than 400, or network error) —
+    /// treat as transient.
+    Failed,
+}
+
 /// Outcome of a non-streaming chat call.
 #[derive(Debug)]
 pub enum JsonChat {
@@ -59,13 +78,16 @@ pub trait LlamaBackend: Send + Sync {
     /// `Ok(false)` on HTTP 500 (some builds fail that way), `Err` on other
     /// non-2xx / network errors — mirrors `raise_for_status` after the 500 check.
     async fn save_slot(&self, slot_id: usize, basename: &str) -> Result<bool, BackendError>;
-    /// `false` on any failure (non-200 or network error).
+    /// Restore a saved KV file into the slot.
+    ///
+    /// `Rejected` on HTTP 400 (the backend could not load the file),
+    /// `Failed` on any other non-2xx or network error.
     ///
     /// Deliberate deviation: Python's `restore_slot` propagates network
     /// errors, which in `app.py` becomes an unhandled 500 that also leaks
     /// the slot lock (the slot is never released). Here we log and return
-    /// `false` so the chat proceeds without the restore.
-    async fn restore_slot(&self, slot_id: usize, basename: &str) -> bool;
+    /// a non-`Restored` outcome so the chat proceeds without the restore.
+    async fn restore_slot(&self, slot_id: usize, basename: &str) -> RestoreOutcome;
     /// Model id reported by the backend; `"unknown"` on failure.
     async fn get_model_id(&self) -> String;
     async fn chat_stream(
@@ -183,7 +205,7 @@ impl LlamaBackend for LlamaClient {
         Ok(true)
     }
 
-    async fn restore_slot(&self, slot_id: usize, basename: &str) -> bool {
+    async fn restore_slot(&self, slot_id: usize, basename: &str) -> RestoreOutcome {
         let req = self.apply_auth(
             self.client
                 .post(format!("{}/slots/{slot_id}", self.base_url))
@@ -196,7 +218,7 @@ impl LlamaBackend for LlamaClient {
                     "restore_slot_fail slot={slot_id} basename={} err={e}",
                     &basename[..basename.len().min(16)]
                 );
-                false
+                RestoreOutcome::Failed
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -205,9 +227,12 @@ impl LlamaBackend for LlamaClient {
                         "restore_slot_status={status} slot={slot_id} basename={}",
                         &basename[..basename.len().min(16)]
                     );
-                    return false;
                 }
-                true
+                match status {
+                    200 => RestoreOutcome::Restored,
+                    400 => RestoreOutcome::Rejected,
+                    _ => RestoreOutcome::Failed,
+                }
             }
         }
     }

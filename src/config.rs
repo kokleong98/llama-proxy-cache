@@ -21,6 +21,11 @@
 //! - `STREAM_QUEUE_SIZE` (16; capacity of the per-request bounded channel
 //!   that buffers streamed SSE bytes between the background reader and the
 //!   HTTP response — smaller values backpressure the backend faster)
+//! - `PREFILTER_BLOCKLIST` (optional: comma-separated keywords; when set,
+//!   requests whose message contents contain any keyword are rejected with
+//!   `400` before any slot/backend work — see the `prefilter` module)
+//! - `PREFILTER_CASE_INSENSITIVE` (`true`; keyword matching is
+//!   case-insensitive)
 //! - `LOG_LEVEL` (`INFO`)
 //!
 //! Every variable can also be set with a command-line flag (see [`Cli`]);
@@ -30,6 +35,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_BACKEND_URL: &str = "http://127.0.0.1:8000";
@@ -44,6 +50,9 @@ pub const DEFAULT_MODEL_ID: &str = "llama.cpp";
 pub const DEFAULT_PORT: u16 = 8081;
 pub const DEFAULT_LOG_LEVEL: &str = "INFO";
 pub const DEFAULT_STREAM_QUEUE_SIZE: usize = 16;
+/// `PREFILTER_CASE_INSENSITIVE` default: keyword matching is
+/// case-insensitive.
+pub const DEFAULT_PREFILTER_CASE_INSENSITIVE: bool = true;
 
 /// Crate version from `Cargo.toml`, reported by `-V` / `--version` and
 /// logged at startup in the `app_start` line.
@@ -92,6 +101,12 @@ pub struct Config {
     /// key into a single backend call, regardless of generation parameters
     /// (followers receive the leader's result — see the `coalesce` module).
     pub coalesce_requests: bool,
+    /// `PREFILTER_BLOCKLIST`: comma-separated keywords; when non-empty the
+    /// proxy rejects requests whose message contents contain any of them
+    /// before any slot/backend work (see the `prefilter` module).
+    pub prefilter_blocklist: Vec<String>,
+    /// `PREFILTER_CASE_INSENSITIVE`: case-insensitive keyword matching.
+    pub prefilter_case_insensitive: bool,
 }
 
 /// Command-line options, one-to-one with the environment variables above.
@@ -125,6 +140,10 @@ pub struct Cli {
     pub stream_queue_size: Option<String>,
     /// Maps to `COALESCE_REQUESTS` (`true`/`false`, or `1`/`0`).
     pub coalesce_requests: Option<String>,
+    /// Maps to `PREFILTER_BLOCKLIST` (comma-separated keywords).
+    pub prefilter_blocklist: Option<String>,
+    /// Maps to `PREFILTER_CASE_INSENSITIVE` (`true`/`false`, or `1`/`0`).
+    pub prefilter_case_insensitive: Option<String>,
 }
 
 impl Config {
@@ -155,6 +174,8 @@ impl Config {
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             stream_queue_size: DEFAULT_STREAM_QUEUE_SIZE,
             coalesce_requests: false,
+            prefilter_blocklist: Vec::new(),
+            prefilter_case_insensitive: DEFAULT_PREFILTER_CASE_INSENSITIVE,
         }
     }
 
@@ -176,6 +197,32 @@ impl Config {
     pub fn with_stream_queue_size(mut self, size: usize) -> Self {
         self.stream_queue_size = size.max(1);
         self
+    }
+
+    /// Override the prefilter blocklist (`PREFILTER_BLOCKLIST`).
+    pub fn with_prefilter_blocklist(mut self, keywords: Vec<String>) -> Self {
+        self.prefilter_blocklist = keywords;
+        self
+    }
+
+    /// Override the prefilter case-sensitivity flag
+    /// (`PREFILTER_CASE_INSENSITIVE`).
+    pub fn with_prefilter_case_insensitive(mut self, on: bool) -> Self {
+        self.prefilter_case_insensitive = on;
+        self
+    }
+
+    /// The prefilter adapter enabled by this configuration, or `None`
+    /// when `PREFILTER_BLOCKLIST` is empty/unset (the default: requests
+    /// are forwarded without any prefilter check).
+    pub fn prefilter(&self) -> Option<Arc<dyn crate::prefilter::Prefilter>> {
+        if self.prefilter_blocklist.is_empty() {
+            return None;
+        }
+        Some(Arc::new(crate::prefilter::KeywordPrefilter::new(
+            self.prefilter_blocklist.clone(),
+            self.prefilter_case_insensitive,
+        )))
     }
 
     /// `--slot-save-path` directories known to the proxy, used to remove
@@ -269,6 +316,22 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string()),
             stream_queue_size: env_stream_queue_size(vars),
             coalesce_requests: env_bool(vars, "COALESCE_REQUESTS", false),
+            // Comma-separated keywords; empty entries dropped. Unset /
+            // blank list = prefilter disabled.
+            prefilter_blocklist: vars
+                .get("PREFILTER_BLOCKLIST")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|k| k.trim().to_string())
+                        .filter(|k| !k.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            prefilter_case_insensitive: env_bool(
+                vars,
+                "PREFILTER_CASE_INSENSITIVE",
+                DEFAULT_PREFILTER_CASE_INSENSITIVE,
+            ),
         }
     }
 
@@ -394,6 +457,8 @@ impl Cli {
                 "--log-level" => cli.log_level = Some(value),
                 "--stream-queue-size" => cli.stream_queue_size = Some(value),
                 "--coalesce-requests" => cli.coalesce_requests = Some(value),
+                "--prefilter-blocklist" => cli.prefilter_blocklist = Some(value),
+                "--prefilter-case-insensitive" => cli.prefilter_case_insensitive = Some(value),
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -425,6 +490,8 @@ Options:
   --log-level <LEVEL>           LOG_LEVEL            TRACE..ERROR (default INFO; RUST_LOG overrides)
   --stream-queue-size <N>       STREAM_QUEUE_SIZE    per-request SSE channel capacity (default 16, must be >= 1)
   --coalesce-requests <BOOL>    COALESCE_REQUESTS    group concurrent same-key requests into one backend call (default false)
+  --prefilter-blocklist <LIST>  PREFILTER_BLOCKLIST  comma-separated keywords; matching requests are rejected (400) before the backend (default: disabled)
+  --prefilter-case-insensitive <BOOL>  PREFILTER_CASE_INSENSITIVE  keyword matching is case-insensitive (default true)
   -V, --version                 show version and exit
   -h, --help                    show this help and exit
 
@@ -440,6 +507,10 @@ Notes:
     booleans accept 1/true/yes/on and 0/false/no/off
   * META_MAX=0 disables pruning; a restore of a pruned key falls back to a
     full prefill
+  * PREFILTER_BLOCKLIST is a comma-separated keyword list (surrounding
+    whitespace ignored); when set, requests whose message contents contain
+    any keyword are rejected with 400 before slot acquisition or backend
+    dispatch; unset/blank = no prefilter
   * the backend should be started with matching llama-server flags:
     -np/--parallel (N_SLOTS), --api-key (LLAMA_API_KEY) and a
     --slot-save-path directory (SLOT_SAVE_PATH)
@@ -469,6 +540,11 @@ Notes:
             ("LOG_LEVEL", &self.log_level),
             ("STREAM_QUEUE_SIZE", &self.stream_queue_size),
             ("COALESCE_REQUESTS", &self.coalesce_requests),
+            ("PREFILTER_BLOCKLIST", &self.prefilter_blocklist),
+            (
+                "PREFILTER_CASE_INSENSITIVE",
+                &self.prefilter_case_insensitive,
+            ),
         ];
         for (env_name, value) in opts {
             if let Some(v) = value {
@@ -745,6 +821,8 @@ mod tests {
             "--log-level",
             "--stream-queue-size",
             "--coalesce-requests",
+            "--prefilter-blocklist",
+            "--prefilter-case-insensitive",
             "--version",
             "--help",
         ] {
@@ -767,6 +845,8 @@ mod tests {
             "LOG_LEVEL",
             "STREAM_QUEUE_SIZE",
             "COALESCE_REQUESTS",
+            "PREFILTER_BLOCKLIST",
+            "PREFILTER_CASE_INSENSITIVE",
         ] {
             assert!(usage.contains(env), "usage missing {env}");
         }
@@ -814,6 +894,54 @@ mod tests {
         // builder clamps below 1 to 1
         let c = Config::from_env_map(&HashMap::new()).with_stream_queue_size(0);
         assert_eq!(c.stream_queue_size, 1);
+    }
+
+    #[test]
+    fn prefilter_env_and_cli() {
+        // default: disabled
+        let c = Config::from_env_map(&HashMap::new());
+        assert!(c.prefilter_blocklist.is_empty());
+        assert!(c.prefilter_case_insensitive);
+        assert!(c.prefilter().is_none());
+
+        // env: comma list trimmed, empty entries dropped
+        let c = Config::from_env_map(&vars(&[
+            ("PREFILTER_BLOCKLIST", "a, b ,c,,  "),
+            ("PREFILTER_CASE_INSENSITIVE", "false"),
+        ]));
+        assert_eq!(
+            c.prefilter_blocklist,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert!(!c.prefilter_case_insensitive);
+        let pf = c.prefilter().expect("prefilter enabled");
+        assert_eq!(pf.name(), "keyword");
+
+        // blank list = disabled
+        assert!(
+            Config::from_env_map(&vars(&[("PREFILTER_BLOCKLIST", " , ")]))
+                .prefilter()
+                .is_none()
+        );
+
+        // invalid boolean -> default (case-insensitive)
+        assert!(
+            Config::from_env_map(&vars(&[("PREFILTER_CASE_INSENSITIVE", "oops")]))
+                .prefilter_case_insensitive
+        );
+
+        // CLI wins over env
+        let cli = Cli::parse(vec![
+            "--prefilter-blocklist".to_string(),
+            "cli-kw".to_string(),
+            "--prefilter-case-insensitive".to_string(),
+            "false".to_string(),
+        ])
+        .unwrap();
+        let merged = cli.merged_env(&vars(&[("PREFILTER_BLOCKLIST", "env-kw")]));
+        let c = Config::from_env_map(&merged);
+        assert_eq!(c.prefilter_blocklist, vec!["cli-kw".to_string()]);
+        assert!(!c.prefilter_case_insensitive);
     }
 
     #[test]
