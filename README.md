@@ -10,17 +10,26 @@ full prefill cost every time.
 
 ## How it works
 
-1. **Request prefilter** (optional) — when `PREFILTER_BLOCKLIST` is set,
+1. **Request prefilter** (optional) — when a prefilter is configured,
    every chat request is checked by a prefilter adapter
    (`src/prefilter.rs`) right after body parsing and cache-key
    computation and **before** coalescing, slot acquisition, or backend
-   dispatch. The built-in adapter rejects requests whose message
-   contents contain a blocked keyword (plain substring match,
-   case-insensitive by default, `PREFILTER_CASE_INSENSITIVE`) with a
-   `400` JSON error; the request never reaches llama-server — no slot is
-   acquired, no KV cache is restored or saved, no meta file is written,
-   and the request never leads or joins a coalescing group. Custom
-   accept/reject logic plugs in through the `Prefilter` trait.
+   dispatch. Two built-in adapters: the **keyword blocklist**
+   (`PREFILTER_BLOCKLIST`) rejects requests whose message contents
+   contain a blocked keyword (plain substring match, case-insensitive by
+   default, `PREFILTER_CASE_INSENSITIVE`) with a `400` JSON error, and the
+   **result cache** (`PREFILTER_RESULT_CACHE_DIR`) answers fresh
+   (non-expired, `PREFILTER_RESULT_CACHE_TTL`) same-key requests with a
+   previously cached backend result stored at `{dir}/{key}.json` — fresh
+   non-streaming results are stored there after the backend call;
+   streaming requests are never served from the cache. In both cases the
+   request never reaches llama-server — no slot is acquired, no KV cache
+   is restored or saved, no meta file is written, and the request never
+   leads or joins a coalescing group (when both are enabled the
+   blocklist runs first). Custom accept/reject/serve logic plugs in
+   through the `Prefilter` trait; result-cache hits can trigger a
+   pluggable post-serve cleanup adapter (`PostCleanup`, e.g. the built-in
+   `RemoveAfterServe` one-shot cleanup).
 2. **Prefix hashing** — the concatenated message contents (roles
    stripped) are split into words (`\w+`, lowercased), chunked into blocks
    of `WORDS_PER_BLOCK` (default 100) words, and each block is SHA256-hashed.
@@ -77,6 +86,8 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
 | `PREFILTER_BLOCKLIST` | —                 | comma-separated keywords; requests whose message contents contain any are rejected with `400` before the backend (default: no prefilter) |
 | `PREFILTER_CASE_INSENSITIVE` | `true`     | keyword matching is case-insensitive           |
+| `PREFILTER_RESULT_CACHE_DIR` | —          | cache-result path (`{key}.json` per cache key); fresh same-key requests are answered from the cached backend result before the backend (default: disabled) |
+| `PREFILTER_RESULT_CACHE_TTL` | `300` (s)    | per-entry result-cache expiry; `0` = never expires |
 
 Every variable is also available as a command-line flag (see
 `./target/release/lpcache --help`): `--backends`, `--llama-url`,
@@ -85,7 +96,9 @@ Every variable is also available as a command-line flag (see
 `--model-id`, `--port`, `--api-key` (→ `LLAMA_API_KEY`), `--log-level`,
 `--stream-queue-size`,
 `--coalesce-requests`, `--prefilter-blocklist` (→ `PREFILTER_BLOCKLIST`),
-`--prefilter-case-insensitive` (→ `PREFILTER_CASE_INSENSITIVE`).
+`--prefilter-case-insensitive` (→ `PREFILTER_CASE_INSENSITIVE`),
+`--prefilter-result-cache-dir` (→ `PREFILTER_RESULT_CACHE_DIR`),
+`--prefilter-result-cache-ttl` (→ `PREFILTER_RESULT_CACHE_TTL`).
 `-h`/`--help` shows the full help; `-V`/`--version` prints the proxy version
 (also logged in the `app_start` line at startup).
 Explicit flags take precedence over environment variables, which take

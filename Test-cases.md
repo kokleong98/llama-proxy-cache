@@ -4,7 +4,7 @@ Complete catalog of the **lpcache** regression suite (KV-cache-aware,
 OpenAI-compatible proxy for llama.cpp). Every entry maps 1:1 to a test
 function; the full suite runs with `cargo test`.
 
-**Total: 129 test cases** — 77 unit + 37 API integration + 15 client
+**Total: 148 test cases** — 91 unit + 42 API integration + 15 client
 integration.
 
 | # | Suite | Location | Tests |
@@ -22,9 +22,9 @@ integration.
 
 ```sh
 cd lpcache
-cargo test                    # full regression suite (129 tests, ~4 s)
-cargo test --lib              # 77 unit tests only
-cargo test --test api         # 37 API integration tests
+cargo test                    # full regression suite (148 tests, ~4 s)
+cargo test --lib              # 91 unit tests only
+cargo test --test api         # 42 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test <name-substring>   # run a single test by name filter
 cargo clippy --all-targets    # lint gate (expected: 0 warnings)
@@ -34,7 +34,7 @@ Integration tests start `MockLlama` — an in-process mock of the llama.cpp
 server (`src/mock_backend.rs`) on free localhost ports — so the suite needs
 no real `llama-server`, model files, or network access.
 
-## 1. Configuration — `src/config.rs` (25)
+## 1. Configuration — `src/config.rs` (27)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -62,12 +62,14 @@ no real `llama-server`, model files, or network access.
 | 22 | `stream_queue_size_env_and_cli` | `STREAM_QUEUE_SIZE` env + CLI | default 16; env `64` applied; `0` / invalid → default; CLI `--stream-queue-size 8` overrides env; builder clamps below 1 to 1 |
 | 23 | `prefilter_env_and_cli` | `PREFILTER_BLOCKLIST` / `PREFILTER_CASE_INSENSITIVE` env + CLI | default disabled (empty list, case-insensitive); comma list trimmed with empty entries dropped; blank list = disabled; invalid bool → default; CLI wins over env |
 | 24 | `config_precedence_cli_over_env_over_defaults` | CLI > env > default (merged env map **and** final Config) | CLI overrides; env applies to unset flags; unset flags add nothing; default otherwise |
+| | 26 | `prefilter_result_cache_env_and_cli` | `PREFILTER_RESULT_CACHE_DIR` / `PREFILTER_RESULT_CACHE_TTL` env + CLI | default disabled (no dir, 300 s TTL); dir + TTL applied; blank dir = disabled; `0` = never expire; invalid/negative TTL → default; CLI wins over env; builder clamps negative TTL to 0 |
+| | 27 | `prefilter_combines_keyword_and_result_cache` | which adapter `Config::prefilter()` builds | blocklist only → `keyword`; result cache only → `result_cache`; both → `chain` (blocklist first) |
 | 25 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
 
-## 2. Request prefilter adapter — `src/prefilter.rs` (9)
+## 2. Request prefilter adapter — `src/prefilter.rs` (11)
 
-The accept/reject adapter consulted before any slot/backend work (see the
-`prefilter` module docs).
+The accept/reject/serve adapter consulted before any slot/backend work
+(see the `prefilter` module docs).
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -81,6 +83,8 @@ The accept/reject adapter consulted before any slot/backend work (see the
 | 8 | `from_comma_list_trims_and_drops_empty` | `PREFILTER_BLOCKLIST`-style parsing | trimmed list; whitespace-only/empty → `None` (disabled) |
 | 9 | `trait_object_dispatch` | adapter behind `Arc<dyn Prefilter>` (the `AppState` shape) | `name()` + `check()` dispatch correctly |
 
+| | 10 | `chain_first_non_accept_wins` | `ChainPrefilter` (keyword → serve-fixture) | clean request → `Serve` from the 2nd adapter; blocked request → `Reject { 400 }` from the 1st beats the later serve |
+| | 11 | `chain_all_accepts_accepts` | all adapters return `Accept` | chain returns `Accept` |
 ## 3. Hashing, meta files, pruning — `src/hashing.rs` (19)
 
 | # | Test case | What it verifies | Expected result |
@@ -147,7 +151,7 @@ save/restore semantics and the backend circuit breaker.
 | 16 | `probe_down_backends_recovers_up_backend` | probe recovery | one probe round recovers a live backend; healthy backends not counted |
 | 17 | `acquire_excluding_picks_other_backend` | retry on a different backend | exclude be0 → be1 slot 0; single backend → fast error (no 300 s wait) |
 
-## 7. API end-to-end — `tests/api.rs` (37)
+## 7. API end-to-end — `tests/api.rs` (42)
 
 The real proxy router (axum) in front of `MockLlama`, which records every
 chat body/query, restore and save. Default setup: 1 backend, 2 slots,
@@ -194,6 +198,11 @@ behaviour requires a real connection).
 | 35 | `restore_touches_lru_timestamp_so_prune_keeps_hot_entry` | `META_MAX=2`; saves A, B, C (prunes A); then B+tail restores B and saves B' | the successful restore bumps B's LRU timestamp → B's own post-save prune evicts C (the true oldest), not the just-restored B |
 | 36 | `restore_rejected_cleans_up_stale_meta` | save A (KV created); delete A's KV; mock restore → 400; A+tail; A+tail again; delete KV; A+tail2 | 400 with the KV absent from every slot-save dir → stale meta removed (`stale_meta_removed`); 400 with the KV still present → meta **kept** (may be transient); final request saves a fresh entry |
 | 37 | `restore_rejected_keeps_meta_when_save_dir_unvisible` | configured slot-save dir does not exist on the proxy's host; mock restore → 400 | absence of the KV file can't be verified (remote backend) → meta kept (status quo) |
+| | 38 | `result_cache_serves_cached_result_without_backend` | 1st request stores the result in the cache dir; 2nd same-key request | 2nd served from cache (identical body, 200) with **no** backend call, no save/restore, no meta file; a different key misses → backend |
+| | 39 | `result_cache_expires_after_ttl` | TTL 0.2 s; fresh hit, then 300 ms sleep | fresh entry served from cache; after the TTL the entry is expired + lazily removed and the request goes to the backend (new entry stored) |
+| | 40 | `result_cache_stream_requests_bypass_cache` | same key, `stream: true` after a cached non-stream result | SSE (`text/event-stream`) from the backend — streaming requests are never served from the cache |
+| | 41 | `result_cache_remove_after_serve_cleanup` | `RemoveAfterServe` post-cleanup attached; 3 same-key requests | 1st → backend (entry stored); 2nd → served from cache, then entry file removed; 3rd → backend again (one-shot cache) |
+| | 42 | `keyword_blocklist_rejects_before_result_cache_serves` | blocklist + result cache chained; blocked prompt with a pre-populated cache entry | `400` from the blocklist — the reject beats the cached serve; backend never called |
 
 ## 8. Backend client — HTTP behavior — `tests/client.rs` (15)
 
@@ -218,6 +227,26 @@ tests capture the raw request on a one-shot TCP server.
 | 14 | `restore_slot_statuses` | `POST /slot/{id}/restore` | 200 → `Restored`, 400 → `Rejected`, 500 → `Failed` (no error); calls recorded |
 | 15 | `base_url_trailing_slash_normalized` | backend URL with a trailing `/` | works — model id resolved |
 
+## 9. Result cache + cached-result prefilter — `src/result_cache.rs` (10)
+
+File-based cache of non-streaming backend results keyed by the request KV
+cache key (`{dir}/{key}.json` with `status`/`body`/`stored_at`), the
+`CachedResultPrefilter` adapter (`PrefilterDecision::Serve` on a fresh hit)
+and the `PostCleanup` post-serve cleanup adapter.
+
+| # | Test case | What it verifies | Expected result |
+|---|-----------|------------------|-----------------|
+| | 1 | `put_get_roundtrip` | store/fetch/overwrite an entry | roundtrip of `(status, body)`; missing key → `None`; no temp files left |
+| | 2 | `expired_entry_misses_and_is_removed` | TTL 50 ms, read after 60 ms | miss + the entry file is removed (lazy expiry) |
+| | 3 | `zero_ttl_never_expires` | TTL `0` | entry stays fresh |
+| | 4 | `corrupt_entry_misses_and_is_removed` | unreadable JSON entry | miss + removed (self-healing) |
+| | 5 | `prefilter_serves_fresh_hit` | miss → `Accept`; after `put`, hit | `Serve { status, body }`; the adapter exposes the backing cache |
+| | 6 | `prefilter_ignores_stream_requests` | `stream: true` with a fresh hit | `Accept` (never served) |
+| | 7 | `prefilter_ignores_expired_entries` | hit after TTL elapsed | `Accept` |
+| | 8 | `remove_after_serve_deletes_the_entry` | `RemoveAfterServe` cleanup on a hit | `Serve`, entry file removed, next check misses |
+| | 9 | `remove_after_serve_missing_file_is_noop` | cleanup on an absent file | no error (concurrent-serve race is safe) |
+| | 10 | `trait_object_dispatch` | adapter behind `Arc<dyn Prefilter>` | `name()` = `result_cache`; dispatch works |
+
 ## Coverage notes
 
 **Layering.** Pure functions (hashing) → components (config, coalescing,
@@ -237,7 +266,8 @@ client-disconnect behaviour.
 | Idle-aware slot selection | `pick_skips_held_slot_in_favor_of_idle` |
 | Bounded cache pruning (`META_MAX`) | `prune_meta_*` (unit), `prune_removes_oldest_meta_and_kv_files` (E2E) |
 | Concurrent-request coalescing (Rust-only feature) | 4 unit + 6 E2E coalesce tests |
-| Request prefilter adapter (Rust-only feature) | 9 unit + 8 E2E prefilter tests |
+| Request prefilter adapter (Rust-only feature) | 11 unit + 8 E2E prefilter tests |
+| Result cache + cached-result prefilter (Rust-only feature) | 10 unit + 5 E2E tests (4 result-cache + 1 blocklist-over-cache chain) |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 
 **Suite health (2026-09-02).** 129/129 passing, clippy clean, ~4 s wall

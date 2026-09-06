@@ -17,13 +17,16 @@
 //!     upstream request to llama-server the same way
 //!   - 503 when no slot could be acquired within the 300 s timeout
 //!
-//! Request prefilter (optional): when `PREFILTER_BLOCKLIST` is set,
-//! every request is checked by the prefilter adapter
-//! (`crate::prefilter`) right after body parsing / cache-key
+//! Request prefilter (optional): when a prefilter adapter is enabled
+//! (`PREFILTER_BLOCKLIST` keyword blocklist and/or
+//! `PREFILTER_RESULT_CACHE_DIR` result cache), every request is checked by
+//! it (`crate::prefilter`) right after body parsing / cache-key
 //! computation and **before** coalescing, slot acquisition and backend
-//! dispatch: rejected requests get an immediate JSON error and never
-//! reach the llama-server backend (no slot, no restore/save, no meta
-//! file, no coalescing group).
+//! dispatch: rejected requests get an immediate JSON error, and cached
+//! results are served directly — in both cases the request never reaches
+//! the llama-server backend (no slot, no restore/save, no meta file, no
+//! coalescing group). Successful non-streaming backend results are stored
+//! in the result cache (when enabled) after the backend call.
 //!
 //! Concurrent-request coalescing (`COALESCE_REQUESTS`): when enabled,
 //! concurrent requests with the same cache key form one group regardless
@@ -37,6 +40,7 @@ use crate::config::Config;
 use crate::hashing;
 use crate::llama_client::{BackendError, JsonChat, LlamaBackend, RestoreOutcome};
 use crate::prefilter::{Prefilter, PrefilterDecision, PrefilterRequest};
+use crate::result_cache::ResultCache;
 use crate::slot_manager::{AcquireTimeout, GSlot, SlotGuard, SlotManager};
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -61,9 +65,14 @@ pub struct AppState {
     /// `config.coalesce_requests` is enabled).
     pub sf: Arc<SingleFlight>,
     /// Optional prefilter adapter consulted before any slot/backend work
-    /// (`None` when `PREFILTER_BLOCKLIST` is unset — the default; see the
+    /// (`None` when no prefilter is configured — the default; see the
     /// `prefilter` module).
     pub prefilter: Option<Arc<dyn Prefilter>>,
+    /// Optional result cache (enabled when `PREFILTER_RESULT_CACHE_DIR` is
+    /// set): fresh non-streaming backend results are stored here under the
+    /// request's cache key, and the result-cache prefilter serves hits
+    /// before any slot/backend work (see the `result_cache` module).
+    pub result_cache: Option<Arc<ResultCache>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -117,9 +126,10 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
     let n_words = hashing::words_from_text(&prefix).len();
     let is_big = n_words > state.config.big_threshold_words;
 
-    // Prefilter adapter: accept/reject the request before coalescing,
-    // slot acquisition, or backend dispatch. Rejected requests get an
-    // immediate JSON error and never reach the llama-server backend (no
+    // Prefilter adapter: short-circuit the request before coalescing,
+    // slot acquisition, or backend dispatch. A `Reject` gets an immediate
+    // JSON error, a `Serve` gets a previously cached backend result — in
+    // both cases the request never reaches the llama-server backend (no
     // slot, no restore/save, no meta file, no coalescing group).
     if let Some(pf) = &state.prefilter {
         let preq = PrefilterRequest {
@@ -147,6 +157,15 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
                     short16(&key)
                 );
                 return json_error(status, message);
+            }
+            PrefilterDecision::Serve { status, body } => {
+                tracing::info!(
+                    "prefilter_serve filter={} key={} status={status} n_words={n_words}",
+                    pf.name(),
+                    short16(&key)
+                );
+                let st = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+                return (st, axum::Json(body)).into_response();
             }
         }
     }
@@ -630,6 +649,16 @@ async fn run_pipeline(
                         short16(key),
                         t0.elapsed().as_millis()
                     );
+                    // Result cache: store the fresh backend result under the
+                    // request's cache key so a later same-key (non-stream)
+                    // request is answered by the result-cache prefilter
+                    // before any slot/backend work (see the `result_cache`
+                    // module). Streaming results are not stored.
+                    if let Some(rc) = &state.result_cache
+                        && let Err(e) = rc.put(key, 200, &out)
+                    {
+                        tracing::warn!("result_cache_store_fail key={}: {e}", short16(key));
+                    }
                     return (
                         (StatusCode::OK, axum::Json(out.clone())).into_response(),
                         Some(SharedOutcome::Json(200, out)),
