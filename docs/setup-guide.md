@@ -155,7 +155,7 @@ Expected startup logs:
 ```
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
-slot_manager n_backends=2 total_slots=6
+slot_manager n_backends=2 total_slots=2
 app_start version=0.2.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
@@ -331,6 +331,23 @@ Then, with a >500-word prompt in the messages, send the prompt twice
 
 This is the same flow the test-suite validates; the identical flows are
 covered by `cargo test` (148 tests) against the in-process mock.
+
+### 7.1 Load test (optional)
+
+The project also ships a concurrent load-test client for any
+OpenAI-compatible endpoint (the proxy, a mock backend, or a real
+`llama-server`):
+
+```bash
+cargo run --release --example load_test -- [base_url] [workers] [duration_secs] [big_words]
+# defaults: http://127.0.0.1:8091 100 120 600
+```
+
+Each worker sticks to one of three shared long prompts (`worker_id % 3`),
+so most requests exercise the restore hot path; every 5th request is a
+small prompt (uncached by design). When the run finishes it prints a
+status-code breakdown and latency percentiles (client-side, including
+proxy queue wait).
 
 ---
 

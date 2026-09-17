@@ -88,6 +88,8 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `PREFILTER_CASE_INSENSITIVE` | `true`     | keyword matching is case-insensitive           |
 | `PREFILTER_RESULT_CACHE_DIR` | —          | cache-result path (`{key}.json` per cache key); fresh same-key requests are answered from the cached backend result before the backend (default: disabled) |
 | `PREFILTER_RESULT_CACHE_TTL` | `300` (s)    | per-entry result-cache expiry; `0` = never expires |
+| `SAVE_RETRIES` | `3`                 | retries after a failed KV cache save (backend 500 or other error); `0` = no retry |
+| `SAVE_RETRY_DELAY_MS` | `1000` (ms)   | delay between KV cache save retry attempts          |
 
 Every variable is also available as a command-line flag (see
 `./target/release/lpcache --help`): `--backends`, `--llama-url`,
@@ -98,7 +100,9 @@ Every variable is also available as a command-line flag (see
 `--coalesce-requests`, `--prefilter-blocklist` (→ `PREFILTER_BLOCKLIST`),
 `--prefilter-case-insensitive` (→ `PREFILTER_CASE_INSENSITIVE`),
 `--prefilter-result-cache-dir` (→ `PREFILTER_RESULT_CACHE_DIR`),
-`--prefilter-result-cache-ttl` (→ `PREFILTER_RESULT_CACHE_TTL`).
+`--prefilter-result-cache-ttl` (→ `PREFILTER_RESULT_CACHE_TTL`),
+`--save-retries` (→ `SAVE_RETRIES`),
+`--save-retry-delay-ms` (→ `SAVE_RETRY_DELAY_MS`).
 `-h`/`--help` shows the full help; `-V`/`--version` prints the proxy version
 (also logged in the `app_start` line at startup).
 Explicit flags take precedence over environment variables, which take

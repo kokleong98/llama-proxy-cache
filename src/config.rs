@@ -18,6 +18,10 @@
 //! - `COALESCE_REQUESTS` (`false`; when true, concurrent requests with the
 //!   same KV cache key are grouped into a single backend call regardless of
 //!   generation parameters — see the `coalesce` module)
+//! - `SAVE_RETRIES` (3) and `SAVE_RETRY_DELAY_MS` (1000): a failed KV cache
+//!   save (backend 500 or network/other error) is retried by the slot
+//!   manager up to `SAVE_RETRIES` times, waiting `SAVE_RETRY_DELAY_MS`
+//!   milliseconds between attempts (`0` retries = disabled)
 //! - `STREAM_QUEUE_SIZE` (16; capacity of the per-request bounded channel
 //!   that buffers streamed SSE bytes between the background reader and the
 //!   HTTP response — smaller values backpressure the backend faster)
@@ -63,6 +67,12 @@ pub const DEFAULT_PREFILTER_CASE_INSENSITIVE: bool = true;
 /// `PREFILTER_RESULT_CACHE_TTL` default: per-entry expiry in seconds
 /// (`0` = entries never expire).
 pub const DEFAULT_PREFILTER_RESULT_CACHE_TTL_SECS: f64 = 300.0;
+/// `SAVE_RETRIES` default: retries after a failed KV cache save (backend
+/// 500 or network/other error) before giving up (`0` = no retry).
+pub const DEFAULT_SAVE_RETRIES: usize = 3;
+/// `SAVE_RETRY_DELAY_MS` default: delay in milliseconds between save retry
+/// attempts.
+pub const DEFAULT_SAVE_RETRY_DELAY_MS: u64 = 1000;
 
 /// Crate version from `Cargo.toml`, reported by `-V` / `--version` and
 /// logged at startup in the `app_start` line.
@@ -126,6 +136,12 @@ pub struct Config {
     /// `PREFILTER_RESULT_CACHE_TTL`: per-entry expiry in seconds
     /// (`0` = entries never expire).
     pub prefilter_result_cache_ttl_secs: f64,
+    /// `SAVE_RETRIES`: retries after a failed KV cache save (backend 500 or
+    /// network/other error) before giving up (`0` = no retry).
+    pub save_retries: usize,
+    /// `SAVE_RETRY_DELAY_MS`: delay in milliseconds between save retry
+    /// attempts.
+    pub save_retry_delay_ms: u64,
 }
 
 /// Command-line options, one-to-one with the environment variables above.
@@ -167,6 +183,10 @@ pub struct Cli {
     pub prefilter_result_cache_dir: Option<String>,
     /// Maps to `PREFILTER_RESULT_CACHE_TTL` (per-entry expiry, seconds).
     pub prefilter_result_cache_ttl: Option<String>,
+    /// Maps to `SAVE_RETRIES` (retries after a failed KV cache save).
+    pub save_retries: Option<String>,
+    /// Maps to `SAVE_RETRY_DELAY_MS` (delay between save retry attempts).
+    pub save_retry_delay_ms: Option<String>,
 }
 
 impl Config {
@@ -201,6 +221,8 @@ impl Config {
             prefilter_case_insensitive: DEFAULT_PREFILTER_CASE_INSENSITIVE,
             prefilter_result_cache_dir: None,
             prefilter_result_cache_ttl_secs: DEFAULT_PREFILTER_RESULT_CACHE_TTL_SECS,
+            save_retries: DEFAULT_SAVE_RETRIES,
+            save_retry_delay_ms: DEFAULT_SAVE_RETRY_DELAY_MS,
         }
     }
 
@@ -403,6 +425,12 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             prefilter_result_cache_ttl_secs: env_result_cache_ttl(vars),
+            save_retries: env_int(vars, "SAVE_RETRIES", DEFAULT_SAVE_RETRIES),
+            save_retry_delay_ms: env_int(
+                vars,
+                "SAVE_RETRY_DELAY_MS",
+                DEFAULT_SAVE_RETRY_DELAY_MS as usize,
+            ) as u64,
         }
     }
 
@@ -551,6 +579,8 @@ impl Cli {
                 "--prefilter-case-insensitive" => cli.prefilter_case_insensitive = Some(value),
                 "--prefilter-result-cache-dir" => cli.prefilter_result_cache_dir = Some(value),
                 "--prefilter-result-cache-ttl" => cli.prefilter_result_cache_ttl = Some(value),
+                "--save-retries" => cli.save_retries = Some(value),
+                "--save-retry-delay-ms" => cli.save_retry_delay_ms = Some(value),
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -586,6 +616,8 @@ Options:
   --prefilter-case-insensitive <BOOL>  PREFILTER_CASE_INSENSITIVE  keyword matching is case-insensitive (default true)
   --prefilter-result-cache-dir <PATH>  PREFILTER_RESULT_CACHE_DIR  dir for cached backend results ({key}.json); when set, fresh same-key non-stream requests are answered from the cache before the backend (default: disabled)
   --prefilter-result-cache-ttl <SECS>  PREFILTER_RESULT_CACHE_TTL  cached-result expiry in seconds (default 300, 0 = never)
+  --save-retries <N>            SAVE_RETRIES         retries after a failed KV cache save (backend 500 or other error) (default 3, 0 = no retry)
+  --save-retry-delay-ms <MS>    SAVE_RETRY_DELAY_MS  delay in milliseconds between save retry attempts (default 1000)
   -V, --version                 show version and exit
   -h, --help                    show this help and exit
 
@@ -654,6 +686,8 @@ Notes:
                 "PREFILTER_RESULT_CACHE_TTL",
                 &self.prefilter_result_cache_ttl,
             ),
+            ("SAVE_RETRIES", &self.save_retries),
+            ("SAVE_RETRY_DELAY_MS", &self.save_retry_delay_ms),
         ];
         for (env_name, value) in opts {
             if let Some(v) = value {
@@ -693,6 +727,8 @@ mod tests {
         assert_eq!(c.port, 8081);
         assert_eq!(c.log_level, "INFO");
         assert_eq!(c.stream_queue_size, 16);
+        assert_eq!(c.save_retries, DEFAULT_SAVE_RETRIES);
+        assert_eq!(c.save_retry_delay_ms, DEFAULT_SAVE_RETRY_DELAY_MS);
     }
 
     #[test]
@@ -934,6 +970,8 @@ mod tests {
             "--prefilter-case-insensitive",
             "--prefilter-result-cache-dir",
             "--prefilter-result-cache-ttl",
+            "--save-retries",
+            "--save-retry-delay-ms",
             "--version",
             "--help",
         ] {
@@ -960,6 +998,8 @@ mod tests {
             "PREFILTER_CASE_INSENSITIVE",
             "PREFILTER_RESULT_CACHE_DIR",
             "PREFILTER_RESULT_CACHE_TTL",
+            "SAVE_RETRIES",
+            "SAVE_RETRY_DELAY_MS",
         ] {
             assert!(usage.contains(env), "usage missing {env}");
         }
@@ -1007,6 +1047,45 @@ mod tests {
         // builder clamps below 1 to 1
         let c = Config::from_env_map(&HashMap::new()).with_stream_queue_size(0);
         assert_eq!(c.stream_queue_size, 1);
+    }
+
+    #[test]
+    fn save_retry_env_and_cli() {
+        // defaults
+        let c = Config::from_env_map(&HashMap::new());
+        assert_eq!(c.save_retries, DEFAULT_SAVE_RETRIES);
+        assert_eq!(c.save_retry_delay_ms, DEFAULT_SAVE_RETRY_DELAY_MS);
+        // env values
+        let c = Config::from_env_map(&vars(&[
+            ("SAVE_RETRIES", "5"),
+            ("SAVE_RETRY_DELAY_MS", "250"),
+        ]));
+        assert_eq!(c.save_retries, 5);
+        assert_eq!(c.save_retry_delay_ms, 250);
+        // 0 disables retries
+        assert_eq!(Config::from_env_map(&vars(&[("SAVE_RETRIES", "0")])).save_retries, 0);
+        // invalid -> defaults
+        let c = Config::from_env_map(&vars(&[
+            ("SAVE_RETRIES", "oops"),
+            ("SAVE_RETRY_DELAY_MS", "bad"),
+        ]));
+        assert_eq!(c.save_retries, DEFAULT_SAVE_RETRIES);
+        assert_eq!(c.save_retry_delay_ms, DEFAULT_SAVE_RETRY_DELAY_MS);
+        // CLI wins over env
+        let cli = Cli::parse(vec![
+            "--save-retries".to_string(),
+            "1".to_string(),
+            "--save-retry-delay-ms".to_string(),
+            "50".to_string(),
+        ])
+        .unwrap();
+        let merged = cli.merged_env(&vars(&[
+            ("SAVE_RETRIES", "5"),
+            ("SAVE_RETRY_DELAY_MS", "250"),
+        ]));
+        let c = Config::from_env_map(&merged);
+        assert_eq!(c.save_retries, 1);
+        assert_eq!(c.save_retry_delay_ms, 50);
     }
 
     #[test]

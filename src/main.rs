@@ -64,7 +64,12 @@ async fn main() {
         }
     }
 
-    let sm = Arc::new(SlotManager::new(&config.backends, clients.clone()));
+    let sm = Arc::new(
+        SlotManager::new(&config.backends, clients.clone()).with_save_retry(
+            config.save_retries,
+            std::time::Duration::from_millis(config.save_retry_delay_ms),
+        ),
+    );
     // Optional prefilter adapter(s) (PREFILTER_BLOCKLIST keyword blocklist
     // and/or PREFILTER_RESULT_CACHE_DIR result cache): short-circuit
     // requests before any slot/backend work.

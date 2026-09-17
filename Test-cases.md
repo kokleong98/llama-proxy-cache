@@ -34,7 +34,7 @@ Integration tests start `MockLlama` — an in-process mock of the llama.cpp
 server (`src/mock_backend.rs`) on free localhost ports — so the suite needs
 no real `llama-server`, model files, or network access.
 
-## 1. Configuration — `src/config.rs` (27)
+## 1. Configuration — `src/config.rs` (28)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -57,7 +57,7 @@ no real `llama-server`, model files, or network access.
 | 17 | `cli_help_flags` | `--help` / `-h`, also among other options | `help` flag set |
 | 18 | `cli_version_flags` | `--version` / `-V`, also among other options | `version` flag set |
 | 19 | `version_string_is_crate_name_and_version` | `version_string()` output | starts with `lpcache `, ends with the crate version |
-| 20 | `cli_usage_lists_all_flags_and_env_vars` | completeness of `--help` text | all 20 flags and 18 env vars listed |
+| 20 | `cli_usage_lists_all_flags_and_env_vars` | completeness of `--help` text | all 22 flags and 20 env vars listed |
 | 21 | `coalesce_requests_flag` | `COALESCE_REQUESTS` env + CLI | off by default; `true`/`1` on; `0`/invalid off; CLI overrides env |
 | 22 | `stream_queue_size_env_and_cli` | `STREAM_QUEUE_SIZE` env + CLI | default 16; env `64` applied; `0` / invalid → default; CLI `--stream-queue-size 8` overrides env; builder clamps below 1 to 1 |
 | 23 | `prefilter_env_and_cli` | `PREFILTER_BLOCKLIST` / `PREFILTER_CASE_INSENSITIVE` env + CLI | default disabled (empty list, case-insensitive); comma list trimmed with empty entries dropped; blank list = disabled; invalid bool → default; CLI wins over env |
@@ -65,6 +65,7 @@ no real `llama-server`, model files, or network access.
 | | 26 | `prefilter_result_cache_env_and_cli` | `PREFILTER_RESULT_CACHE_DIR` / `PREFILTER_RESULT_CACHE_TTL` env + CLI | default disabled (no dir, 300 s TTL); dir + TTL applied; blank dir = disabled; `0` = never expire; invalid/negative TTL → default; CLI wins over env; builder clamps negative TTL to 0 |
 | | 27 | `prefilter_combines_keyword_and_result_cache` | which adapter `Config::prefilter()` builds | blocklist only → `keyword`; result cache only → `result_cache`; both → `chain` (blocklist first) |
 | 25 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
+| 28 | `save_retry_env_and_cli` | `SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS` env + CLI | default 3 retries / 1000 ms; env values applied; `0` disables retries; invalid → defaults; CLI wins over env |
 
 ## 2. Request prefilter adapter — `src/prefilter.rs` (11)
 
@@ -126,7 +127,7 @@ The accept/reject/serve adapter consulted before any slot/backend work
 | 2 | `slot_pinning_duplicated_in_root_options_query` | `slot = Some(1)` | `_slot_id`/`slot_id`/`id_slot` in body root **and** `options`, `slot_id`/`id_slot` in query; existing fields preserved |
 | 3 | `slot_pinning_adds_options_when_missing` | body without an `options` object | `options` object created with both pin fields |
 
-## 6. Slot management — `src/slot_manager.rs` (17)
+## 6. Slot management — `src/slot_manager.rs` (21)
 
 In-memory `TestClient` backends; verifies selection, per-slot locking,
 save/restore semantics and the backend circuit breaker.
@@ -150,6 +151,10 @@ save/restore semantics and the backend circuit breaker.
 | 15 | `report_success_resets_cooldown_and_streak` | reset on success | cooldown 0 + streak 0; next failure restarts at 5 s |
 | 16 | `probe_down_backends_recovers_up_backend` | probe recovery | one probe round recovers a live backend; healthy backends not counted |
 | 17 | `acquire_excluding_picks_other_backend` | retry on a different backend | exclude be0 → be1 slot 0; single backend → fast error (no 300 s wait) |
+| 18 | `save_after_retries_until_success` | save auto-retry (Rust-only feature) | 2 transient failures then success → `Ok(true)`, exactly 3 save calls, slot marked used |
+| 19 | `save_after_retries_exhausted_propagates_error` | always-failing save | `Err` after 1 initial + `SAVE_RETRIES` attempts; `last_used` untouched (slot stays free) |
+| 20 | `save_after_retries_exhausted_500_returns_false` | always-500 save | `Ok(false)` after 1 + `SAVE_RETRIES` attempts; slot still marked used |
+| 21 | `save_after_no_retry_when_retries_disabled` | `SAVE_RETRIES=0` | exactly one save attempt, `Err` propagated |
 
 ## 7. API end-to-end — `tests/api.rs` (42)
 
@@ -268,6 +273,7 @@ client-disconnect behaviour.
 | Concurrent-request coalescing (Rust-only feature) | 4 unit + 6 E2E coalesce tests |
 | Request prefilter adapter (Rust-only feature) | 11 unit + 8 E2E prefilter tests |
 | Result cache + cached-result prefilter (Rust-only feature) | 10 unit + 5 E2E tests (4 result-cache + 1 blocklist-over-cache chain) |
+| KV cache save auto-retry (`SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS`, Rust-only feature) | `save_after_retries_until_success`, `save_after_retries_exhausted_propagates_error`, `save_after_retries_exhausted_500_returns_false`, `save_after_no_retry_when_retries_disabled` (unit), `save_retry_env_and_cli` (config) |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 
 **Suite health (2026-09-02).** 129/129 passing, clippy clean, ~4 s wall
@@ -277,6 +283,12 @@ On 2026-08-31 the configurable `STREAM_QUEUE_SIZE` (env var +
 (config) and `stream_queue_size_one_delivers_full_stream` /
 `coalesce_stream_queue_size_one_follower_receives_full_stream` (E2E,
 both with `STREAM_QUEUE_SIZE=1` for maximal channel backpressure).
+On 2026-09-17 the KV cache save auto-retry (configurable
+`SAVE_RETRIES` + `SAVE_RETRY_DELAY_MS`, env vars + CLI flags) added five
+cases: `save_retry_env_and_cli` (config) and four `save_after_*` unit
+tests (153 tests total across all sections, clippy clean). The slot
+manager unit tests use a 1 ms retry delay so retry-driven tests stay fast
+while exercising the production-default retry count.
 The 2026-08-31 prefilter adapter feature added 18 tests (+10 unit, +8 E2E)
 to the 2026-08-26 baseline of 104.
 De-duplicated from 109 tests on 2026-08-26: removed

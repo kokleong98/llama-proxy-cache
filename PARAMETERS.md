@@ -70,6 +70,8 @@ precedence over the built-in defaults. `-h` / `--help` prints the built-in help.
 | `PREFILTER_CASE_INSENSITIVE` | `--prefilter-case-insensitive <BOOL>` | `true` | Prefilter keyword matching is case-insensitive |
 | `PREFILTER_RESULT_CACHE_DIR` | `--prefilter-result-cache-dir <PATH>` | — | The **cache-result path** (dir holding one `{key}.json` per request KV cache key). When set, the result-cache prefilter answers fresh (non-expired) same-key requests with a previously cached backend result **before any slot/backend work** — no slot, no restore/save, no meta file, no coalescing group; fresh non-streaming 200 JSON results are stored under the key after the backend call; streaming requests are never served from the cache. Unset/blank = disabled |
 | `PREFILTER_RESULT_CACHE_TTL` | `--prefilter-result-cache-ttl <SECS>` | `300` | Per-entry result-cache expiry in seconds; expired entries are removed lazily on read; `0` = entries never expire |
+| `SAVE_RETRIES` | `--save-retries <N>` | `3` | Retries after a **failed KV cache save** (backend `500` or network/other error) before giving up; a `save_retry` warning is logged per attempt. `0` = no retry. The final outcome is unchanged: backend `500` after all attempts → save reported as failed; `Err` after all attempts → request `500` |
+| `SAVE_RETRY_DELAY_MS` | `--save-retry-delay-ms <MS>` | `1000` | Delay in milliseconds between KV cache save retry attempts |
 | — | `-V`, `--version` | — | Print the proxy version (from `Cargo.toml`) and exit; the version is also logged in the `app_start` line at startup |
 | — | `-h`, `--help` | — | Show help and exit |
 
