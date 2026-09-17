@@ -43,6 +43,16 @@ async fn main() {
             config.meta_dir.display()
         );
     }
+    // Result cache (PREFILTER_RESULT_CACHE_DIR): pre-create the
+    // cache-result dir so a store failure is visible early.
+    if let Some(rc) = &config.result_cache()
+        && let Err(e) = std::fs::create_dir_all(rc.dir())
+    {
+        tracing::warn!(
+            "could not create result cache dir {}: {e}",
+            rc.dir().display()
+        );
+    }
 
     let port = config.port;
     let mut clients: Vec<Arc<dyn LlamaBackend>> = Vec::new();
@@ -54,15 +64,24 @@ async fn main() {
         }
     }
 
-    let sm = Arc::new(SlotManager::new(&config.backends, clients.clone()));
-    // Optional prefilter adapter (PREFILTER_BLOCKLIST): rejects matching
+    let sm = Arc::new(
+        SlotManager::new(&config.backends, clients.clone()).with_save_retry(
+            config.save_retries,
+            std::time::Duration::from_millis(config.save_retry_delay_ms),
+        ),
+    );
+    // Optional prefilter adapter(s) (PREFILTER_BLOCKLIST keyword blocklist
+    // and/or PREFILTER_RESULT_CACHE_DIR result cache): short-circuit
     // requests before any slot/backend work.
     let prefilter = config.prefilter();
+    let result_cache = config.result_cache();
     if let Some(pf) = &prefilter {
         tracing::info!(
-            "prefilter enabled: filter={} keywords={}",
+            "prefilter enabled: filter={} keywords={} result_cache_dir={:?} result_cache_ttl_secs={}",
             pf.name(),
-            config.prefilter_blocklist.len()
+            config.prefilter_blocklist.len(),
+            config.prefilter_result_cache_dir,
+            config.prefilter_result_cache_ttl_secs
         );
     }
     let state = AppState {
@@ -71,6 +90,7 @@ async fn main() {
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
 
     // Warn early if a configured --slot-save-path dir is missing: pruning

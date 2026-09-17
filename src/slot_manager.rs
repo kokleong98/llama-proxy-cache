@@ -8,9 +8,12 @@
 //! - `acquire` waits up to `acquire_timeout` (default 300 s, same as the
 //!   `asyncio.wait_for` wrapper in `app.py`) and restores before chat when a
 //!   restore key is given
-//! - `save_after` saves the KV cache and updates the LRU timestamp
+//! - `save_after` saves the KV cache and updates the LRU timestamp; a
+//!   failed save (backend 500 or network/other error) is retried up to
+//!   `SAVE_RETRIES` times, waiting `SAVE_RETRY_DELAY_MS` milliseconds
+//!   between attempts
 
-use crate::config::BackendConf;
+use crate::config::{BackendConf, DEFAULT_SAVE_RETRIES, DEFAULT_SAVE_RETRY_DELAY_MS};
 use crate::llama_client::{BackendError, LlamaBackend, RestoreOutcome};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -74,6 +77,12 @@ pub struct SlotManager {
     /// escalate the cooldown (5 s, 10 s, 20 s, 40 s, then capped at 60 s).
     /// Reset by any successful request or probe.
     failure_streak: Vec<AtomicU32>,
+    /// `SAVE_RETRIES`: retries after a failed KV cache save (backend 500 or
+    /// network/other error) before giving up (`0` = no retry).
+    save_retries: usize,
+    /// `SAVE_RETRY_DELAY_MS`: delay in milliseconds between save retry
+    /// attempts.
+    save_retry_delay: Duration,
 }
 
 impl SlotManager {
@@ -111,6 +120,8 @@ impl SlotManager {
             down_until,
             backend_cooldown: DEFAULT_BACKEND_COOLDOWN,
             failure_streak,
+            save_retries: DEFAULT_SAVE_RETRIES,
+            save_retry_delay: Duration::from_millis(DEFAULT_SAVE_RETRY_DELAY_MS),
         }
     }
 
@@ -123,6 +134,15 @@ impl SlotManager {
     /// Test hook: change the backend failure cooldown.
     pub fn with_backend_cooldown(mut self, d: Duration) -> Self {
         self.backend_cooldown = d;
+        self
+    }
+
+    /// Change the KV cache save retry policy (`SAVE_RETRIES` +
+    /// `SAVE_RETRY_DELAY_MS`): a failed save is retried up to `retries`
+    /// times, waiting `delay` between attempts.
+    pub fn with_save_retry(mut self, retries: usize, delay: Duration) -> Self {
+        self.save_retries = retries;
+        self.save_retry_delay = delay;
         self
     }
 
@@ -358,12 +378,38 @@ impl SlotManager {
     }
 
     /// Save the slot's KV cache under `key` and mark the slot used
-    /// (port of `save_after`). `Ok(false)` on backend 500; `Err` on other
-    /// failures (the caller maps that to a 500, as in the Python app).
+    /// (port of `save_after`, plus auto-retry).
+    ///
+    /// Auto-retry (deviation from the Python original): a failed save —
+    /// backend 500 (`Ok(false)`) or any other error (`Err`) — is retried up
+    /// to `save_retries` times, waiting `save_retry_delay` between attempts.
+    /// The final outcome is returned unchanged: `Ok(false)` on a 500 after
+    /// all attempts, `Err` when every attempt errored (the caller maps that
+    /// to a 500, as in the Python app). The slot is marked used on any
+    /// `Ok` outcome (including `Ok(false)`), as before.
     pub async fn save_after(&self, g: GSlot, key: &str) -> Result<bool, BackendError> {
-        let ok = self.clients[g.be].save_slot(g.slot, key).await?;
-        self.last_used[self.idx(g)].store(now_nanos(), Ordering::SeqCst);
-        Ok(ok)
+        let mut last = self.clients[g.be].save_slot(g.slot, key).await;
+        let mut attempt = 0;
+        while !matches!(&last, Ok(true)) && attempt < self.save_retries {
+            attempt += 1;
+            let cause = match &last {
+                Ok(false) => "backend returned 500".to_string(),
+                Ok(true) => unreachable!("the loop condition stops on Ok(true)"),
+                Err(e) => e.to_string(),
+            };
+            tracing::warn!(
+                "save_retry g={g} key={} attempt={attempt}/{} delay_ms={} cause={cause}",
+                short(key),
+                self.save_retries,
+                self.save_retry_delay.as_millis()
+            );
+            tokio::time::sleep(self.save_retry_delay).await;
+            last = self.clients[g.be].save_slot(g.slot, key).await;
+        }
+        if last.is_ok() {
+            self.last_used[self.idx(g)].store(now_nanos(), Ordering::SeqCst);
+        }
+        last
     }
 
     /// Release a held slot (port of `release`).
@@ -404,7 +450,7 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
     use serde_json::Value;
-    use std::sync::atomic::{AtomicBool, AtomicU8};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
     use std::time::Duration;
     use tokio::sync::Mutex;
 
@@ -414,6 +460,9 @@ mod tests {
         restores: Arc<Mutex<Vec<(usize, String)>>>,
         /// 0 = Ok(true), 1 = Ok(false) (backend 500), 2 = Err
         save_mode: Arc<AtomicU8>,
+        /// The first N save calls return a transient `Err` (0 = disabled);
+        /// later calls fall through to `save_mode`.
+        save_fail_first_n: Arc<AtomicUsize>,
         /// true = Restored, false = Failed
         restore_ok: Arc<AtomicBool>,
     }
@@ -424,6 +473,7 @@ mod tests {
                 saves: Arc::new(Mutex::new(Vec::new())),
                 restores: Arc::new(Mutex::new(Vec::new())),
                 save_mode: Arc::new(AtomicU8::new(0)),
+                save_fail_first_n: Arc::new(AtomicUsize::new(0)),
                 restore_ok: Arc::new(AtomicBool::new(true)),
             })
         }
@@ -436,6 +486,15 @@ mod tests {
                 .lock()
                 .await
                 .push((slot_id, basename.to_string()));
+            if self
+                .save_fail_first_n
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                self.save_fail_first_n
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(BackendError::Other("mock transient save error".into()));
+            }
             match self.save_mode.load(std::sync::atomic::Ordering::SeqCst) {
                 0 => Ok(true),
                 1 => Ok(false),
@@ -484,7 +543,12 @@ mod tests {
             .iter()
             .map(|c| Arc::clone(c) as Arc<dyn LlamaBackend>)
             .collect();
-        let sm = Arc::new(SlotManager::new(&backends, clients));
+        let sm = Arc::new(
+            SlotManager::new(&backends, clients)
+                // keep retry-driven tests fast (the retry count stays at the
+                // production default, only the delay shrinks to 1 ms)
+                .with_save_retry(DEFAULT_SAVE_RETRIES, Duration::from_millis(1)),
+        );
         (sm, raw)
     }
 
@@ -587,6 +651,86 @@ mod tests {
         let g = sm.acquire(None).await.unwrap();
         assert_eq!(g.slot, GSlot { be: 0, slot: 0 });
         sm.release(g);
+    }
+
+    #[tokio::test]
+    async fn save_after_retries_until_success() {
+        let (sm, raw) = make(1, 2);
+        // first two saves fail transiently, the third succeeds
+        raw[0]
+            .save_fail_first_n
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap());
+        // 2 failed attempts + 1 successful attempt
+        let saves = raw[0].saves.lock().await.clone();
+        assert_eq!(
+            saves,
+            vec![
+                (0usize, "k1".to_string()),
+                (0usize, "k1".to_string()),
+                (0usize, "k1".to_string())
+            ]
+        );
+        // the successful save marked slot 0 used
+        let g = sm.acquire(None).await.unwrap();
+        assert_eq!(g.slot, GSlot { be: 0, slot: 1 });
+        sm.release(g);
+    }
+
+    #[tokio::test]
+    async fn save_after_retries_exhausted_propagates_error() {
+        let (sm, raw) = make(1, 2);
+        raw[0]
+            .save_mode
+            .store(2, std::sync::atomic::Ordering::SeqCst); // always Err
+        assert!(sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.is_err());
+        // 1 initial attempt + the configured retries
+        assert_eq!(
+            raw[0].saves.lock().await.len(),
+            1 + DEFAULT_SAVE_RETRIES
+        );
+        // last_used not updated -> slot 0 still "free"
+        let g = sm.acquire(None).await.unwrap();
+        assert_eq!(g.slot, GSlot { be: 0, slot: 0 });
+        sm.release(g);
+    }
+
+    #[tokio::test]
+    async fn save_after_retries_exhausted_500_returns_false() {
+        let (sm, raw) = make(1, 2);
+        raw[0]
+            .save_mode
+            .store(1, std::sync::atomic::Ordering::SeqCst); // always Ok(false)
+        assert!(!sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap());
+        assert_eq!(
+            raw[0].saves.lock().await.len(),
+            1 + DEFAULT_SAVE_RETRIES
+        );
+        // a failed (500) save still marks the slot used
+        let g = sm.acquire(None).await.unwrap();
+        assert_eq!(g.slot, GSlot { be: 0, slot: 1 });
+        sm.release(g);
+    }
+
+    #[tokio::test]
+    async fn save_after_no_retry_when_retries_disabled() {
+        let backends = vec![BackendConf {
+            url: "http://b0".to_string(),
+            n_slots: 1,
+            slot_save_path: None,
+        }];
+        let client = TestClient::new();
+        let clients: Vec<Arc<dyn LlamaBackend>> =
+            vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+        let sm = Arc::new(
+            SlotManager::new(&backends, clients).with_save_retry(0, Duration::from_millis(1)),
+        );
+        client
+            .save_mode
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.is_err());
+        // only the initial attempt, no retries
+        assert_eq!(client.saves.lock().await.len(), 1);
     }
 
     #[tokio::test]

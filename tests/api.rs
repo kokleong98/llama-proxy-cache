@@ -125,12 +125,14 @@ async fn make_state_inner(
     };
     let sm = Arc::new(sm);
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     (state, mock, td)
 }
@@ -630,12 +632,14 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
             .with_backend_cooldown(Duration::from_secs(60)),
     );
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     let app = router(state);
 
@@ -704,12 +708,14 @@ async fn connection_failure_retries_on_other_backend() {
     ];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     let app = router(state);
 
@@ -774,12 +780,14 @@ async fn probe_recovers_cooled_down_backend() {
             .with_backend_cooldown(Duration::from_secs(60)),
     );
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm: Arc::clone(&sm),
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     let app = router(state);
 
@@ -857,12 +865,14 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
     ];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     let app = router(state);
 
@@ -914,12 +924,14 @@ async fn prune_removes_oldest_meta_and_kv_files() {
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     let app = router(state);
 
@@ -989,12 +1001,14 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     let app = router(state);
 
@@ -1108,12 +1122,14 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     let app = router(state);
 
@@ -1677,6 +1693,264 @@ async fn custom_prefilter_adapter_accepts_and_rejects() {
     assert_eq!(mock.state.chat_bodies().await.len(), 1);
 }
 
+/// State with the result-cache prefilter enabled: fresh non-streaming
+/// backend results are stored under the request's cache key in a temp
+/// dir (returned as the 4th element) and served to the next same-key
+/// request before any slot/backend work. `ttl_secs` = 0: never expire.
+async fn make_state_result_cache(
+    ttl_secs: f64,
+) -> (AppState, MockLlama, tempfile::TempDir, tempfile::TempDir) {
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let td_rc = tempfile::tempdir().expect("result cache dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_prefilter_result_cache_dir(Some(td_rc.path().to_path_buf()))
+    .with_prefilter_result_cache_ttl_secs(ttl_secs);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_cache,
+    };
+    (state, mock, td, td_rc)
+}
+
+#[tokio::test]
+async fn result_cache_serves_cached_result_without_backend() {
+    let (state, mock, td, td_rc) = make_state_result_cache(300.0).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello result cache" }]
+    });
+    // First request: reaches the backend and stores the result in the
+    // cache-result path.
+    let r1 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r1.status(), 200);
+    let v1 = read_body(r1).await;
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    let entries: Vec<_> = std::fs::read_dir(td_rc.path())
+        .expect("read cache dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].file_name().to_string_lossy().ends_with(".json"));
+    // Second same-key request: served from the cache — no backend call,
+    // no slot work (no save/restore), no meta file.
+    let r2 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r2.status(), 200);
+    let v2 = read_body(r2).await;
+    assert_eq!(v1, v2);
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    assert!(mock.state.saves().await.is_empty());
+    assert!(mock.state.restores().await.is_empty());
+    assert_eq!(
+        std::fs::read_dir(td.path()).expect("read meta dir").count(),
+        0
+    );
+    // A different key is a cache miss: reaches the backend.
+    let other = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "a different prompt" }]
+    });
+    let r3 = app.clone().oneshot(post_json(&other)).await.expect("resp");
+    assert_eq!(r3.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 2);
+}
+
+#[tokio::test]
+async fn result_cache_expires_after_ttl() {
+    let (state, mock, _td, td_rc) = make_state_result_cache(0.2).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "expiring prompt" }]
+    });
+    let r1 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r1.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    // Entry is fresh: served from the cache.
+    let r2 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r2.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    // After the TTL: the entry is expired (and lazily removed) — backend
+    // again, and the fresh result overwrites the expired entry.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r3 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r3.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 2);
+    let n_files = std::fs::read_dir(td_rc.path())
+        .expect("read cache dir")
+        .filter_map(|e| e.ok())
+        .count();
+    assert_eq!(n_files, 1);
+}
+
+#[tokio::test]
+async fn result_cache_stream_requests_bypass_cache() {
+    let (state, mock, _td, _td_rc) = make_state_result_cache(300.0).await;
+    let app = router(state);
+    let non_stream = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "stream bypass" }]
+    });
+    let r1 = app
+        .clone()
+        .oneshot(post_json(&non_stream))
+        .await
+        .expect("resp");
+    assert_eq!(r1.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    // Same key, stream=true: never served from the cache (a cached JSON
+    // answer would not match the SSE contract) — the backend streams.
+    let stream = json!({
+        "model": "m1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "stream bypass" }]
+    });
+    let r2 = app.clone().oneshot(post_json(&stream)).await.expect("resp");
+    assert_eq!(r2.status(), 200);
+    let ctype = r2
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .expect("content-type")
+        .to_str()
+        .unwrap();
+    assert_eq!(ctype, "text/event-stream");
+    assert_eq!(mock.state.chat_bodies().await.len(), 2);
+}
+
+#[tokio::test]
+async fn result_cache_remove_after_serve_cleanup() {
+    let (mut state, mock, _td, td_rc) = make_state_result_cache(300.0).await;
+    // Attach the built-in post-serve cleanup adapter: the entry file is
+    // removed after a cached result is served (one-shot cache).
+    let cache = state.result_cache.clone().expect("result cache");
+    state.prefilter = Some(Arc::new(
+        lpcache::result_cache::CachedResultPrefilter::new(cache)
+            .with_cleanup(Arc::new(lpcache::result_cache::RemoveAfterServe)),
+    ));
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "one-shot prompt" }]
+    });
+    // 1st: backend (1 call), entry stored.
+    let r1 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r1.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    let n_files = || {
+        std::fs::read_dir(td_rc.path())
+            .expect("read cache dir")
+            .filter_map(|e| e.ok())
+            .count()
+    };
+    assert_eq!(n_files(), 1);
+    // 2nd: served from the cache, then the post-cleanup removes the file.
+    let r2 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r2.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    assert_eq!(n_files(), 0);
+    // 3rd: the one-shot entry is gone — backend again.
+    let r3 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r3.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 2);
+}
+
+#[tokio::test]
+async fn keyword_blocklist_rejects_before_result_cache_serves() {
+    // Both adapters enabled (chained): a blocked request is rejected with
+    // 400 by the blocklist even when a cached result exists for its key —
+    // the blocklist runs first and a reject beats a serve.
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let td_rc = tempfile::tempdir().expect("result cache dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+        }],
+        100,
+        500,
+        0.6,
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_prefilter_blocklist(vec!["banned".to_string()])
+    .with_prefilter_result_cache_dir(Some(td_rc.path().to_path_buf()))
+    .with_prefilter_result_cache_ttl_secs(300.0);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_cache,
+    };
+    // Pre-populate the cache for the blocked prompt's key (a blocked
+    // request can never store a result itself).
+    let key = expected_key("this is banned");
+    state
+        .result_cache
+        .as_ref()
+        .expect("result cache")
+        .put(&key, 200, &json!({ "object": "chat.completion" }))
+        .unwrap();
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "this is banned" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 400);
+    let v = read_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("keyword prefilter")
+    );
+    assert!(mock.state.chat_bodies().await.is_empty());
+}
+
 /// State with a mock that emulates `--slot-save-path` (successful saves
 /// create a KV file) and an explicit META_MAX.
 async fn make_state_with_save_dir(
@@ -1706,12 +1980,14 @@ async fn make_state_with_save_dir(
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     (state, mock, td)
 }
@@ -1819,12 +2095,14 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
     let prefilter = cfg.prefilter();
+    let result_cache = cfg.result_cache();
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
+        result_cache,
     };
     let app = router(state);
 

@@ -18,6 +18,10 @@
 //! - `COALESCE_REQUESTS` (`false`; when true, concurrent requests with the
 //!   same KV cache key are grouped into a single backend call regardless of
 //!   generation parameters — see the `coalesce` module)
+//! - `SAVE_RETRIES` (3) and `SAVE_RETRY_DELAY_MS` (1000): a failed KV cache
+//!   save (backend 500 or network/other error) is retried by the slot
+//!   manager up to `SAVE_RETRIES` times, waiting `SAVE_RETRY_DELAY_MS`
+//!   milliseconds between attempts (`0` retries = disabled)
 //! - `STREAM_QUEUE_SIZE` (16; capacity of the per-request bounded channel
 //!   that buffers streamed SSE bytes between the background reader and the
 //!   HTTP response — smaller values backpressure the backend faster)
@@ -26,6 +30,13 @@
 //!   `400` before any slot/backend work — see the `prefilter` module)
 //! - `PREFILTER_CASE_INSENSITIVE` (`true`; keyword matching is
 //!   case-insensitive)
+//! - `PREFILTER_RESULT_CACHE_DIR` (optional: the cache-result path; when
+//!   set, the result-cache prefilter answers fresh same-key requests with
+//!   a previously cached backend result before any slot/backend work, and
+//!   fresh non-streaming results are stored under
+//!   `{dir}/{key}.json` — see the `result_cache` module)
+//! - `PREFILTER_RESULT_CACHE_TTL` (300; per-entry expiry in seconds,
+//!   `0` = entries never expire)
 //! - `LOG_LEVEL` (`INFO`)
 //!
 //! Every variable can also be set with a command-line flag (see [`Cli`]);
@@ -53,6 +64,15 @@ pub const DEFAULT_STREAM_QUEUE_SIZE: usize = 16;
 /// `PREFILTER_CASE_INSENSITIVE` default: keyword matching is
 /// case-insensitive.
 pub const DEFAULT_PREFILTER_CASE_INSENSITIVE: bool = true;
+/// `PREFILTER_RESULT_CACHE_TTL` default: per-entry expiry in seconds
+/// (`0` = entries never expire).
+pub const DEFAULT_PREFILTER_RESULT_CACHE_TTL_SECS: f64 = 300.0;
+/// `SAVE_RETRIES` default: retries after a failed KV cache save (backend
+/// 500 or network/other error) before giving up (`0` = no retry).
+pub const DEFAULT_SAVE_RETRIES: usize = 3;
+/// `SAVE_RETRY_DELAY_MS` default: delay in milliseconds between save retry
+/// attempts.
+pub const DEFAULT_SAVE_RETRY_DELAY_MS: u64 = 1000;
 
 /// Crate version from `Cargo.toml`, reported by `-V` / `--version` and
 /// logged at startup in the `app_start` line.
@@ -107,6 +127,21 @@ pub struct Config {
     pub prefilter_blocklist: Vec<String>,
     /// `PREFILTER_CASE_INSENSITIVE`: case-insensitive keyword matching.
     pub prefilter_case_insensitive: bool,
+    /// `PREFILTER_RESULT_CACHE_DIR`: the cache-result path; when set, the
+    /// result-cache prefilter serves fresh same-key requests from
+    /// previously cached backend results, and fresh non-streaming results
+    /// are stored in this directory (see the `result_cache` module).
+    /// `None` = result cache disabled (the default).
+    pub prefilter_result_cache_dir: Option<PathBuf>,
+    /// `PREFILTER_RESULT_CACHE_TTL`: per-entry expiry in seconds
+    /// (`0` = entries never expire).
+    pub prefilter_result_cache_ttl_secs: f64,
+    /// `SAVE_RETRIES`: retries after a failed KV cache save (backend 500 or
+    /// network/other error) before giving up (`0` = no retry).
+    pub save_retries: usize,
+    /// `SAVE_RETRY_DELAY_MS`: delay in milliseconds between save retry
+    /// attempts.
+    pub save_retry_delay_ms: u64,
 }
 
 /// Command-line options, one-to-one with the environment variables above.
@@ -144,6 +179,14 @@ pub struct Cli {
     pub prefilter_blocklist: Option<String>,
     /// Maps to `PREFILTER_CASE_INSENSITIVE` (`true`/`false`, or `1`/`0`).
     pub prefilter_case_insensitive: Option<String>,
+    /// Maps to `PREFILTER_RESULT_CACHE_DIR` (the cache-result path).
+    pub prefilter_result_cache_dir: Option<String>,
+    /// Maps to `PREFILTER_RESULT_CACHE_TTL` (per-entry expiry, seconds).
+    pub prefilter_result_cache_ttl: Option<String>,
+    /// Maps to `SAVE_RETRIES` (retries after a failed KV cache save).
+    pub save_retries: Option<String>,
+    /// Maps to `SAVE_RETRY_DELAY_MS` (delay between save retry attempts).
+    pub save_retry_delay_ms: Option<String>,
 }
 
 impl Config {
@@ -176,6 +219,10 @@ impl Config {
             coalesce_requests: false,
             prefilter_blocklist: Vec::new(),
             prefilter_case_insensitive: DEFAULT_PREFILTER_CASE_INSENSITIVE,
+            prefilter_result_cache_dir: None,
+            prefilter_result_cache_ttl_secs: DEFAULT_PREFILTER_RESULT_CACHE_TTL_SECS,
+            save_retries: DEFAULT_SAVE_RETRIES,
+            save_retry_delay_ms: DEFAULT_SAVE_RETRY_DELAY_MS,
         }
     }
 
@@ -212,16 +259,55 @@ impl Config {
         self
     }
 
-    /// The prefilter adapter enabled by this configuration, or `None`
-    /// when `PREFILTER_BLOCKLIST` is empty/unset (the default: requests
-    /// are forwarded without any prefilter check).
+    /// Override the result-cache directory (`PREFILTER_RESULT_CACHE_DIR`);
+    /// `None` disables the result cache (the default).
+    pub fn with_prefilter_result_cache_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.prefilter_result_cache_dir = dir;
+        self
+    }
+
+    /// Override the per-entry result-cache expiry in seconds
+    /// (`PREFILTER_RESULT_CACHE_TTL`; `0` = entries never expire).
+    pub fn with_prefilter_result_cache_ttl_secs(mut self, secs: f64) -> Self {
+        self.prefilter_result_cache_ttl_secs = secs.max(0.0);
+        self
+    }
+
+    /// The prefilter adapter enabled by this configuration, or `None` when
+    /// neither the keyword blocklist (`PREFILTER_BLOCKLIST`) nor the
+    /// result cache (`PREFILTER_RESULT_CACHE_DIR`) is enabled — the
+    /// default: requests are forwarded without any prefilter check. When
+    /// both are enabled they are chained (blocklist first: a blocked
+    /// request is rejected with `400` before a cache hit could serve it).
     pub fn prefilter(&self) -> Option<Arc<dyn crate::prefilter::Prefilter>> {
-        if self.prefilter_blocklist.is_empty() {
-            return None;
+        let mut filters: Vec<Arc<dyn crate::prefilter::Prefilter>> = Vec::new();
+        if !self.prefilter_blocklist.is_empty() {
+            filters.push(Arc::new(crate::prefilter::KeywordPrefilter::new(
+                self.prefilter_blocklist.clone(),
+                self.prefilter_case_insensitive,
+            )));
         }
-        Some(Arc::new(crate::prefilter::KeywordPrefilter::new(
-            self.prefilter_blocklist.clone(),
-            self.prefilter_case_insensitive,
+        if self.prefilter_result_cache_dir.is_some() {
+            let cache = self.result_cache().expect("dir is set");
+            filters.push(Arc::new(crate::result_cache::CachedResultPrefilter::new(
+                cache,
+            )));
+        }
+        match filters.len() {
+            0 => None,
+            1 => Some(filters.into_iter().next().expect("one filter")),
+            _ => Some(Arc::new(crate::prefilter::ChainPrefilter::new(filters))),
+        }
+    }
+
+    /// The result cache enabled by this configuration (`None` when
+    /// `PREFILTER_RESULT_CACHE_DIR` is unset — the default). Used by the
+    /// `app` module to store fresh non-streaming backend results.
+    pub fn result_cache(&self) -> Option<Arc<crate::result_cache::ResultCache>> {
+        let dir = self.prefilter_result_cache_dir.as_ref()?;
+        Some(Arc::new(crate::result_cache::ResultCache::new(
+            dir.clone(),
+            Duration::from_secs_f64(self.prefilter_result_cache_ttl_secs),
         )))
     }
 
@@ -332,6 +418,19 @@ impl Config {
                 "PREFILTER_CASE_INSENSITIVE",
                 DEFAULT_PREFILTER_CASE_INSENSITIVE,
             ),
+            // Unset / blank dir = result cache disabled.
+            prefilter_result_cache_dir: vars
+                .get("PREFILTER_RESULT_CACHE_DIR")
+                .map(|raw| raw.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            prefilter_result_cache_ttl_secs: env_result_cache_ttl(vars),
+            save_retries: env_int(vars, "SAVE_RETRIES", DEFAULT_SAVE_RETRIES),
+            save_retry_delay_ms: env_int(
+                vars,
+                "SAVE_RETRY_DELAY_MS",
+                DEFAULT_SAVE_RETRY_DELAY_MS as usize,
+            ) as u64,
         }
     }
 
@@ -381,6 +480,25 @@ fn env_stream_queue_size(vars: &HashMap<String, String>) -> usize {
             DEFAULT_STREAM_QUEUE_SIZE
         );
         DEFAULT_STREAM_QUEUE_SIZE
+    } else {
+        n
+    }
+}
+
+/// Parse `PREFILTER_RESULT_CACHE_TTL` (the per-entry result-cache expiry
+/// in seconds, `0` = never expire): like [`env_float`], but negative
+/// values fall back to the default with a warning.
+fn env_result_cache_ttl(vars: &HashMap<String, String>) -> f64 {
+    let n = env_float(
+        vars,
+        "PREFILTER_RESULT_CACHE_TTL",
+        DEFAULT_PREFILTER_RESULT_CACHE_TTL_SECS,
+    );
+    if n < 0.0 {
+        tracing::warn!(
+            "env PREFILTER_RESULT_CACHE_TTL={n} is negative, using {DEFAULT_PREFILTER_RESULT_CACHE_TTL_SECS}"
+        );
+        DEFAULT_PREFILTER_RESULT_CACHE_TTL_SECS
     } else {
         n
     }
@@ -459,6 +577,10 @@ impl Cli {
                 "--coalesce-requests" => cli.coalesce_requests = Some(value),
                 "--prefilter-blocklist" => cli.prefilter_blocklist = Some(value),
                 "--prefilter-case-insensitive" => cli.prefilter_case_insensitive = Some(value),
+                "--prefilter-result-cache-dir" => cli.prefilter_result_cache_dir = Some(value),
+                "--prefilter-result-cache-ttl" => cli.prefilter_result_cache_ttl = Some(value),
+                "--save-retries" => cli.save_retries = Some(value),
+                "--save-retry-delay-ms" => cli.save_retry_delay_ms = Some(value),
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -492,6 +614,10 @@ Options:
   --coalesce-requests <BOOL>    COALESCE_REQUESTS    group concurrent same-key requests into one backend call (default false)
   --prefilter-blocklist <LIST>  PREFILTER_BLOCKLIST  comma-separated keywords; matching requests are rejected (400) before the backend (default: disabled)
   --prefilter-case-insensitive <BOOL>  PREFILTER_CASE_INSENSITIVE  keyword matching is case-insensitive (default true)
+  --prefilter-result-cache-dir <PATH>  PREFILTER_RESULT_CACHE_DIR  dir for cached backend results ({key}.json); when set, fresh same-key non-stream requests are answered from the cache before the backend (default: disabled)
+  --prefilter-result-cache-ttl <SECS>  PREFILTER_RESULT_CACHE_TTL  cached-result expiry in seconds (default 300, 0 = never)
+  --save-retries <N>            SAVE_RETRIES         retries after a failed KV cache save (backend 500 or other error) (default 3, 0 = no retry)
+  --save-retry-delay-ms <MS>    SAVE_RETRY_DELAY_MS  delay in milliseconds between save retry attempts (default 1000)
   -V, --version                 show version and exit
   -h, --help                    show this help and exit
 
@@ -511,6 +637,13 @@ Notes:
     whitespace ignored); when set, requests whose message contents contain
     any keyword are rejected with 400 before slot acquisition or backend
     dispatch; unset/blank = no prefilter
+  * PREFILTER_RESULT_CACHE_DIR enables the result-cache prefilter: fresh
+    (non-expired) same-key requests are answered with the previously
+    cached backend result before any slot/backend work; fresh non-streaming
+    results are stored as {dir}/{key}.json; streaming requests are never
+    served from the cache; PREFILTER_RESULT_CACHE_TTL is the per-entry
+    expiry in seconds (0 = never); when both PREFILTER_BLOCKLIST and the
+    result cache are set, the blocklist runs first (reject wins over serve)
   * the backend should be started with matching llama-server flags:
     -np/--parallel (N_SLOTS), --api-key (LLAMA_API_KEY) and a
     --slot-save-path directory (SLOT_SAVE_PATH)
@@ -545,6 +678,16 @@ Notes:
                 "PREFILTER_CASE_INSENSITIVE",
                 &self.prefilter_case_insensitive,
             ),
+            (
+                "PREFILTER_RESULT_CACHE_DIR",
+                &self.prefilter_result_cache_dir,
+            ),
+            (
+                "PREFILTER_RESULT_CACHE_TTL",
+                &self.prefilter_result_cache_ttl,
+            ),
+            ("SAVE_RETRIES", &self.save_retries),
+            ("SAVE_RETRY_DELAY_MS", &self.save_retry_delay_ms),
         ];
         for (env_name, value) in opts {
             if let Some(v) = value {
@@ -584,6 +727,8 @@ mod tests {
         assert_eq!(c.port, 8081);
         assert_eq!(c.log_level, "INFO");
         assert_eq!(c.stream_queue_size, 16);
+        assert_eq!(c.save_retries, DEFAULT_SAVE_RETRIES);
+        assert_eq!(c.save_retry_delay_ms, DEFAULT_SAVE_RETRY_DELAY_MS);
     }
 
     #[test]
@@ -823,6 +968,10 @@ mod tests {
             "--coalesce-requests",
             "--prefilter-blocklist",
             "--prefilter-case-insensitive",
+            "--prefilter-result-cache-dir",
+            "--prefilter-result-cache-ttl",
+            "--save-retries",
+            "--save-retry-delay-ms",
             "--version",
             "--help",
         ] {
@@ -847,6 +996,10 @@ mod tests {
             "COALESCE_REQUESTS",
             "PREFILTER_BLOCKLIST",
             "PREFILTER_CASE_INSENSITIVE",
+            "PREFILTER_RESULT_CACHE_DIR",
+            "PREFILTER_RESULT_CACHE_TTL",
+            "SAVE_RETRIES",
+            "SAVE_RETRY_DELAY_MS",
         ] {
             assert!(usage.contains(env), "usage missing {env}");
         }
@@ -897,6 +1050,45 @@ mod tests {
     }
 
     #[test]
+    fn save_retry_env_and_cli() {
+        // defaults
+        let c = Config::from_env_map(&HashMap::new());
+        assert_eq!(c.save_retries, DEFAULT_SAVE_RETRIES);
+        assert_eq!(c.save_retry_delay_ms, DEFAULT_SAVE_RETRY_DELAY_MS);
+        // env values
+        let c = Config::from_env_map(&vars(&[
+            ("SAVE_RETRIES", "5"),
+            ("SAVE_RETRY_DELAY_MS", "250"),
+        ]));
+        assert_eq!(c.save_retries, 5);
+        assert_eq!(c.save_retry_delay_ms, 250);
+        // 0 disables retries
+        assert_eq!(Config::from_env_map(&vars(&[("SAVE_RETRIES", "0")])).save_retries, 0);
+        // invalid -> defaults
+        let c = Config::from_env_map(&vars(&[
+            ("SAVE_RETRIES", "oops"),
+            ("SAVE_RETRY_DELAY_MS", "bad"),
+        ]));
+        assert_eq!(c.save_retries, DEFAULT_SAVE_RETRIES);
+        assert_eq!(c.save_retry_delay_ms, DEFAULT_SAVE_RETRY_DELAY_MS);
+        // CLI wins over env
+        let cli = Cli::parse(vec![
+            "--save-retries".to_string(),
+            "1".to_string(),
+            "--save-retry-delay-ms".to_string(),
+            "50".to_string(),
+        ])
+        .unwrap();
+        let merged = cli.merged_env(&vars(&[
+            ("SAVE_RETRIES", "5"),
+            ("SAVE_RETRY_DELAY_MS", "250"),
+        ]));
+        let c = Config::from_env_map(&merged);
+        assert_eq!(c.save_retries, 1);
+        assert_eq!(c.save_retry_delay_ms, 50);
+    }
+
+    #[test]
     fn prefilter_env_and_cli() {
         // default: disabled
         let c = Config::from_env_map(&HashMap::new());
@@ -942,6 +1134,115 @@ mod tests {
         let c = Config::from_env_map(&merged);
         assert_eq!(c.prefilter_blocklist, vec!["cli-kw".to_string()]);
         assert!(!c.prefilter_case_insensitive);
+    }
+
+    #[test]
+    fn prefilter_result_cache_env_and_cli() {
+        // default: disabled
+        let c = Config::from_env_map(&HashMap::new());
+        assert!(c.prefilter_result_cache_dir.is_none());
+        assert!((c.prefilter_result_cache_ttl_secs - 300.0).abs() < f64::EPSILON);
+        assert!(c.result_cache().is_none());
+        assert!(c.prefilter().is_none());
+
+        // env: dir + ttl
+        let c = Config::from_env_map(&vars(&[
+            ("PREFILTER_RESULT_CACHE_DIR", "my_cache"),
+            ("PREFILTER_RESULT_CACHE_TTL", "60"),
+        ]));
+        assert_eq!(
+            c.prefilter_result_cache_dir.as_deref(),
+            Some(std::path::Path::new("my_cache"))
+        );
+        assert!((c.prefilter_result_cache_ttl_secs - 60.0).abs() < f64::EPSILON);
+        let rc = c.result_cache().expect("result cache enabled");
+        assert_eq!(rc.dir(), std::path::Path::new("my_cache"));
+        assert_eq!(rc.ttl(), std::time::Duration::from_secs(60));
+        let pf = c.prefilter().expect("prefilter enabled");
+        assert_eq!(pf.name(), "result_cache");
+
+        // blank dir = disabled; ttl 0 = never expire
+        let c = Config::from_env_map(&vars(&[
+            ("PREFILTER_RESULT_CACHE_DIR", "   "),
+            ("PREFILTER_RESULT_CACHE_TTL", "0"),
+        ]));
+        assert!(c.prefilter_result_cache_dir.is_none());
+        assert!(c.prefilter_result_cache_ttl_secs == 0.0);
+        assert!(c.result_cache().is_none());
+        assert!(c.prefilter().is_none());
+
+        // invalid / negative ttl -> default
+        assert!(
+            (Config::from_env_map(&vars(&[("PREFILTER_RESULT_CACHE_TTL", "oops")]))
+                .prefilter_result_cache_ttl_secs
+                - 300.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (Config::from_env_map(&vars(&[("PREFILTER_RESULT_CACHE_TTL", "-5")]))
+                .prefilter_result_cache_ttl_secs
+                - 300.0)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // CLI wins over env
+        let cli = Cli::parse(vec![
+            "--prefilter-result-cache-dir".to_string(),
+            "cli_dir".to_string(),
+            "--prefilter-result-cache-ttl".to_string(),
+            "5".to_string(),
+        ])
+        .unwrap();
+        let merged = cli.merged_env(&vars(&[
+            ("PREFILTER_RESULT_CACHE_DIR", "env_dir"),
+            ("PREFILTER_RESULT_CACHE_TTL", "7"),
+        ]));
+        let c = Config::from_env_map(&merged);
+        assert_eq!(
+            c.prefilter_result_cache_dir.as_deref(),
+            Some(std::path::Path::new("cli_dir"))
+        );
+        assert!((c.prefilter_result_cache_ttl_secs - 5.0).abs() < f64::EPSILON);
+
+        // builder clamps negative ttl to 0 (never expire)
+        let c = Config::new(
+            vec![],
+            100,
+            500,
+            0.1,
+            std::path::PathBuf::from("kv_meta"),
+            std::time::Duration::from_secs(600),
+            "llama.cpp".to_string(),
+            8081,
+        )
+        .with_prefilter_result_cache_dir(Some(std::path::PathBuf::from("rc")))
+        .with_prefilter_result_cache_ttl_secs(-3.0);
+        assert_eq!(c.prefilter_result_cache_ttl_secs, 0.0);
+        assert_eq!(c.result_cache().unwrap().ttl(), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn prefilter_combines_keyword_and_result_cache() {
+        // only the blocklist -> keyword adapter
+        let c = Config::from_env_map(&vars(&[("PREFILTER_BLOCKLIST", "bad")]));
+        assert_eq!(c.prefilter().unwrap().name(), "keyword");
+
+        // only the result cache -> the result-cache adapter
+        let c = Config::from_env_map(&vars(&[("PREFILTER_RESULT_CACHE_DIR", "rc")]));
+        assert_eq!(c.prefilter().unwrap().name(), "result_cache");
+
+        // both -> a chain (blocklist first, result cache second)
+        let c = Config::from_env_map(&vars(&[
+            ("PREFILTER_BLOCKLIST", "bad"),
+            ("PREFILTER_RESULT_CACHE_DIR", "rc"),
+        ]));
+        let pf = c.prefilter().expect("prefilter enabled");
+        assert_eq!(pf.name(), "chain");
+        // both adapters stay available: the result cache is constructed
+        // from the same config for the write path
+        assert!(c.result_cache().is_some());
     }
 
     #[test]

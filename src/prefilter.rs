@@ -10,13 +10,22 @@
 //!   JSON error. The request never reaches the llama-server backend —
 //!   no slot is acquired, no cache is restored or saved, no meta file is
 //!   written, and (because the check runs before coalescing) the request
-//!   never leads or joins a coalesced group.
+//!   never leads or joins a coalesced group;
+//! - `Serve { status, body }`: answer the client immediately with a
+//!   previously cached backend result (a full JSON response with its
+//!   original status code) — same short-circuit semantics as `Reject`,
+//!   but with a successful payload instead of an error.
 //!
-//! Built-in adapter: [`KeywordPrefilter`] — rejects requests whose
-//! message contents contain any blocked keyword (plain substring match,
-//! case-insensitive by default). Enabled via `PREFILTER_BLOCKLIST` /
-//! `--prefilter-blocklist` (see the `config` module); when the list is
-//! empty the prefilter is disabled and there is no per-request cost.
+//! Built-in adapters:
+//! - [`KeywordPrefilter`] — rejects requests whose message contents
+//!   contain any blocked keyword (plain substring match, case-insensitive
+//!   by default). Enabled via `PREFILTER_BLOCKLIST` /
+//!   `--prefilter-blocklist` (see the `config` module); when the list is
+//!   empty the prefilter is disabled and there is no per-request cost.
+//! - [`ChainPrefilter`] — runs several adapters in order; the first
+//!   non-`Accept` decision wins. The `config` module uses it to combine
+//!   the keyword blocklist with the result-cache adapter
+//!   (`crate::result_cache::CachedResultPrefilter`).
 //!
 //! Custom adapters implement the [`Prefilter`] trait and are wired into
 //! `AppState::prefilter` (programmatic use, e.g. rate limiting, model
@@ -40,6 +49,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Snapshot of everything the proxy knows about a request at prefilter
 /// time: after body parsing and cache-key computation, before slot
@@ -65,13 +75,18 @@ pub struct PrefilterRequest {
 }
 
 /// Outcome of a prefilter check.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PrefilterDecision {
     /// Forward the request to the normal pipeline.
     Accept,
     /// Reject the request: the client receives a JSON error with this
     /// status code and message; the request never reaches the backend.
     Reject { status: u16, message: String },
+    /// Serve a previously cached backend result: the client receives
+    /// `body` (a full JSON response) with the given status code; no slot
+    /// is acquired and no backend call is made (see the `result_cache`
+    /// module).
+    Serve { status: u16, body: Value },
 }
 
 /// Adapter trait for accept/reject checks that run before any
@@ -223,6 +238,47 @@ impl Prefilter for KeywordPrefilter {
             },
             None => PrefilterDecision::Accept,
         }
+    }
+}
+
+/// Runs several prefilter adapters in order; the first non-`Accept`
+/// decision wins (a `Reject` or `Serve` from an earlier adapter stops the
+/// chain, and `Accept` from every adapter forwards the request). The
+/// `config` module uses it when both the keyword blocklist and the
+/// result-cache adapter are enabled (the blocklist runs first, so a
+/// blocked request is rejected with `400` before a cache hit could serve
+/// it).
+#[derive(Clone)]
+pub struct ChainPrefilter {
+    filters: Vec<Arc<dyn Prefilter>>,
+}
+
+impl ChainPrefilter {
+    /// Build from an ordered list of adapters (evaluation order).
+    pub fn new(filters: Vec<Arc<dyn Prefilter>>) -> Self {
+        Self { filters }
+    }
+
+    /// The adapters in evaluation order.
+    pub fn filters(&self) -> &[Arc<dyn Prefilter>] {
+        &self.filters
+    }
+}
+
+#[async_trait]
+impl Prefilter for ChainPrefilter {
+    fn name(&self) -> &str {
+        "chain"
+    }
+
+    async fn check(&self, req: &PrefilterRequest) -> PrefilterDecision {
+        for f in &self.filters {
+            match f.check(req).await {
+                PrefilterDecision::Accept => {}
+                other => return other,
+            }
+        }
+        PrefilterDecision::Accept
     }
 }
 
@@ -380,5 +436,63 @@ mod tests {
             pf.check(&req).await,
             PrefilterDecision::Reject { .. }
         ));
+    }
+
+    /// An adapter that always serves a fixed body (chain-test fixture).
+    struct ServeFilter {
+        body: Value,
+    }
+
+    #[async_trait]
+    impl Prefilter for ServeFilter {
+        fn name(&self) -> &str {
+            "serve_fixture"
+        }
+
+        async fn check(&self, _req: &PrefilterRequest) -> PrefilterDecision {
+            PrefilterDecision::Serve {
+                status: 200,
+                body: self.body.clone(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_first_non_accept_wins() {
+        let chain = ChainPrefilter::new(vec![
+            Arc::new(KeywordPrefilter::new(["banned"], true)),
+            Arc::new(ServeFilter {
+                body: json!({ "object": "chat.completion" }),
+            }),
+        ]);
+        assert_eq!(chain.name(), "chain");
+        assert_eq!(chain.filters().len(), 2);
+
+        // Clean request: keyword accepts, serve fixture serves.
+        let req = preq(json!([{ "role": "user", "content": "hello" }]), 1);
+        assert_eq!(
+            chain.check(&req).await,
+            PrefilterDecision::Serve {
+                status: 200,
+                body: json!({ "object": "chat.completion" })
+            }
+        );
+
+        // Blocked request: the earlier reject wins over the later serve.
+        let req = preq(json!([{ "role": "user", "content": "banned word" }]), 2);
+        assert!(matches!(
+            chain.check(&req).await,
+            PrefilterDecision::Reject { status: 400, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn chain_all_accepts_accepts() {
+        let chain = ChainPrefilter::new(vec![
+            Arc::new(KeywordPrefilter::new(["banned"], true)),
+            Arc::new(KeywordPrefilter::new(["other"], true)),
+        ]);
+        let req = preq(json!([{ "role": "user", "content": "hello" }]), 1);
+        assert_eq!(chain.check(&req).await, PrefilterDecision::Accept);
     }
 }

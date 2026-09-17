@@ -12,7 +12,7 @@ client (OpenAI API)                llama.cpp backend(s)
 │ lpcache (this project)                              │
 │  • prefix hashing  • big/small  • LCP restore lookup   │
 │  • slot locks (free-first, then LRU)  • SSE passthrough│
-│  • prefilter accept/reject (optional, PREFILTER_BLOCKLIST) │
+│  • prefilter: keyword reject + result-cache serve (opt.)   │
 │  • saves KV cache + writes <key>.meta.json            │
 └────────────────────────────────────────────────────────┘
 ```
@@ -75,6 +75,7 @@ llama-server \
 |----------------------|------------------------------------------------------------------|
 | `-np 4`              | slot pool size — **must equal `n_slots` in the proxy config**    |
 | `--slot-save-path`   | directory where the real KV `.bin` files are written/read by basename |
+| `--api-key`          | (optional) backend auth — the proxy's `LLAMA_API_KEY` must match it   |
 | `--host`/`--port`    | where the proxy's `BACKENDS` URL points at                      |
 
 > **Note:** without `--slot-save-path`, save/restore calls fail (500) and the
@@ -154,7 +155,7 @@ Expected startup logs:
 ```
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
-slot_manager n_backends=2 total_slots=6
+slot_manager n_backends=2 total_slots=2
 app_start version=0.2.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
@@ -178,6 +179,11 @@ listening on 0.0.0.0:8081
 | `LOG_LEVEL`           | `INFO`                     | `TRACE..ERROR`; `RUST_LOG` overrides it             |
 | `STREAM_QUEUE_SIZE`   | `16`                       | capacity of the per-request SSE channel that buffers streamed bytes between the background reader and the HTTP response (must be >= 1; smaller values backpressure the backend faster) |
 | `COALESCE_REQUESTS`   | `false`                    | group concurrent same-cache-key requests into one backend call (Rust-only) |
+| `LLAMA_API_KEY`       | —                          | sent to the backend as `Authorization: Bearer <key>` (llama-server `--api-key`); unset = no auth |
+| `PREFILTER_BLOCKLIST` | —                          | comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
+| `PREFILTER_CASE_INSENSITIVE` | `true`              | keyword matching is case-insensitive (set `false` for exact-case) |
+| `PREFILTER_RESULT_CACHE_DIR` | —                   | the **cache-result path**; when set, fresh same-key non-streaming requests are answered from a cached backend result (`{dir}/{key}.json`) before any slot/backend work — streaming requests always bypass the cache; unset/blank = disabled |
+| `PREFILTER_RESULT_CACHE_TTL` | `300`               | per-entry result-cache expiry in seconds (`0` = entries never expire) |
 
 Every variable also has a command-line flag; explicit flags take
 precedence over environment variables, which take precedence over the
@@ -201,11 +207,49 @@ built-in defaults. `--help` prints the full list with defaults:
 | `--log-level <LEVEL>`         | `LOG_LEVEL`         |
 | `--stream-queue-size <N>`     | `STREAM_QUEUE_SIZE` |
 | `--coalesce-requests <BOOL>`  | `COALESCE_REQUESTS` |
+| `--prefilter-blocklist <LIST>`    | `PREFILTER_BLOCKLIST` |
+| `--prefilter-case-insensitive <BOOL>` | `PREFILTER_CASE_INSENSITIVE` |
+| `--prefilter-result-cache-dir <PATH>` | `PREFILTER_RESULT_CACHE_DIR` |
+| `--prefilter-result-cache-ttl <SECS>` | `PREFILTER_RESULT_CACHE_TTL` |
 
 The cache key is `sha256(backend_model_id + "\n" + prefix)`, where
 `backend_model_id` is the model id reported by the **first** configured
 backend — so in a multi-backend setup all backends should run the same
 model. The same `META_DIR` can be shared by all backends.
+
+### 4.4 Request prefilter & result cache (optional)
+
+A prefilter adapter runs right after the request body is parsed and the
+cache key is computed, and **before** coalescing, slot acquisition, KV
+restore/save, or backend dispatch. When it short-circuits the request, the
+request **never reaches `llama-server`** — no slot is acquired, no KV cache
+is restored or saved, no meta file is written, and the request never leads
+or joins a coalescing group. Two adapters are built in (enable either or
+both):
+
+- **Keyword blocklist** (`PREFILTER_BLOCKLIST`) — rejects a request whose
+  message contents contain a blocked keyword with a `400` JSON error.
+  Matching is a plain substring, case-insensitive by default
+  (`PREFILTER_CASE_INSENSITIVE`). Logs `prefilter_reject filter=keyword`.
+- **Result cache** (`PREFILTER_RESULT_CACHE_DIR`) — answers a fresh
+  (non-expired) same-key request with a previously cached backend result
+  (the original JSON body and status code), read from `{dir}/{key}.json`.
+  Fresh non-streaming results are stored there after the backend call;
+  **streaming requests are never served from the cache** and always fall
+  through to the backend. Entries expire after `PREFILTER_RESULT_CACHE_TTL`
+  seconds (`0` = never) and are removed lazily on read. Logs
+  `prefilter_serve filter=result_cache` / `result_cache_hit` on a hit, and
+  `result_cache_store_fail` if storing a fresh result fails.
+
+When **both** are enabled they are chained and the blocklist runs first — a
+blocked request is rejected with `400` before a cache hit could serve it.
+With neither set there is no prefilter and no per-request cost. A request
+that passes the prefilter logs `prefilter_accept filter=...` (debug level)
+and runs the normal pipeline.
+
+> **Note:** the result cache is a whole-request cache keyed on the KV cache
+> key (`sha256(backend_model_id + "\n" + prefix)`) — a separate, faster
+> layer on top of the KV-cache restore, disabled by default.
 
 ---
 
@@ -286,7 +330,24 @@ Then, with a >500-word prompt in the messages, send the prompt twice
 ```
 
 This is the same flow the test-suite validates; the identical flows are
-covered by `cargo test` (125 tests) against the in-process mock.
+covered by `cargo test` (148 tests) against the in-process mock.
+
+### 7.1 Load test (optional)
+
+The project also ships a concurrent load-test client for any
+OpenAI-compatible endpoint (the proxy, a mock backend, or a real
+`llama-server`):
+
+```bash
+cargo run --release --example load_test -- [base_url] [workers] [duration_secs] [big_words]
+# defaults: http://127.0.0.1:8091 100 120 600
+```
+
+Each worker sticks to one of three shared long prompts (`worker_id % 3`),
+so most requests exercise the restore hot path; every 5th request is a
+small prompt (uncached by design). When the run finishes it prints a
+status-code breakdown and latency percentiles (client-side, including
+proxy queue wait).
 
 ---
 
@@ -344,6 +405,13 @@ journalctl -u lpcache -f
   (no KV cost at all). Matching is a plain case-insensitive substring by
   default; set `PREFILTER_CASE_INSENSITIVE=false` for exact-case matches.
   Unset/blank disables the prefilter entirely.
+- **`PREFILTER_RESULT_CACHE_DIR` / `PREFILTER_RESULT_CACHE_TTL`** —
+  enable the whole-request result cache to answer fresh, non-streaming
+  same-key requests from a cached backend result (no slot, no backend
+  call). Keep the TTL (`300` s default) short enough that a cached answer
+  is still what the live model would return; `0` keeps entries forever
+  (best for deterministic, non-temperature sampling). Unset the dir to
+  disable it.
 
 ## 10. Troubleshooting
 
@@ -356,8 +424,9 @@ journalctl -u lpcache -f
 | No `restore_candidate` on repeated prompts | Prompt below `BIG_THRESHOLD_WORDS` words, `LCP_TH` too high, different model, or different `WORDS_PER_BLOCK` than when the cache was saved. |
 | `422` from the proxy | Malformed JSON body. |
 | `400` `request blocked by keyword prefilter: "..."` | `PREFILTER_BLOCKLIST` matched the request's message contents; the request never reached the backend. Adjust/remove the keyword, or unset `PREFILTER_BLOCKLIST` to disable the prefilter. |
+| Repeated non-streaming prompt returns instantly with no `dispatch`/`json_done` (a `prefilter_serve filter=result_cache` / `result_cache_hit` line instead) | `PREFILTER_RESULT_CACHE_DIR` is set and a fresh (non-expired) cached result for that key exists in the dir; the proxy served it without touching the backend. Expected behaviour — unset `PREFILTER_RESULT_CACHE_DIR` (or lower `PREFILTER_RESULT_CACHE_TTL`) to force fresh backend calls. |
 | `502` `provider non-JSON body` | The backend answered 200 but with a JSON body that is not an object (e.g. an array); the response is unusable. |
 | 200 response with `{"object":"error", ...}` payload | The backend answered 200 with a non-JSON body; the raw snippet is included. |
-| Logs too quiet | `LOG_LEVEL=DEBUG` (or `RUST_LOG=lpcache=debug`). Key lines: `before_acquire`, `after_acquire`, `dispatch`, `restore_candidate`, `restore_before_chat`, `json_done`, `stream_reader_done`. With `COALESCE_REQUESTS` on, also `coalesce_lead`/`coalesce_join`. |
+| Logs too quiet | `LOG_LEVEL=DEBUG` (or `RUST_LOG=lpcache=debug`). Key lines: `before_acquire`, `after_acquire`, `dispatch`, `restore_candidate`, `restore_before_chat`, `json_done`, `stream_reader_done`. With `COALESCE_REQUESTS` on, also `coalesce_lead`/`coalesce_join`; with a prefilter enabled, `prefilter_accept`/`prefilter_reject`/`prefilter_serve` and (result cache) `result_cache_hit`/`result_cache_expired`. |
 
 
