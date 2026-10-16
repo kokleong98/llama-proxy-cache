@@ -1,106 +1,27 @@
-//! HTTP client for llama.cpp (port of `llama_client.py`).
+//! `llama` plugin — the llama.cpp backend HTTP client adapter.
 //!
+//! `LlamaClient` implements the [`LlamaBackend`] adapter for one
+//! llama.cpp server:
 //! - `chat_stream` / `chat_json`: POST `/v1/chat/completions`
 //! - `save_slot` / `restore_slot`: POST `/slots/{id}?action=save|restore`
 //!   with the file basename in the JSON body (`{"filename": ...}`)
 //! - `get_model_id`: GET `/v1/models`
 //! - The slot pin is duplicated in body root, `options` and query params.
+//!
+//! Params:
+//! - `url` (required): the backend base URL.
+//! - `api_key` (optional): sent as `Authorization: Bearer <key>`
+//!   (llama-server's `--api-key`).
+//! - `timeout_secs` (default `600`): per-request timeout.
 
+use crate::api::{BackendError, JsonChat, LlamaBackend, RestoreOutcome, StreamChat};
+use crate::registry::{PluginError, PluginFactory};
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
-
-/// Errors from backend HTTP calls.
-#[derive(Debug)]
-pub enum BackendError {
-    /// Non-2xx status from the backend (body captured for diagnostics).
-    HttpStatus { status: u16, body: String },
-    /// Network / request-level error.
-    Other(String),
-}
-
-impl std::fmt::Display for BackendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BackendError::HttpStatus { status, body } => {
-                let body: String = body.chars().take(512).collect();
-                write!(f, "provider returned HTTP {status}: {body}")
-            }
-            BackendError::Other(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for BackendError {}
-
-/// Outcome of a restore attempt.
-///
-/// Python only distinguished "failed"; the `Rejected` (HTTP 400) case is
-/// split out so the proxy can tell a *useless KV file* (missing, corrupt,
-/// or too big for the slot's context) from a *transient* failure and clean
-/// up the stale meta entry (see `app::remove_stale_meta`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RestoreOutcome {
-    /// The backend loaded the KV file into the slot (HTTP 200).
-    Restored,
-    /// The backend rejected the file (HTTP 400): it could not be loaded
-    /// on that backend (missing, corrupt, or no available space in the
-    /// slot's KV cache).
-    Rejected,
-    /// Any other failure (non-2xx other than 400, or network error) —
-    /// treat as transient.
-    Failed,
-}
-
-/// Outcome of a non-streaming chat call.
-#[derive(Debug)]
-pub enum JsonChat {
-    /// 200 + JSON object — normal response.
-    Object(Value),
-    /// 200 + valid JSON but not an object (array/scalar) -> proxy 502.
-    NonObject,
-    /// 200 but the body is not usable JSON -> proxy 200 with an error payload.
-    NonJson { message: &'static str, raw: String },
-}
-
-/// A streaming chat response (raw SSE bytes).
-pub struct StreamChat {
-    pub status: u16,
-    pub stream: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>,
-}
-
-/// Abstraction over a llama.cpp backend (implemented by [`LlamaClient`]).
-#[async_trait]
-pub trait LlamaBackend: Send + Sync {
-    /// `Ok(false)` on HTTP 500 (some builds fail that way), `Err` on other
-    /// non-2xx / network errors — mirrors `raise_for_status` after the 500 check.
-    async fn save_slot(&self, slot_id: usize, basename: &str) -> Result<bool, BackendError>;
-    /// Restore a saved KV file into the slot.
-    ///
-    /// `Rejected` on HTTP 400 (the backend could not load the file),
-    /// `Failed` on any other non-2xx or network error.
-    ///
-    /// Deliberate deviation: Python's `restore_slot` propagates network
-    /// errors, which in `app.py` becomes an unhandled 500 that also leaks
-    /// the slot lock (the slot is never released). Here we log and return
-    /// a non-`Restored` outcome so the chat proceeds without the restore.
-    async fn restore_slot(&self, slot_id: usize, basename: &str) -> RestoreOutcome;
-    /// Model id reported by the backend; `"unknown"` on failure.
-    async fn get_model_id(&self) -> String;
-    async fn chat_stream(
-        &self,
-        body: &Value,
-        slot_id: Option<usize>,
-    ) -> Result<StreamChat, BackendError>;
-    async fn chat_json(
-        &self,
-        body: &Value,
-        slot_id: Option<usize>,
-    ) -> Result<JsonChat, BackendError>;
-}
 
 /// reqwest-based client for one llama.cpp backend.
 ///
@@ -175,6 +96,7 @@ impl LlamaClient {
         (new_body, query)
     }
 }
+
 #[async_trait]
 impl LlamaBackend for LlamaClient {
     async fn save_slot(&self, slot_id: usize, basename: &str) -> Result<bool, BackendError> {
@@ -299,6 +221,7 @@ impl LlamaBackend for LlamaClient {
             stream: Box::pin(resp.bytes_stream().map(|r| r.map_err(|e| e.to_string()))),
         })
     }
+
     async fn chat_json(
         &self,
         body: &Value,
@@ -362,9 +285,60 @@ impl LlamaBackend for LlamaClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Plugin factory (configurable, dynamically loadable)
+// ---------------------------------------------------------------------------
+
+const NAME: &str = "llama";
+
+#[derive(Debug, Deserialize)]
+struct LlamaParams {
+    url: String,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    timeout_secs: f64,
+}
+
+fn default_timeout_secs() -> f64 {
+    600.0
+}
+
+/// Factory for the `llama` backend plugin (registered by
+/// [`crate::builtin::register`]).
+pub struct LlamaPluginFactory;
+
+impl PluginFactory for LlamaPluginFactory {
+    fn create_backend(&self, params: &Value) -> Result<Option<Arc<dyn LlamaBackend>>, PluginError> {
+        let LlamaParams {
+            url,
+            api_key,
+            timeout_secs,
+        } = LlamaParams::deserialize(params).map_err(|e| PluginError::BadParams {
+            name: NAME.to_string(),
+            message: e.to_string(),
+        })?;
+        if url.trim().is_empty() {
+            return Err(PluginError::BadParams {
+                name: NAME.to_string(),
+                message: "`url` must be a non-empty base URL".to_string(),
+            });
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs.max(0.0));
+        let client = LlamaClient::new(&url, timeout, api_key.as_deref()).map_err(|e| {
+            PluginError::BadParams {
+                name: NAME.to_string(),
+                message: format!("client init failed: {e}"),
+            }
+        })?;
+        Ok(Some(Arc::new(client)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::PluginFactory;
     use serde_json::json;
 
     #[test]
@@ -403,5 +377,31 @@ mod tests {
         assert_eq!(b2["options"]["slot_id"], 3);
         assert_eq!(b2["options"]["id_slot"], 3);
         assert!(b2["options"].as_object().unwrap().len() == 2);
+    }
+
+    #[tokio::test]
+    async fn factory_creates_backend_from_json_params() {
+        let f = LlamaPluginFactory;
+        let be = f
+            .create_backend(&json!({
+                "url": "http://127.0.0.1:1",
+                "api_key": "777",
+                "timeout_secs": 2
+            }))
+            .unwrap()
+            .expect("backend");
+        // get_model_id against a dead port degrades to "unknown".
+        assert_eq!(be.get_model_id().await, "unknown");
+    }
+
+    #[test]
+    fn factory_rejects_missing_url() {
+        let f = LlamaPluginFactory;
+        assert!(matches!(
+            f.create_backend(&json!({})),
+            Err(PluginError::BadParams { .. })
+        ));
+        // The llama plugin provides no prefilter.
+        assert!(f.create_prefilter(&json!({})).unwrap().is_none());
     }
 }

@@ -25,18 +25,26 @@
 //! - `STREAM_QUEUE_SIZE` (16; capacity of the per-request bounded channel
 //!   that buffers streamed SSE bytes between the background reader and the
 //!   HTTP response — smaller values backpressure the backend faster)
-//! - `PREFILTER_BLOCKLIST` (optional: comma-separated keywords; when set,
-//!   requests whose message contents contain any keyword are rejected with
-//!   `400` before any slot/backend work — see the `prefilter` module)
+//! - `PREFILTER_BLOCKLIST` (legacy; maps to the `keyword` plugin:
+//!   comma-separated keywords; when set, requests whose message contents
+//!   contain any keyword are rejected with `400` before any slot/backend
+//!   work)
 //! - `PREFILTER_CASE_INSENSITIVE` (`true`; keyword matching is
 //!   case-insensitive)
-//! - `PREFILTER_RESULT_CACHE_DIR` (optional: the cache-result path; when
-//!   set, the result-cache prefilter answers fresh same-key requests with
-//!   a previously cached backend result before any slot/backend work, and
-//!   fresh non-streaming results are stored under
-//!   `{dir}/{key}.json` — see the `result_cache` module)
+//! - `PREFILTER_RESULT_CACHE_DIR` (legacy; maps to the `result_cache`
+//!   plugin: the cache-result path; when set, the result-cache prefilter
+//!   answers fresh same-key requests with a previously cached backend
+//!   result before any slot/backend work, and fresh non-streaming results
+//!   are stored under `{dir}/{key}.json`)
 //! - `PREFILTER_RESULT_CACHE_TTL` (300; per-entry expiry in seconds,
 //!   `0` = entries never expire)
+//! - `PLUGINS` (optional: a JSON array of plugin specs
+//!   `[{"name": "...", "params": {...}}, ...]` — the prefilter plugins to
+//!   load from the `lpcache-plugins` registry (built-ins: `keyword`,
+//!   `chain`, `result_cache`; custom plugin crates can register more).
+//!   When set, the specs are used as-is and the legacy `PREFILTER_*`
+//!   settings above are **ignored**; when unset, the specs are
+//!   synthesized from them (see [`Config::plugin_specs`])
 //! - `LOG_LEVEL` (`INFO`)
 //!
 //! Every variable can also be set with a command-line flag (see [`Cli`]);
@@ -46,7 +54,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_BACKEND_URL: &str = "http://127.0.0.1:8000";
@@ -121,20 +128,28 @@ pub struct Config {
     /// key into a single backend call, regardless of generation parameters
     /// (followers receive the leader's result — see the `coalesce` module).
     pub coalesce_requests: bool,
-    /// `PREFILTER_BLOCKLIST`: comma-separated keywords; when non-empty the
-    /// proxy rejects requests whose message contents contain any of them
-    /// before any slot/backend work (see the `prefilter` module).
+    /// `PLUGINS`: raw JSON array of plugin specs
+    /// (`[{"name": "...", "params": {...}}]`). When set, the prefilter
+    /// plugins are loaded from it via the `lpcache-plugins` registry and
+    /// the legacy `PREFILTER_*` settings below are ignored; when `None`,
+    /// the specs are synthesized from them (see [`Config::plugin_specs`]).
+    pub plugins: Option<String>,
+    /// `PREFILTER_BLOCKLIST` (legacy; maps to the `keyword` plugin):
+    /// comma-separated keywords; when non-empty the proxy rejects requests
+    /// whose message contents contain any of them before any slot/backend
+    /// work.
     pub prefilter_blocklist: Vec<String>,
-    /// `PREFILTER_CASE_INSENSITIVE`: case-insensitive keyword matching.
+    /// `PREFILTER_CASE_INSENSITIVE` (legacy; `keyword` plugin param):
+    /// case-insensitive keyword matching.
     pub prefilter_case_insensitive: bool,
-    /// `PREFILTER_RESULT_CACHE_DIR`: the cache-result path; when set, the
-    /// result-cache prefilter serves fresh same-key requests from
-    /// previously cached backend results, and fresh non-streaming results
-    /// are stored in this directory (see the `result_cache` module).
-    /// `None` = result cache disabled (the default).
+    /// `PREFILTER_RESULT_CACHE_DIR` (legacy; maps to the `result_cache`
+    /// plugin): the cache-result path; when set, the result-cache
+    /// prefilter serves fresh same-key requests from previously cached
+    /// backend results, and fresh non-streaming results are stored in this
+    /// directory. `None` = result cache disabled (the default).
     pub prefilter_result_cache_dir: Option<PathBuf>,
-    /// `PREFILTER_RESULT_CACHE_TTL`: per-entry expiry in seconds
-    /// (`0` = entries never expire).
+    /// `PREFILTER_RESULT_CACHE_TTL` (legacy; `result_cache` plugin param):
+    /// per-entry expiry in seconds (`0` = entries never expire).
     pub prefilter_result_cache_ttl_secs: f64,
     /// `SAVE_RETRIES`: retries after a failed KV cache save (backend 500 or
     /// network/other error) before giving up (`0` = no retry).
@@ -175,6 +190,9 @@ pub struct Cli {
     pub stream_queue_size: Option<String>,
     /// Maps to `COALESCE_REQUESTS` (`true`/`false`, or `1`/`0`).
     pub coalesce_requests: Option<String>,
+    /// Maps to `PLUGINS` (JSON array of plugin specs; when set, the legacy
+    /// `PREFILTER_*` settings are ignored).
+    pub plugins: Option<String>,
     /// Maps to `PREFILTER_BLOCKLIST` (comma-separated keywords).
     pub prefilter_blocklist: Option<String>,
     /// Maps to `PREFILTER_CASE_INSENSITIVE` (`true`/`false`, or `1`/`0`).
@@ -217,6 +235,7 @@ impl Config {
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             stream_queue_size: DEFAULT_STREAM_QUEUE_SIZE,
             coalesce_requests: false,
+            plugins: None,
             prefilter_blocklist: Vec::new(),
             prefilter_case_insensitive: DEFAULT_PREFILTER_CASE_INSENSITIVE,
             prefilter_result_cache_dir: None,
@@ -236,6 +255,14 @@ impl Config {
     /// (`COALESCE_REQUESTS`).
     pub fn with_coalesce_requests(mut self, on: bool) -> Self {
         self.coalesce_requests = on;
+        self
+    }
+
+    /// Override the plugin spec list (`PLUGINS`); when set, the prefilter
+    /// plugins are loaded from this JSON array and the legacy
+    /// `PREFILTER_*` settings are ignored.
+    pub fn with_plugins(mut self, plugins: Option<String>) -> Self {
+        self.plugins = plugins;
         self
     }
 
@@ -273,42 +300,50 @@ impl Config {
         self
     }
 
-    /// The prefilter adapter enabled by this configuration, or `None` when
-    /// neither the keyword blocklist (`PREFILTER_BLOCKLIST`) nor the
-    /// result cache (`PREFILTER_RESULT_CACHE_DIR`) is enabled — the
-    /// default: requests are forwarded without any prefilter check. When
-    /// both are enabled they are chained (blocklist first: a blocked
-    /// request is rejected with `400` before a cache hit could serve it).
-    pub fn prefilter(&self) -> Option<Arc<dyn crate::prefilter::Prefilter>> {
-        let mut filters: Vec<Arc<dyn crate::prefilter::Prefilter>> = Vec::new();
-        if !self.prefilter_blocklist.is_empty() {
-            filters.push(Arc::new(crate::prefilter::KeywordPrefilter::new(
-                self.prefilter_blocklist.clone(),
-                self.prefilter_case_insensitive,
-            )));
+    /// The prefilter plugin specs to load from the `lpcache-plugins`
+    /// registry, in evaluation order:
+    /// - when `PLUGINS` is set, its JSON array is parsed and used as-is
+    ///   (the legacy `PREFILTER_*` settings are ignored);
+    /// - otherwise the specs are synthesized from the legacy settings: a
+    ///   `keyword` spec when `PREFILTER_BLOCKLIST` is non-empty and/or a
+    ///   `result_cache` spec when `PREFILTER_RESULT_CACHE_DIR` is set
+    ///   (blocklist first: a blocked request is rejected with `400` before
+    ///   a cache hit could serve it).
+    ///
+    /// An empty list means no prefilter (the default). `Err` when
+    /// `PLUGINS` is set but is not a JSON array of spec objects
+    /// (`{"name": "...", "params": {...}}`).
+    pub fn plugin_specs(&self) -> Result<Vec<lpcache_plugins::PluginSpec>, String> {
+        use lpcache_plugins::PluginSpec;
+        if let Some(raw) = self.plugins.as_deref().filter(|v| !v.trim().is_empty()) {
+            let arr: Vec<serde_json::Value> =
+                serde_json::from_str(raw).map_err(|e| format!("PLUGINS is not valid JSON: {e}"))?;
+            arr.into_iter()
+                .enumerate()
+                .map(|(i, v)| PluginSpec::try_from(&v).map_err(|e| format!("PLUGINS[{i}]: {e}")))
+                .collect()
+        } else {
+            let mut specs = Vec::new();
+            if !self.prefilter_blocklist.is_empty() {
+                specs.push(PluginSpec::new(
+                    "keyword",
+                    serde_json::json!({
+                        "keywords": self.prefilter_blocklist,
+                        "case_insensitive": self.prefilter_case_insensitive,
+                    }),
+                ));
+            }
+            if let Some(dir) = &self.prefilter_result_cache_dir {
+                specs.push(PluginSpec::new(
+                    "result_cache",
+                    serde_json::json!({
+                        "dir": dir.to_string_lossy(),
+                        "ttl_secs": self.prefilter_result_cache_ttl_secs,
+                    }),
+                ));
+            }
+            Ok(specs)
         }
-        if self.prefilter_result_cache_dir.is_some() {
-            let cache = self.result_cache().expect("dir is set");
-            filters.push(Arc::new(crate::result_cache::CachedResultPrefilter::new(
-                cache,
-            )));
-        }
-        match filters.len() {
-            0 => None,
-            1 => Some(filters.into_iter().next().expect("one filter")),
-            _ => Some(Arc::new(crate::prefilter::ChainPrefilter::new(filters))),
-        }
-    }
-
-    /// The result cache enabled by this configuration (`None` when
-    /// `PREFILTER_RESULT_CACHE_DIR` is unset — the default). Used by the
-    /// `app` module to store fresh non-streaming backend results.
-    pub fn result_cache(&self) -> Option<Arc<crate::result_cache::ResultCache>> {
-        let dir = self.prefilter_result_cache_dir.as_ref()?;
-        Some(Arc::new(crate::result_cache::ResultCache::new(
-            dir.clone(),
-            Duration::from_secs_f64(self.prefilter_result_cache_ttl_secs),
-        )))
     }
 
     /// `--slot-save-path` directories known to the proxy, used to remove
@@ -402,6 +437,9 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string()),
             stream_queue_size: env_stream_queue_size(vars),
             coalesce_requests: env_bool(vars, "COALESCE_REQUESTS", false),
+            // Raw JSON array of plugin specs; parsed by `plugin_specs`.
+            // Unset = synthesize the specs from the PREFILTER_* settings.
+            plugins: vars.get("PLUGINS").cloned(),
             // Comma-separated keywords; empty entries dropped. Unset /
             // blank list = prefilter disabled.
             prefilter_blocklist: vars
@@ -575,6 +613,7 @@ impl Cli {
                 "--log-level" => cli.log_level = Some(value),
                 "--stream-queue-size" => cli.stream_queue_size = Some(value),
                 "--coalesce-requests" => cli.coalesce_requests = Some(value),
+                "--plugins" => cli.plugins = Some(value),
                 "--prefilter-blocklist" => cli.prefilter_blocklist = Some(value),
                 "--prefilter-case-insensitive" => cli.prefilter_case_insensitive = Some(value),
                 "--prefilter-result-cache-dir" => cli.prefilter_result_cache_dir = Some(value),
@@ -612,7 +651,8 @@ Options:
   --log-level <LEVEL>           LOG_LEVEL            TRACE..ERROR (default INFO; RUST_LOG overrides)
   --stream-queue-size <N>       STREAM_QUEUE_SIZE    per-request SSE channel capacity (default 16, must be >= 1)
   --coalesce-requests <BOOL>    COALESCE_REQUESTS    group concurrent same-key requests into one backend call (default false)
-  --prefilter-blocklist <LIST>  PREFILTER_BLOCKLIST  comma-separated keywords; matching requests are rejected (400) before the backend (default: disabled)
+  --plugins <JSON>              PLUGINS              JSON array of plugin specs [{"name": "...", "params": {...}}] selecting the prefilter plugins (built-ins: keyword, chain, result_cache); when set, the legacy PREFILTER_* settings are ignored (default: synthesized from them)
+  --prefilter-blocklist <LIST>  PREFILTER_BLOCKLIST  (legacy: keyword plugin) comma-separated keywords; matching requests are rejected (400) before the backend (default: disabled)
   --prefilter-case-insensitive <BOOL>  PREFILTER_CASE_INSENSITIVE  keyword matching is case-insensitive (default true)
   --prefilter-result-cache-dir <PATH>  PREFILTER_RESULT_CACHE_DIR  dir for cached backend results ({key}.json); when set, fresh same-key non-stream requests are answered from the cache before the backend (default: disabled)
   --prefilter-result-cache-ttl <SECS>  PREFILTER_RESULT_CACHE_TTL  cached-result expiry in seconds (default 300, 0 = never)
@@ -673,6 +713,7 @@ Notes:
             ("LOG_LEVEL", &self.log_level),
             ("STREAM_QUEUE_SIZE", &self.stream_queue_size),
             ("COALESCE_REQUESTS", &self.coalesce_requests),
+            ("PLUGINS", &self.plugins),
             ("PREFILTER_BLOCKLIST", &self.prefilter_blocklist),
             (
                 "PREFILTER_CASE_INSENSITIVE",
@@ -727,6 +768,8 @@ mod tests {
         assert_eq!(c.port, 8081);
         assert_eq!(c.log_level, "INFO");
         assert_eq!(c.stream_queue_size, 16);
+        assert!(c.plugins.is_none());
+        assert!(c.prefilter_blocklist.is_empty());
         assert_eq!(c.save_retries, DEFAULT_SAVE_RETRIES);
         assert_eq!(c.save_retry_delay_ms, DEFAULT_SAVE_RETRY_DELAY_MS);
     }
@@ -966,6 +1009,7 @@ mod tests {
             "--log-level",
             "--stream-queue-size",
             "--coalesce-requests",
+            "--plugins",
             "--prefilter-blocklist",
             "--prefilter-case-insensitive",
             "--prefilter-result-cache-dir",
@@ -994,6 +1038,7 @@ mod tests {
             "LOG_LEVEL",
             "STREAM_QUEUE_SIZE",
             "COALESCE_REQUESTS",
+            "PLUGINS",
             "PREFILTER_BLOCKLIST",
             "PREFILTER_CASE_INSENSITIVE",
             "PREFILTER_RESULT_CACHE_DIR",
@@ -1019,6 +1064,131 @@ mod tests {
         let cli = Cli::parse(vec!["--coalesce-requests".to_string(), "false".to_string()]).unwrap();
         let merged = cli.merged_env(&vars(&[("COALESCE_REQUESTS", "1")]));
         assert!(!Config::from_env_map(&merged).coalesce_requests);
+    }
+
+    #[test]
+    fn plugins_env_and_cli_stored_raw() {
+        // unset -> None (synthesized from the PREFILTER_* settings instead)
+        assert_eq!(Config::from_env_map(&HashMap::new()).plugins, None);
+        // env stores the raw JSON; parsing happens in `plugin_specs`
+        let raw = r#"[{"name":"keyword","params":{"keywords":["a"]}}]"#;
+        assert_eq!(
+            Config::from_env_map(&vars(&[("PLUGINS", raw)]))
+                .plugins
+                .as_deref(),
+            Some(raw)
+        );
+        // CLI flag
+        let cli = Cli::parse(vec!["--plugins".to_string(), raw.to_string()]).unwrap();
+        assert_eq!(cli.plugins.as_deref(), Some(raw));
+        // merged env carries the flag value
+        let merged = cli.merged_env(&HashMap::new());
+        assert_eq!(merged.get("PLUGINS").map(String::as_str), Some(raw));
+        // builder
+        assert_eq!(
+            Config::new(
+                Vec::new(),
+                100,
+                500,
+                0.1,
+                std::path::PathBuf::from("m"),
+                Duration::from_secs(600),
+                "m".to_string(),
+                10
+            )
+            .with_plugins(Some(raw.to_string()))
+            .plugins
+            .as_deref(),
+            Some(raw)
+        );
+    }
+
+    #[test]
+    fn plugin_specs_parsed_from_plugins_json() {
+        let c = Config::from_env_map(&vars(&[(
+            "PLUGINS",
+            r#"[{"name":"keyword","params":{"keywords":["a"],"case_insensitive":false}},{"name":"result_cache","params":{"dir":"/var/rc","ttl_secs":120}}]"#,
+        )]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "keyword");
+        assert_eq!(specs[0].params["keywords"], serde_json::json!(["a"]));
+        assert_eq!(specs[0].params["case_insensitive"], false);
+        assert_eq!(specs[1].name, "result_cache");
+        assert_eq!(specs[1].params["dir"], "/var/rc");
+        assert_eq!(specs[1].params["ttl_secs"], 120);
+    }
+
+    #[test]
+    fn plugin_specs_plugins_take_precedence_over_legacy() {
+        let c = Config::from_env_map(&vars(&[
+            (
+                "PLUGINS",
+                r#"[{"name":"keyword","params":{"keywords":["x"]}}]"#,
+            ),
+            ("PREFILTER_BLOCKLIST", "ignored"),
+            ("PREFILTER_RESULT_CACHE_DIR", "/ignored"),
+        ]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "keyword");
+        assert_eq!(specs[0].params["keywords"], serde_json::json!(["x"]));
+        // an empty spec list is valid and disables the prefilter
+        let c = Config::from_env_map(&vars(&[
+            ("PLUGINS", "[]"),
+            ("PREFILTER_BLOCKLIST", "ignored"),
+        ]));
+        assert!(c.plugin_specs().expect("specs").is_empty());
+    }
+
+    #[test]
+    fn plugin_specs_invalid_json_errors() {
+        // not JSON at all
+        let c = Config::from_env_map(&vars(&[("PLUGINS", "not json")]));
+        assert!(c.plugin_specs().is_err());
+        // JSON, but not an array
+        let c = Config::from_env_map(&vars(&[("PLUGINS", r#"{"name":"keyword"}"#)]));
+        assert!(c.plugin_specs().is_err());
+        // array entry without a `name` string
+        let c = Config::from_env_map(&vars(&[("PLUGINS", r#"[{"params":{}}]"#)]));
+        let err = c.plugin_specs().unwrap_err();
+        assert!(err.contains("PLUGINS[0]"), "err: {err}");
+        // blank value = unset -> synthesize from the (unset) legacy settings
+        let c = Config::from_env_map(&vars(&[("PLUGINS", "   ")]));
+        assert!(c.plugin_specs().expect("blank = unset").is_empty());
+    }
+
+    #[test]
+    fn plugin_specs_synthesized_from_legacy_settings() {
+        // neither legacy setting -> no prefilter (the default)
+        assert!(
+            Config::from_env_map(&HashMap::new())
+                .plugin_specs()
+                .expect("specs")
+                .is_empty()
+        );
+        // blocklist only -> one `keyword` spec
+        let c = Config::from_env_map(&vars(&[("PREFILTER_BLOCKLIST", "a, b")]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "keyword");
+        assert_eq!(specs[0].params["keywords"], serde_json::json!(["a", "b"]));
+        // default case_insensitive=true
+        assert_eq!(specs[0].params["case_insensitive"], true);
+        // both set -> keyword first, then result_cache
+        let c = Config::from_env_map(&vars(&[
+            ("PREFILTER_BLOCKLIST", "a"),
+            ("PREFILTER_CASE_INSENSITIVE", "false"),
+            ("PREFILTER_RESULT_CACHE_DIR", "/var/rc"),
+            ("PREFILTER_RESULT_CACHE_TTL", "60"),
+        ]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "keyword");
+        assert_eq!(specs[0].params["case_insensitive"], false);
+        assert_eq!(specs[1].name, "result_cache");
+        assert_eq!(specs[1].params["dir"], "/var/rc");
+        assert_eq!(specs[1].params["ttl_secs"], 60.0);
     }
 
     #[test]
@@ -1063,7 +1233,10 @@ mod tests {
         assert_eq!(c.save_retries, 5);
         assert_eq!(c.save_retry_delay_ms, 250);
         // 0 disables retries
-        assert_eq!(Config::from_env_map(&vars(&[("SAVE_RETRIES", "0")])).save_retries, 0);
+        assert_eq!(
+            Config::from_env_map(&vars(&[("SAVE_RETRIES", "0")])).save_retries,
+            0
+        );
         // invalid -> defaults
         let c = Config::from_env_map(&vars(&[
             ("SAVE_RETRIES", "oops"),
@@ -1094,7 +1267,7 @@ mod tests {
         let c = Config::from_env_map(&HashMap::new());
         assert!(c.prefilter_blocklist.is_empty());
         assert!(c.prefilter_case_insensitive);
-        assert!(c.prefilter().is_none());
+        assert!(c.plugin_specs().expect("specs").is_empty());
 
         // env: comma list trimmed, empty entries dropped
         let c = Config::from_env_map(&vars(&[
@@ -1106,14 +1279,21 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert!(!c.prefilter_case_insensitive);
-        let pf = c.prefilter().expect("prefilter enabled");
-        assert_eq!(pf.name(), "keyword");
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "keyword");
+        assert_eq!(
+            specs[0].params["keywords"],
+            serde_json::json!(["a", "b", "c"])
+        );
+        assert_eq!(specs[0].params["case_insensitive"], false);
 
         // blank list = disabled
         assert!(
             Config::from_env_map(&vars(&[("PREFILTER_BLOCKLIST", " , ")]))
-                .prefilter()
-                .is_none()
+                .plugin_specs()
+                .expect("specs")
+                .is_empty()
         );
 
         // invalid boolean -> default (case-insensitive)
@@ -1134,6 +1314,9 @@ mod tests {
         let c = Config::from_env_map(&merged);
         assert_eq!(c.prefilter_blocklist, vec!["cli-kw".to_string()]);
         assert!(!c.prefilter_case_insensitive);
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].params["keywords"], serde_json::json!(["cli-kw"]));
     }
 
     #[test]
@@ -1142,8 +1325,7 @@ mod tests {
         let c = Config::from_env_map(&HashMap::new());
         assert!(c.prefilter_result_cache_dir.is_none());
         assert!((c.prefilter_result_cache_ttl_secs - 300.0).abs() < f64::EPSILON);
-        assert!(c.result_cache().is_none());
-        assert!(c.prefilter().is_none());
+        assert!(c.plugin_specs().expect("specs").is_empty());
 
         // env: dir + ttl
         let c = Config::from_env_map(&vars(&[
@@ -1155,11 +1337,11 @@ mod tests {
             Some(std::path::Path::new("my_cache"))
         );
         assert!((c.prefilter_result_cache_ttl_secs - 60.0).abs() < f64::EPSILON);
-        let rc = c.result_cache().expect("result cache enabled");
-        assert_eq!(rc.dir(), std::path::Path::new("my_cache"));
-        assert_eq!(rc.ttl(), std::time::Duration::from_secs(60));
-        let pf = c.prefilter().expect("prefilter enabled");
-        assert_eq!(pf.name(), "result_cache");
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "result_cache");
+        assert_eq!(specs[0].params["dir"], "my_cache");
+        assert_eq!(specs[0].params["ttl_secs"], 60.0);
 
         // blank dir = disabled; ttl 0 = never expire
         let c = Config::from_env_map(&vars(&[
@@ -1168,8 +1350,7 @@ mod tests {
         ]));
         assert!(c.prefilter_result_cache_dir.is_none());
         assert!(c.prefilter_result_cache_ttl_secs == 0.0);
-        assert!(c.result_cache().is_none());
-        assert!(c.prefilter().is_none());
+        assert!(c.plugin_specs().expect("specs").is_empty());
 
         // invalid / negative ttl -> default
         assert!(
@@ -1205,6 +1386,11 @@ mod tests {
             Some(std::path::Path::new("cli_dir"))
         );
         assert!((c.prefilter_result_cache_ttl_secs - 5.0).abs() < f64::EPSILON);
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "result_cache");
+        assert_eq!(specs[0].params["dir"], "cli_dir");
+        assert_eq!(specs[0].params["ttl_secs"], 5.0);
 
         // builder clamps negative ttl to 0 (never expire)
         let c = Config::new(
@@ -1220,29 +1406,36 @@ mod tests {
         .with_prefilter_result_cache_dir(Some(std::path::PathBuf::from("rc")))
         .with_prefilter_result_cache_ttl_secs(-3.0);
         assert_eq!(c.prefilter_result_cache_ttl_secs, 0.0);
-        assert_eq!(c.result_cache().unwrap().ttl(), std::time::Duration::ZERO);
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].params["ttl_secs"], 0.0);
     }
 
     #[test]
-    fn prefilter_combines_keyword_and_result_cache() {
-        // only the blocklist -> keyword adapter
+    fn plugin_specs_combine_keyword_and_result_cache() {
+        // only the blocklist -> one keyword spec
         let c = Config::from_env_map(&vars(&[("PREFILTER_BLOCKLIST", "bad")]));
-        assert_eq!(c.prefilter().unwrap().name(), "keyword");
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "keyword");
 
-        // only the result cache -> the result-cache adapter
+        // only the result cache -> one result_cache spec
         let c = Config::from_env_map(&vars(&[("PREFILTER_RESULT_CACHE_DIR", "rc")]));
-        assert_eq!(c.prefilter().unwrap().name(), "result_cache");
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "result_cache");
 
-        // both -> a chain (blocklist first, result cache second)
+        // both -> two specs in order (blocklist first: a blocked request is
+        // rejected with 400 before a cache hit could serve it); the
+        // registry chains them into one prefilter at load time
         let c = Config::from_env_map(&vars(&[
             ("PREFILTER_BLOCKLIST", "bad"),
             ("PREFILTER_RESULT_CACHE_DIR", "rc"),
         ]));
-        let pf = c.prefilter().expect("prefilter enabled");
-        assert_eq!(pf.name(), "chain");
-        // both adapters stay available: the result cache is constructed
-        // from the same config for the write path
-        assert!(c.result_cache().is_some());
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "keyword");
+        assert_eq!(specs[1].name, "result_cache");
     }
 
     #[test]

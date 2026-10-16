@@ -4,26 +4,29 @@ Complete catalog of the **lpcache** regression suite (KV-cache-aware,
 OpenAI-compatible proxy for llama.cpp). Every entry maps 1:1 to a test
 function; the full suite runs with `cargo test`.
 
-**Total: 148 test cases** — 91 unit + 42 API integration + 15 client
-integration.
+**Total: 175 test cases** — 77 lpcache unit + 41 lpcache-plugins
+unit + 42 API integration + 15 client integration.
 
 | # | Suite | Location | Tests |
 |---|-------|----------|-------|
-| 1 | Configuration (env vars, CLI, precedence) | `src/config.rs` | 25 |
-| 2 | Request prefilter adapter | `src/prefilter.rs` | 9 |
+| 1 | Configuration (env vars, CLI, precedence, `PLUGINS` specs) | `src/config.rs` | 33 |
+| 2 | Prefilter plugins (keyword, chain) | `plugins/src/builtin/keyword.rs`, `chain.rs` | 14 |
 | 3 | Hashing, meta files, pruning | `src/hashing.rs` | 19 |
 | 4 | Request coalescing (`SingleFlight`) | `src/coalesce.rs` | 4 |
-| 5 | Backend client — slot pinning | `src/llama_client.rs` | 3 |
-| 6 | Slot management (selection, locks, breaker) | `src/slot_manager.rs` | 17 |
-| 7 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 33 |
+| 5 | llama backend client plugin | `plugins/src/builtin/llama.rs` | 5 |
+| 6 | Slot management (selection, locks, breaker) | `src/slot_manager.rs` | 21 |
+| 7 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 42 |
 | 8 | Backend client — HTTP behavior | `tests/client.rs` | 15 |
+| 9 | Result cache plugin | `plugins/src/builtin/result_cache.rs` | 14 |
+| 10 | Plugin registry (specs, loading, chaining) | `plugins/src/registry.rs` | 8 |
 
 ## How to run
 
 ```sh
 cd lpcache
-cargo test                    # full regression suite (148 tests, ~4 s)
-cargo test --lib              # 91 unit tests only
+cargo test                    # full regression suite (175 tests, ~4 s)
+cargo test --lib              # 77 lpcache unit tests only
+cargo test -p lpcache-plugins # 41 plugin library unit tests
 cargo test --test api         # 42 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test <name-substring>   # run a single test by name filter
@@ -34,7 +37,7 @@ Integration tests start `MockLlama` — an in-process mock of the llama.cpp
 server (`src/mock_backend.rs`) on free localhost ports — so the suite needs
 no real `llama-server`, model files, or network access.
 
-## 1. Configuration — `src/config.rs` (28)
+## 1. Configuration — `src/config.rs` (33)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -60,17 +63,26 @@ no real `llama-server`, model files, or network access.
 | 20 | `cli_usage_lists_all_flags_and_env_vars` | completeness of `--help` text | all 22 flags and 20 env vars listed |
 | 21 | `coalesce_requests_flag` | `COALESCE_REQUESTS` env + CLI | off by default; `true`/`1` on; `0`/invalid off; CLI overrides env |
 | 22 | `stream_queue_size_env_and_cli` | `STREAM_QUEUE_SIZE` env + CLI | default 16; env `64` applied; `0` / invalid → default; CLI `--stream-queue-size 8` overrides env; builder clamps below 1 to 1 |
-| 23 | `prefilter_env_and_cli` | `PREFILTER_BLOCKLIST` / `PREFILTER_CASE_INSENSITIVE` env + CLI | default disabled (empty list, case-insensitive); comma list trimmed with empty entries dropped; blank list = disabled; invalid bool → default; CLI wins over env |
+| 23 | `prefilter_env_and_cli` | `PREFILTER_BLOCKLIST` / `PREFILTER_CASE_INSENSITIVE` env + CLI | default disabled (empty list, case-insensitive); comma list trimmed with empty entries dropped; blank list = disabled; invalid bool → default; CLI wins over env; synthesized `keyword` spec params (`keywords`, `case_insensitive`) |
 | 24 | `config_precedence_cli_over_env_over_defaults` | CLI > env > default (merged env map **and** final Config) | CLI overrides; env applies to unset flags; unset flags add nothing; default otherwise |
-| | 26 | `prefilter_result_cache_env_and_cli` | `PREFILTER_RESULT_CACHE_DIR` / `PREFILTER_RESULT_CACHE_TTL` env + CLI | default disabled (no dir, 300 s TTL); dir + TTL applied; blank dir = disabled; `0` = never expire; invalid/negative TTL → default; CLI wins over env; builder clamps negative TTL to 0 |
-| | 27 | `prefilter_combines_keyword_and_result_cache` | which adapter `Config::prefilter()` builds | blocklist only → `keyword`; result cache only → `result_cache`; both → `chain` (blocklist first) |
 | 25 | `config_from_cli_overrides_process_env` | `Config::from_cli` vs real process env | CLI value wins; empty CLI reproduces the process-env config |
-| 28 | `save_retry_env_and_cli` | `SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS` env + CLI | default 3 retries / 1000 ms; env values applied; `0` disables retries; invalid → defaults; CLI wins over env |
+| 26 | `prefilter_result_cache_env_and_cli` | `PREFILTER_RESULT_CACHE_DIR` / `PREFILTER_RESULT_CACHE_TTL` env + CLI | default disabled (no dir, 300 s TTL); dir + TTL applied; blank dir = disabled; `0` = never expire; invalid/negative TTL → default; CLI wins over env; builder clamps negative TTL to 0; synthesized `result_cache` spec params (`dir`, `ttl_secs`) |
+| 27 | `save_retry_env_and_cli` | `SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS` env + CLI | default 3 retries / 1000 ms; env values applied; `0` disables retries; invalid → defaults; CLI wins over env |
+| 28 | `plugin_specs_combine_keyword_and_result_cache` | which specs `Config::plugin_specs()` synthesizes from legacy env | blocklist only → one `keyword` spec; result cache only → one `result_cache` spec; both → two specs in order (`keyword` first) |
+| 29 | `plugin_specs_parsed_from_plugins_json` | `PLUGINS` JSON array (a `keyword` + a `result_cache` spec) | spec names/params parsed exactly (incl. an empty `params` object) |
+| 30 | `plugins_env_and_cli_stored_raw` | `PLUGINS` env + `--plugins` CLI | raw string kept (surrounding whitespace); CLI wins over env; unset → `None` |
+| 31 | `plugin_specs_plugins_take_precedence_over_legacy` | `PLUGINS` set **and** legacy `PREFILTER_*` set | `PLUGINS` used verbatim; legacy settings ignored |
+| 32 | `plugin_specs_synthesized_from_legacy_settings` | legacy `PREFILTER_*` only (no `PLUGINS`) | `keyword` spec (keywords, case_insensitive) + `result_cache` spec (dir, ttl_secs) in order; both unset → no specs |
+| 33 | `plugin_specs_invalid_json_errors` | malformed `PLUGINS` JSON | `Err` mentioning `PLUGINS` |
 
-## 2. Request prefilter adapter — `src/prefilter.rs` (11)
+## 2. Prefilter plugins — `plugins/src/builtin/keyword.rs` + `chain.rs` (14)
 
-The accept/reject/serve adapter consulted before any slot/backend work
-(see the `prefilter` module docs).
+The `Prefilter` trait implementations from the `lpcache-plugins`
+library — loaded by the proxy from `PLUGINS` specs (or specs synthesized
+from the legacy `PREFILTER_*` variables) and consulted before any
+slot/backend work.
+
+Keyword plugin (11 tests):
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -83,9 +95,16 @@ The accept/reject/serve adapter consulted before any slot/backend work
 | 7 | `message_text_flattens_content` | string + array contents flattened | newline-joined text; empty/defensive inputs → `""` |
 | 8 | `from_comma_list_trims_and_drops_empty` | `PREFILTER_BLOCKLIST`-style parsing | trimmed list; whitespace-only/empty → `None` (disabled) |
 | 9 | `trait_object_dispatch` | adapter behind `Arc<dyn Prefilter>` (the `AppState` shape) | `name()` + `check()` dispatch correctly |
+| 10 | `factory_creates_prefilter_from_json_params` | `keyword` plugin factory with JSON params | prefilter built from `keywords` + `case_insensitive` |
+| 11 | `factory_rejects_empty_or_missing_keywords` | no `keywords` / empty list / wrong type | factory `Err` |
 
-| | 10 | `chain_first_non_accept_wins` | `ChainPrefilter` (keyword → serve-fixture) | clean request → `Serve` from the 2nd adapter; blocked request → `Reject { 400 }` from the 1st beats the later serve |
-| | 11 | `chain_all_accepts_accepts` | all adapters return `Accept` | chain returns `Accept` |
+Chain plugin (3 tests):
+
+| # | Test case | What it verifies | Expected result |
+|---|-----------|------------------|-----------------|
+| 12 | `chain_first_non_accept_wins` | `ChainPrefilter` (keyword → serve-fixture) | clean request → `Serve` from the 2nd adapter; blocked request → `Reject { 400 }` from the 1st beats the later serve |
+| 13 | `chain_all_accepts_accepts` | all adapters return `Accept` | chain returns `Accept` |
+| 14 | `factory_builds_nested_chain_from_specs` | `chain` factory with a nested `prefilters` spec list | nested chain constructed and dispatching |
 ## 3. Hashing, meta files, pruning — `src/hashing.rs` (19)
 
 | # | Test case | What it verifies | Expected result |
@@ -119,13 +138,18 @@ The accept/reject/serve adapter consulted before any slot/backend work
 | 3 | `finish_wakes_waiters_with_outcome` | waiter wakeup on leader finish | follower receives the leader's `SharedOutcome` |
 | 4 | `sse_append_and_drain_is_ordered` | ordered incremental SSE drain | `"a"+"bc"` drains as `"abc"`, then `"d"`; full buffer `"abcd"` |
 
-## 5. Backend client — slot pinning — `src/llama_client.rs` (3)
+## 5. llama backend client plugin — `plugins/src/builtin/llama.rs` (5)
+
+The built-in `llama` plugin's `LlamaClient` — slot-pinning unit tests
+plus the plugin factory.
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
 | 1 | `slot_pinning_none` | `slot = None` | body unchanged, no query params |
 | 2 | `slot_pinning_duplicated_in_root_options_query` | `slot = Some(1)` | `_slot_id`/`slot_id`/`id_slot` in body root **and** `options`, `slot_id`/`id_slot` in query; existing fields preserved |
 | 3 | `slot_pinning_adds_options_when_missing` | body without an `options` object | `options` object created with both pin fields |
+| 4 | `factory_creates_backend_from_json_params` | `llama` plugin factory with JSON params | backend client created from `url` (+ optional `api_key`) |
+| 5 | `factory_rejects_missing_url` | spec without a `url` param | factory `Err` |
 
 ## 6. Slot management — `src/slot_manager.rs` (21)
 
@@ -232,25 +256,47 @@ tests capture the raw request on a one-shot TCP server.
 | 14 | `restore_slot_statuses` | `POST /slot/{id}/restore` | 200 → `Restored`, 400 → `Rejected`, 500 → `Failed` (no error); calls recorded |
 | 15 | `base_url_trailing_slash_normalized` | backend URL with a trailing `/` | works — model id resolved |
 
-## 9. Result cache + cached-result prefilter — `src/result_cache.rs` (10)
+## 9. Result cache plugin — `plugins/src/builtin/result_cache.rs` (14)
 
-File-based cache of non-streaming backend results keyed by the request KV
-cache key (`{dir}/{key}.json` with `status`/`body`/`stored_at`), the
-`CachedResultPrefilter` adapter (`PrefilterDecision::Serve` on a fresh hit)
-and the `PostCleanup` post-serve cleanup adapter.
+The `result_cache` plugin: file-based cache of non-streaming backend
+results keyed by the request KV cache key (`{dir}/{key}.json` with
+`status`/`body`/`stored_at`), a `Prefilter` (`PrefilterDecision::Serve`
+on a fresh hit), a `ResultStore` for the post-backend write path, and
+the `PostCleanup` post-serve cleanup adapter.
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
-| | 1 | `put_get_roundtrip` | store/fetch/overwrite an entry | roundtrip of `(status, body)`; missing key → `None`; no temp files left |
-| | 2 | `expired_entry_misses_and_is_removed` | TTL 50 ms, read after 60 ms | miss + the entry file is removed (lazy expiry) |
-| | 3 | `zero_ttl_never_expires` | TTL `0` | entry stays fresh |
-| | 4 | `corrupt_entry_misses_and_is_removed` | unreadable JSON entry | miss + removed (self-healing) |
-| | 5 | `prefilter_serves_fresh_hit` | miss → `Accept`; after `put`, hit | `Serve { status, body }`; the adapter exposes the backing cache |
-| | 6 | `prefilter_ignores_stream_requests` | `stream: true` with a fresh hit | `Accept` (never served) |
-| | 7 | `prefilter_ignores_expired_entries` | hit after TTL elapsed | `Accept` |
-| | 8 | `remove_after_serve_deletes_the_entry` | `RemoveAfterServe` cleanup on a hit | `Serve`, entry file removed, next check misses |
-| | 9 | `remove_after_serve_missing_file_is_noop` | cleanup on an absent file | no error (concurrent-serve race is safe) |
-| | 10 | `trait_object_dispatch` | adapter behind `Arc<dyn Prefilter>` | `name()` = `result_cache`; dispatch works |
+| 1 | `put_get_roundtrip` | store/fetch/overwrite an entry | roundtrip of `(status, body)`; missing key → `None`; no temp files left |
+| 2 | `expired_entry_misses_and_is_removed` | TTL 50 ms, read after 60 ms | miss + the entry file is removed (lazy expiry) |
+| 3 | `zero_ttl_never_expires` | TTL `0` | entry stays fresh |
+| 4 | `corrupt_entry_misses_and_is_removed` | unreadable JSON entry | miss + removed (self-healing) |
+| 5 | `prefilter_serves_fresh_hit` | miss → `Accept`; after `put`, hit | `Serve { status, body }`; the prefilter exposes the backing cache |
+| 6 | `prefilter_ignores_stream_requests` | `stream: true` with a fresh hit | `Accept` (never served) |
+| 7 | `prefilter_ignores_expired_entries` | hit after TTL elapsed | `Accept` |
+| 8 | `remove_after_serve_deletes_the_entry` | `RemoveAfterServe` cleanup on a hit | `Serve`, entry file removed, next check misses |
+| 9 | `remove_after_serve_missing_file_is_noop` | cleanup on an absent file | no error (concurrent-serve race is safe) |
+| 10 | `trait_object_dispatch` | prefilter behind `Arc<dyn Prefilter>` | `name()` = `result_cache`; dispatch works |
+| 11 | `factory_creates_plugin_from_json_params` | plugin factory with JSON params | prefilter + result store from `dir` / `ttl_secs` / `cleanup` |
+| 12 | `factory_requires_dir_and_validates_cleanup` | missing `dir`; unknown `cleanup` value | factory `Err` |
+| 13 | `store_trait_wraps_put` | `ResultStore::store` through the trait object | entry file written via the trait |
+| 14 | `prefilter_result_store_exposes_the_same_cache` | the plugin's prefilter + result store together | both share the same cache (a store is visible to the prefilter) |
+
+## 10. Plugin registry — `plugins/src/registry.rs` (8)
+
+The runtime registry: plugin factories registered by name, `PluginSpec`
+parsing from `PLUGINS` JSON, and `load_prefilters` (zero/one/many specs
+→ no prefilter / one prefilter / a `chain`).
+
+| # | Test case | What it verifies | Expected result |
+|---|-----------|------------------|-----------------|
+| 1 | `with_builtins_registers_all_builtin_plugins` | `Registry::with_builtins()` | `chain`, `keyword`, `llama`, `result_cache` registered; unknown names not |
+| 2 | `global_registry_and_ensure_builtin_are_idempotent` | `global()` + repeated `ensure_builtin()` | same registry; built-ins registered exactly once |
+| 3 | `register_custom_plugin_and_create_it` | custom factory registered at runtime | created by name; `name()` = custom plugin |
+| 4 | `unknown_plugin_is_an_error` | spec naming an unregistered plugin | `PluginError::UnknownPlugin` naming it |
+| 5 | `wrong_kind_is_an_error` | prefilter spec for a backend-only plugin (`llama`) and backend spec for a prefilter-only plugin (`keyword`) | `PluginError::UnsupportedKind` in both directions |
+| 6 | `plugin_spec_from_value_defaults_empty_params` | JSON object with/without `params` | name kept; missing `params` → empty object |
+| 7 | `load_prefilters_zero_one_many` | empty list / 1 spec / 2 specs | `None` / the single prefilter (unwrapped) / a `chain` prefilter |
+| 8 | `load_prefilters_propagates_errors` | a spec whose factory fails | the factory's error propagates |
 
 ## Coverage notes
 
@@ -271,13 +317,25 @@ client-disconnect behaviour.
 | Idle-aware slot selection | `pick_skips_held_slot_in_favor_of_idle` |
 | Bounded cache pruning (`META_MAX`) | `prune_meta_*` (unit), `prune_removes_oldest_meta_and_kv_files` (E2E) |
 | Concurrent-request coalescing (Rust-only feature) | 4 unit + 6 E2E coalesce tests |
-| Request prefilter adapter (Rust-only feature) | 11 unit + 8 E2E prefilter tests |
-| Result cache + cached-result prefilter (Rust-only feature) | 10 unit + 5 E2E tests (4 result-cache + 1 blocklist-over-cache chain) |
+| Prefilter plugins (Rust-only feature) | 14 plugin unit tests (keyword 11, chain 3) + 8 E2E prefilter tests |
+| Result cache plugin (Rust-only feature) | 14 plugin unit + 5 E2E tests (4 result-cache + 1 blocklist-over-cache chain) |
+| Plugin system (`PLUGINS` env/flag, `lpcache-plugins` registry) | 5 `PLUGINS` config tests + 8 registry tests + 9 plugin `factory_*` tests; E2E state is built via `load_prefilters` |
 | KV cache save auto-retry (`SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS`, Rust-only feature) | `save_after_retries_until_success`, `save_after_retries_exhausted_propagates_error`, `save_after_retries_exhausted_500_returns_false`, `save_after_no_retry_when_retries_disabled` (unit), `save_retry_env_and_cli` (config) |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 
-**Suite health (2026-09-02).** 129/129 passing, clippy clean, ~4 s wall
+**Suite health (2026-10-16).** 175/175 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
+On 2026-10-16 the adapter modules (`src/prefilter.rs`,
+`src/result_cache.rs`, `src/llama_client.rs`) moved into the
+`lpcache-plugins` workspace library behind the `Prefilter` /
+`ResultStore` / `LlamaBackend` traits and the plugin registry; `PLUGINS`
+(env var + `--plugins` flag) selects plugins by name, and the legacy
+`PREFILTER_*` variables are translated into equivalent plugin specs when
+`PLUGINS` is unset. All previous tests were kept (the 24 adapter unit
+tests moved to the plugin crate; the 42 API tests now build state via
+`load_prefilters`), and 22 unit cases were added (5 `PLUGINS` config
+tests, 8 registry tests, 9 plugin factory tests).
+On 2026-09-02 the suite stood at 129/129 passing.
 On 2026-08-31 the configurable `STREAM_QUEUE_SIZE` (env var +
 `--stream-queue-size` flag) added three cases: `stream_queue_size_env_and_cli`
 (config) and `stream_queue_size_one_delivers_full_stream` /

@@ -1,0 +1,23 @@
+[package]
+name = "lpcache-plugins"
+version = "0.1.0"
+edition = "2024"
+description = "Configurable, dynamically loadable adapter plugins for lpcache"
+license = "MIT"
+
+[lib]
+name = "lpcache_plugins"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

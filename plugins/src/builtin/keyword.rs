@@ -1,107 +1,22 @@
-//! Request prefilter (adapter).
+//! `keyword` plugin — rejects requests whose message contents contain a
+//! blocked keyword (plain substring match, case-insensitive by default).
 //!
-//! A [`Prefilter`] is an adapter the proxy consults **before** any slot
-//! acquisition, KV-cache restore/save, or backend dispatch: it inspects
-//! the parsed chat-completion request ([`PrefilterRequest`]) and returns
-//! a [`PrefilterDecision`] —
-//! - `Accept`: run the normal pipeline (coalescing, slot acquire,
-//!   backend call, save/meta);
-//! - `Reject { status, message }`: answer the client immediately with a
-//!   JSON error. The request never reaches the llama-server backend —
-//!   no slot is acquired, no cache is restored or saved, no meta file is
-//!   written, and (because the check runs before coalescing) the request
-//!   never leads or joins a coalesced group;
-//! - `Serve { status, body }`: answer the client immediately with a
-//!   previously cached backend result (a full JSON response with its
-//!   original status code) — same short-circuit semantics as `Reject`,
-//!   but with a successful payload instead of an error.
+//! Params:
+//! - `keywords` (required): array of keyword strings, or a
+//!   comma-separated string (`"a, b"`).
+//! - `case_insensitive` (default `true`).
 //!
-//! Built-in adapters:
-//! - [`KeywordPrefilter`] — rejects requests whose message contents
-//!   contain any blocked keyword (plain substring match, case-insensitive
-//!   by default). Enabled via `PREFILTER_BLOCKLIST` /
-//!   `--prefilter-blocklist` (see the `config` module); when the list is
-//!   empty the prefilter is disabled and there is no per-request cost.
-//! - [`ChainPrefilter`] — runs several adapters in order; the first
-//!   non-`Accept` decision wins. The `config` module uses it to combine
-//!   the keyword blocklist with the result-cache adapter
-//!   (`crate::result_cache::CachedResultPrefilter`).
-//!
-//! Custom adapters implement the [`Prefilter`] trait and are wired into
-//! `AppState::prefilter` (programmatic use, e.g. rate limiting, model
-//! allow-lists, or tests):
-//!
-//! ```ignore
-//! #[async_trait::async_trait]
-//! impl Prefilter for MyFilter {
-//!     fn name(&self) -> &str { "my_filter" }
-//!     async fn check(&self, req: &PrefilterRequest) -> PrefilterDecision {
-//!         if req.n_words > 1000 {
-//!             return PrefilterDecision::Reject {
-//!                 status: 413,
-//!                 message: "prompt too long".to_string(),
-//!             };
-//!         }
-//!         PrefilterDecision::Accept
-//!     }
-//! }
-//! ```
+//! Rejections are `400` with a message naming the first matching keyword.
+//! An empty keyword list yields no plugin (a config entry is only
+//! synthesized by `lpcache` when a non-empty list is configured).
 
+use crate::api::{Prefilter, PrefilterDecision, PrefilterRequest};
+use crate::registry::{PluginError, PluginFactory};
 use async_trait::async_trait;
+use serde::Deserialize;
+use serde::de::Error as _;
 use serde_json::Value;
 use std::sync::Arc;
-
-/// Snapshot of everything the proxy knows about a request at prefilter
-/// time: after body parsing and cache-key computation, before slot
-/// acquisition or backend dispatch.
-#[derive(Debug, Clone)]
-pub struct PrefilterRequest {
-    /// The full parsed request body (a JSON object).
-    pub body: Value,
-    /// The `messages` array (`[]` when the body has none).
-    pub messages: Value,
-    /// The model the client asked for (the proxy model id when absent).
-    pub model: String,
-    /// The backend model id used in the cache key.
-    pub backend_model_id: String,
-    /// `true` when the client asked for a streamed response.
-    pub stream: bool,
-    /// The request's KV cache key (sha256 hex).
-    pub key: String,
-    /// Total word count of the concatenated message contents.
-    pub n_words: usize,
-    /// `true` when `n_words > BIG_THRESHOLD_WORDS` (cache-eligible).
-    pub is_big: bool,
-}
-
-/// Outcome of a prefilter check.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PrefilterDecision {
-    /// Forward the request to the normal pipeline.
-    Accept,
-    /// Reject the request: the client receives a JSON error with this
-    /// status code and message; the request never reaches the backend.
-    Reject { status: u16, message: String },
-    /// Serve a previously cached backend result: the client receives
-    /// `body` (a full JSON response) with the given status code; no slot
-    /// is acquired and no backend call is made (see the `result_cache`
-    /// module).
-    Serve { status: u16, body: Value },
-}
-
-/// Adapter trait for accept/reject checks that run before any
-/// slot/backend work. Implementations must be `Send + Sync` — they are
-/// shared across all requests behind an `Arc`.
-#[async_trait]
-pub trait Prefilter: Send + Sync {
-    /// Short identifier used in log lines.
-    fn name(&self) -> &str;
-
-    /// Inspect the request: return [`PrefilterDecision::Accept`] to
-    /// forward it, or [`PrefilterDecision::Reject`] to answer the client
-    /// directly.
-    async fn check(&self, req: &PrefilterRequest) -> PrefilterDecision;
-}
 
 /// Flatten all message contents into one searchable text.
 ///
@@ -241,44 +156,69 @@ impl Prefilter for KeywordPrefilter {
     }
 }
 
-/// Runs several prefilter adapters in order; the first non-`Accept`
-/// decision wins (a `Reject` or `Serve` from an earlier adapter stops the
-/// chain, and `Accept` from every adapter forwards the request). The
-/// `config` module uses it when both the keyword blocklist and the
-/// result-cache adapter are enabled (the blocklist runs first, so a
-/// blocked request is rejected with `400` before a cache hit could serve
-/// it).
-#[derive(Clone)]
-pub struct ChainPrefilter {
-    filters: Vec<Arc<dyn Prefilter>>,
+// ---------------------------------------------------------------------------
+// Plugin factory (configurable, dynamically loadable)
+// ---------------------------------------------------------------------------
+
+const NAME: &str = "keyword";
+
+#[derive(Debug, Deserialize)]
+struct KeywordParams {
+    #[serde(default, deserialize_with = "keywords_from_any")]
+    keywords: Vec<String>,
+    #[serde(default = "default_true")]
+    case_insensitive: bool,
 }
 
-impl ChainPrefilter {
-    /// Build from an ordered list of adapters (evaluation order).
-    pub fn new(filters: Vec<Arc<dyn Prefilter>>) -> Self {
-        Self { filters }
-    }
+fn default_true() -> bool {
+    true
+}
 
-    /// The adapters in evaluation order.
-    pub fn filters(&self) -> &[Arc<dyn Prefilter>] {
-        &self.filters
+/// `keywords` accepts either a JSON array of strings or a
+/// comma-separated string.
+fn keywords_from_any<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let v = Value::deserialize(d)?;
+    match v {
+        Value::Array(items) => items
+            .into_iter()
+            .map(|i| {
+                i.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| D::Error::custom("`keywords` array items must be strings"))
+            })
+            .collect(),
+        Value::String(s) => Ok(s
+            .split(',')
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect()),
+        other => Err(D::Error::custom(format!(
+            "`keywords` must be an array of strings or a comma-separated string, got {other:?}"
+        ))),
     }
 }
 
-#[async_trait]
-impl Prefilter for ChainPrefilter {
-    fn name(&self) -> &str {
-        "chain"
-    }
+/// Factory for the `keyword` plugin (registered by
+/// [`crate::builtin::register`]).
+pub struct KeywordPluginFactory;
 
-    async fn check(&self, req: &PrefilterRequest) -> PrefilterDecision {
-        for f in &self.filters {
-            match f.check(req).await {
-                PrefilterDecision::Accept => {}
-                other => return other,
-            }
-        }
-        PrefilterDecision::Accept
+impl PluginFactory for KeywordPluginFactory {
+    fn create_prefilter(&self, params: &Value) -> Result<Option<Arc<dyn Prefilter>>, PluginError> {
+        let KeywordParams {
+            keywords,
+            case_insensitive,
+        } = KeywordParams::deserialize(params).map_err(|e| PluginError::BadParams {
+            name: NAME.to_string(),
+            message: e.to_string(),
+        })?;
+        let Some(pf) = KeywordPrefilter::from_comma_list(&keywords.join(","), case_insensitive)
+        else {
+            return Err(PluginError::BadParams {
+                name: NAME.to_string(),
+                message: "`keywords` must be a non-empty list".to_string(),
+            });
+        };
+        Ok(Some(Arc::new(pf)))
     }
 }
 
@@ -286,7 +226,6 @@ impl Prefilter for ChainPrefilter {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Arc;
 
     fn preq(messages: Value, n_words: usize) -> PrefilterRequest {
         PrefilterRequest {
@@ -438,61 +377,47 @@ mod tests {
         ));
     }
 
-    /// An adapter that always serves a fixed body (chain-test fixture).
-    struct ServeFilter {
-        body: Value,
-    }
-
-    #[async_trait]
-    impl Prefilter for ServeFilter {
-        fn name(&self) -> &str {
-            "serve_fixture"
-        }
-
-        async fn check(&self, _req: &PrefilterRequest) -> PrefilterDecision {
-            PrefilterDecision::Serve {
-                status: 200,
-                body: self.body.clone(),
-            }
-        }
-    }
-
     #[tokio::test]
-    async fn chain_first_non_accept_wins() {
-        let chain = ChainPrefilter::new(vec![
-            Arc::new(KeywordPrefilter::new(["banned"], true)),
-            Arc::new(ServeFilter {
-                body: json!({ "object": "chat.completion" }),
-            }),
-        ]);
-        assert_eq!(chain.name(), "chain");
-        assert_eq!(chain.filters().len(), 2);
-
-        // Clean request: keyword accepts, serve fixture serves.
-        let req = preq(json!([{ "role": "user", "content": "hello" }]), 1);
-        assert_eq!(
-            chain.check(&req).await,
-            PrefilterDecision::Serve {
-                status: 200,
-                body: json!({ "object": "chat.completion" })
-            }
-        );
-
-        // Blocked request: the earlier reject wins over the later serve.
-        let req = preq(json!([{ "role": "user", "content": "banned word" }]), 2);
+    async fn factory_creates_prefilter_from_json_params() {
+        use crate::registry::PluginFactory;
+        let f = KeywordPluginFactory;
+        let pf = f
+            .create_prefilter(&json!({
+                "keywords": ["a", "b"],
+                "case_insensitive": false
+            }))
+            .unwrap()
+            .expect("prefilter");
+        assert_eq!(pf.name(), "keyword");
+        // Comma-string form and default case_insensitive=true.
+        let pf = f
+            .create_prefilter(&json!({ "keywords": "a, b" }))
+            .unwrap()
+            .expect("prefilter");
         assert!(matches!(
-            chain.check(&req).await,
-            PrefilterDecision::Reject { status: 400, .. }
+            pf.check(&preq(json!([{ "role": "user", "content": "A here" }]), 1))
+                .await,
+            PrefilterDecision::Reject { .. }
         ));
     }
 
-    #[tokio::test]
-    async fn chain_all_accepts_accepts() {
-        let chain = ChainPrefilter::new(vec![
-            Arc::new(KeywordPrefilter::new(["banned"], true)),
-            Arc::new(KeywordPrefilter::new(["other"], true)),
-        ]);
-        let req = preq(json!([{ "role": "user", "content": "hello" }]), 1);
-        assert_eq!(chain.check(&req).await, PrefilterDecision::Accept);
+    #[test]
+    fn factory_rejects_empty_or_missing_keywords() {
+        use crate::registry::PluginFactory;
+        let f = KeywordPluginFactory;
+        assert!(matches!(
+            f.create_prefilter(&json!({})),
+            Err(PluginError::BadParams { .. })
+        ));
+        assert!(matches!(
+            f.create_prefilter(&json!({ "keywords": [] })),
+            Err(PluginError::BadParams { .. })
+        ));
+        assert!(matches!(
+            f.create_prefilter(&json!({ "keywords": 42 })),
+            Err(PluginError::BadParams { .. })
+        ));
+        // Does not provide a backend client.
+        assert!(f.create_backend(&json!({})).unwrap().is_none());
     }
 }
