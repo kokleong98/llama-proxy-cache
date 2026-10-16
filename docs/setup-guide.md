@@ -180,9 +180,10 @@ listening on 0.0.0.0:8081
 | `STREAM_QUEUE_SIZE`   | `16`                       | capacity of the per-request SSE channel that buffers streamed bytes between the background reader and the HTTP response (must be >= 1; smaller values backpressure the backend faster) |
 | `COALESCE_REQUESTS`   | `false`                    | group concurrent same-cache-key requests into one backend call (Rust-only) |
 | `LLAMA_API_KEY`       | —                          | sent to the backend as `Authorization: Bearer <key>` (llama-server `--api-key`); unset = no auth |
-| `PREFILTER_BLOCKLIST` | —                          | comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
-| `PREFILTER_CASE_INSENSITIVE` | `true`              | keyword matching is case-insensitive (set `false` for exact-case) |
-| `PREFILTER_RESULT_CACHE_DIR` | —                   | the **cache-result path**; when set, fresh same-key non-streaming requests are answered from a cached backend result (`{dir}/{key}.json`) before any slot/backend work — streaming requests always bypass the cache; unset/blank = disabled |
+| `PLUGINS`             | —                          | JSON **array** of prefilter plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `result_cache`, `chain`; specs are chained in list order (empty array = no prefilter). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
+| `PREFILTER_BLOCKLIST` | —                          | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
+| `PREFILTER_CASE_INSENSITIVE` | `true`              | **legacy**: keyword matching is case-insensitive (set `false` for exact-case) |
+| `PREFILTER_RESULT_CACHE_DIR` | —                   | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): the **cache-result path**; when set, fresh same-key non-streaming requests are answered from a cached backend result (`{dir}/{key}.json`) before any slot/backend work — streaming requests always bypass the cache; unset/blank = disabled |
 | `PREFILTER_RESULT_CACHE_TTL` | `300`               | per-entry result-cache expiry in seconds (`0` = entries never expire) |
 
 Every variable also has a command-line flag; explicit flags take
@@ -207,10 +208,11 @@ built-in defaults. `--help` prints the full list with defaults:
 | `--log-level <LEVEL>`         | `LOG_LEVEL`         |
 | `--stream-queue-size <N>`     | `STREAM_QUEUE_SIZE` |
 | `--coalesce-requests <BOOL>`  | `COALESCE_REQUESTS` |
-| `--prefilter-blocklist <LIST>`    | `PREFILTER_BLOCKLIST` |
-| `--prefilter-case-insensitive <BOOL>` | `PREFILTER_CASE_INSENSITIVE` |
-| `--prefilter-result-cache-dir <PATH>` | `PREFILTER_RESULT_CACHE_DIR` |
-| `--prefilter-result-cache-ttl <SECS>` | `PREFILTER_RESULT_CACHE_TTL` |
+| `--plugins <JSON>`            | `PLUGINS`           |
+| `--prefilter-blocklist <LIST>`    | `PREFILTER_BLOCKLIST` (legacy) |
+| `--prefilter-case-insensitive <BOOL>` | `PREFILTER_CASE_INSENSITIVE` (legacy) |
+| `--prefilter-result-cache-dir <PATH>` | `PREFILTER_RESULT_CACHE_DIR` (legacy) |
+| `--prefilter-result-cache-ttl <SECS>` | `PREFILTER_RESULT_CACHE_TTL` (legacy) |
 
 The cache key is `sha256(backend_model_id + "\n" + prefix)`, where
 `backend_model_id` is the model id reported by the **first** configured
@@ -219,30 +221,51 @@ model. The same `META_DIR` can be shared by all backends.
 
 ### 4.4 Request prefilter & result cache (optional)
 
-A prefilter adapter runs right after the request body is parsed and the
+A prefilter plugin runs right after the request body is parsed and the
 cache key is computed, and **before** coalescing, slot acquisition, KV
 restore/save, or backend dispatch. When it short-circuits the request, the
 request **never reaches `llama-server`** — no slot is acquired, no KV cache
 is restored or saved, no meta file is written, and the request never leads
-or joins a coalescing group. Two adapters are built in (enable either or
-both):
+or joins a coalescing group. Prefilters are selected from the
+`lpcache-plugins` library through the `PLUGINS` JSON config — a list of
+plugins, chained in order (zero, one, or several):
 
-- **Keyword blocklist** (`PREFILTER_BLOCKLIST`) — rejects a request whose
-  message contents contain a blocked keyword with a `400` JSON error.
-  Matching is a plain substring, case-insensitive by default
-  (`PREFILTER_CASE_INSENSITIVE`). Logs `prefilter_reject filter=keyword`.
-- **Result cache** (`PREFILTER_RESULT_CACHE_DIR`) — answers a fresh
-  (non-expired) same-key request with a previously cached backend result
-  (the original JSON body and status code), read from `{dir}/{key}.json`.
-  Fresh non-streaming results are stored there after the backend call;
+```bash
+PLUGINS='[
+  {"name": "keyword", "params": {"keywords": ["bad", "worse"], "case_insensitive": true}},
+  {"name": "result_cache", "params": {"dir": "/var/result_cache", "ttl_secs": 300}}
+]'
+```
+
+Two functional prefilter plugins are built in (enable either or both; the
+`chain` plugin additionally composes nested plugin specs under a single
+entry via its `filters` param):
+
+- **Keyword blocklist** (`keyword`) — rejects a request whose message
+  contents contain a blocked keyword with a `400` JSON error. Matching is
+  a plain substring, case-insensitive by default
+  (`case_insensitive` param). Logs `prefilter_reject filter=keyword`.
+- **Result cache** (`result_cache`) — answers a fresh (non-expired)
+  same-key request with a previously cached backend result (the original
+  JSON body and status code), read from `{dir}/{key}.json`. Fresh
+  non-streaming results are stored there after the backend call;
   **streaming requests are never served from the cache** and always fall
-  through to the backend. Entries expire after `PREFILTER_RESULT_CACHE_TTL`
-  seconds (`0` = never) and are removed lazily on read. Logs
+  through to the backend. Entries expire after the `ttl_secs` param
+  (`0` = never) and are removed lazily on read. Logs
   `prefilter_serve filter=result_cache` / `result_cache_hit` on a hit, and
-  `result_cache_store_fail` if storing a fresh result fails.
+  `result_cache_store_fail` if storing a fresh result fails. The
+  `cleanup: "remove_after_serve"` param turns it into a one-shot cache
+  (the entry is deleted after it is served once).
 
-When **both** are enabled they are chained and the blocklist runs first — a
-blocked request is rejected with `400` before a cache hit could serve it.
+When **both** are enabled they are chained in config order — put
+`keyword` first so a blocked request is rejected with `400` before a cache
+hit could serve it.
+
+**Legacy variables.** `PREFILTER_BLOCKLIST`, `PREFILTER_CASE_INSENSITIVE`,
+`PREFILTER_RESULT_CACHE_DIR`, and `PREFILTER_RESULT_CACHE_TTL` keep
+working: when `PLUGINS` is unset, the proxy translates them into the
+equivalent `keyword` / `result_cache` plugin specs (blocklist first).
+`PLUGINS` takes precedence whenever it is set.
 With neither set there is no prefilter and no per-request cost. A request
 that passes the prefilter logs `prefilter_accept filter=...` (debug level)
 and runs the normal pipeline.
@@ -400,7 +423,15 @@ journalctl -u lpcache -f
   cost is O(meta files), so a smaller bound is also faster.
 - **`WORDS_PER_BLOCK`** — changing it orphans existing caches (the restore
   filter skips mismatching `wpb`); only change it before caches are needed.
-- **`PREFILTER_BLOCKLIST`** — optional comma-separated keyword blocklist;
+- **`PLUGINS`** — the general extension point: select and chain
+  prefilter plugins (`keyword`, `result_cache`, `chain`) by name with
+  per-plugin `params` (see 4.4). The llama.cpp backend client is always
+  the built-in `llama` plugin, instantiated once per backend (each
+  `BACKENDS` entry or the fallback backend). Takes precedence over the
+  legacy `PREFILTER_*` variables below, which keep working when
+  `PLUGINS` is unset.
+- **`PREFILTER_BLOCKLIST`** (legacy) — optional comma-separated keyword
+  blocklist;
   matching requests are rejected with `400` before any slot/backend work
   (no KV cost at all). Matching is a plain case-insensitive substring by
   default; set `PREFILTER_CASE_INSENSITIVE=false` for exact-case matches.

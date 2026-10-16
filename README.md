@@ -10,25 +10,32 @@ full prefill cost every time.
 
 ## How it works
 
-1. **Request prefilter** (optional) — when a prefilter is configured,
-   every chat request is checked by a prefilter adapter
-   (`src/prefilter.rs`) right after body parsing and cache-key
-   computation and **before** coalescing, slot acquisition, or backend
-   dispatch. Two built-in adapters: the **keyword blocklist**
-   (`PREFILTER_BLOCKLIST`) rejects requests whose message contents
-   contain a blocked keyword (plain substring match, case-insensitive by
-   default, `PREFILTER_CASE_INSENSITIVE`) with a `400` JSON error, and the
-   **result cache** (`PREFILTER_RESULT_CACHE_DIR`) answers fresh
-   (non-expired, `PREFILTER_RESULT_CACHE_TTL`) same-key requests with a
-   previously cached backend result stored at `{dir}/{key}.json` — fresh
-   non-streaming results are stored there after the backend call;
-   streaming requests are never served from the cache. In both cases the
-   request never reaches llama-server — no slot is acquired, no KV cache
-   is restored or saved, no meta file is written, and the request never
-   leads or joins a coalescing group (when both are enabled the
-   blocklist runs first). Custom accept/reject/serve logic plugs in
-   through the `Prefilter` trait; result-cache hits can trigger a
-   pluggable post-serve cleanup adapter (`PostCleanup`, e.g. the built-in
+1. **Request prefilter** (optional) — when a prefilter plugin is
+   configured, every chat request is checked by a prefilter plugin right
+   after body parsing and cache-key computation and **before**
+   coalescing, slot acquisition, or backend dispatch. Prefilters come
+   from the `lpcache-plugins` library and are selected by name through
+   the `PLUGINS` JSON config (see below); the legacy `PREFILTER_*`
+   variables keep working and are translated into the equivalent plugin
+   specs when `PLUGINS` is unset. The llama.cpp backend client is
+   likewise a plugin (the built-in `llama`) and is instantiated per
+   `BACKENDS` entry with its URL, API key and timeout from the standard
+   config.
+   Two built-in prefilter plugins: the **keyword blocklist** (`keyword`)
+   rejects requests whose message contents contain a blocked keyword
+   (plain substring match, case-insensitive by default) with a `400`
+   JSON error, and the **result cache** (`result_cache`) answers fresh
+   (non-expired) same-key requests with a previously cached backend
+   result stored at `{dir}/{key}.json` — fresh non-streaming results are
+   stored there after the backend call; streaming requests are never
+   served from the cache. In both cases the request never reaches
+   llama-server — no slot is acquired, no KV cache is restored or saved,
+   no meta file is written, and the request never leads or joins a
+   coalescing group (several plugins are chained in config order, so the
+   blocklist can run first). Custom accept/reject/serve logic plugs in
+   through the `Prefilter` trait from `lpcache_plugins` (register the
+   factory at startup); result-cache hits can trigger a pluggable
+   post-serve cleanup adapter (`PostCleanup`, e.g. the built-in
    `RemoveAfterServe` one-shot cleanup).
 2. **Prefix hashing** — the concatenated message contents (roles
    stripped) are split into words (`\w+`, lowercased), chunked into blocks
@@ -84,10 +91,11 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `LOG_LEVEL`         | `INFO`              | log level (`RUST_LOG` overrides it)            |
 | `STREAM_QUEUE_SIZE` | `16`                | per-request SSE channel capacity (must be >= 1) |
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
-| `PREFILTER_BLOCKLIST` | —                 | comma-separated keywords; requests whose message contents contain any are rejected with `400` before the backend (default: no prefilter) |
-| `PREFILTER_CASE_INSENSITIVE` | `true`     | keyword matching is case-insensitive           |
-| `PREFILTER_RESULT_CACHE_DIR` | —          | cache-result path (`{key}.json` per cache key); fresh same-key requests are answered from the cached backend result before the backend (default: disabled) |
-| `PREFILTER_RESULT_CACHE_TTL` | `300` (s)    | per-entry result-cache expiry; `0` = never expires |
+| `PLUGINS` | —                 | JSON **array** of prefilter plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `result_cache`, `chain`; specs are chained in list order (empty array = no prefilter); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs (when set, `PLUGINS` takes precedence over them) |
+| `PREFILTER_BLOCKLIST` | —                 | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; requests whose message contents contain any are rejected with `400` before the backend (default: no prefilter) |
+| `PREFILTER_CASE_INSENSITIVE` | `true`     | **legacy**: keyword matching is case-insensitive           |
+| `PREFILTER_RESULT_CACHE_DIR` | —          | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): cache-result path (`{key}.json` per cache key); fresh same-key requests are answered from the cached backend result before the backend (default: disabled) |
+| `PREFILTER_RESULT_CACHE_TTL` | `300` (s)    | **legacy**: per-entry result-cache expiry; `0` = never expires |
 | `SAVE_RETRIES` | `3`                 | retries after a failed KV cache save (backend 500 or other error); `0` = no retry |
 | `SAVE_RETRY_DELAY_MS` | `1000` (ms)   | delay between KV cache save retry attempts          |
 
@@ -97,10 +105,11 @@ Every variable is also available as a command-line flag (see
 `--meta-dir`, `--meta-max`, `--slot-save-path`, `--request-timeout`,
 `--model-id`, `--port`, `--api-key` (→ `LLAMA_API_KEY`), `--log-level`,
 `--stream-queue-size`,
-`--coalesce-requests`, `--prefilter-blocklist` (→ `PREFILTER_BLOCKLIST`),
-`--prefilter-case-insensitive` (→ `PREFILTER_CASE_INSENSITIVE`),
-`--prefilter-result-cache-dir` (→ `PREFILTER_RESULT_CACHE_DIR`),
-`--prefilter-result-cache-ttl` (→ `PREFILTER_RESULT_CACHE_TTL`),
+`--coalesce-requests`, `--plugins` (→ `PLUGINS`),
+`--prefilter-blocklist` (→ `PREFILTER_BLOCKLIST`, legacy),
+`--prefilter-case-insensitive` (→ `PREFILTER_CASE_INSENSITIVE`, legacy),
+`--prefilter-result-cache-dir` (→ `PREFILTER_RESULT_CACHE_DIR`, legacy),
+`--prefilter-result-cache-ttl` (→ `PREFILTER_RESULT_CACHE_TTL`, legacy),
 `--save-retries` (→ `SAVE_RETRIES`),
 `--save-retry-delay-ms` (→ `SAVE_RETRY_DELAY_MS`).
 `-h`/`--help` shows the full help; `-V`/`--version` prints the proxy version
@@ -158,15 +167,22 @@ cargo test
 ```
 
 - **Unit tests** (77): config parsing/defaults (incl. `META_MAX` /
-  `SLOT_SAVE_PATH` / `PREFILTER_*`), raw-prefix construction, word
+  `SLOT_SAVE_PATH` / `PREFILTER_*` / `PLUGINS` spec synthesis and
+  precedence), raw-prefix construction, word
   tokenization, block hashing, LCP, SHA256 vectors, meta file round-trips,
   candidate filtering/thresholds, LRU pruning, slot selection (free/oldest
   ordering, idle-aware, multi-backend, circuit breaker, escalating
   backoff, success/probe recovery, retry slot exclusion), per-slot locking,
-  acquire timeout, save semantics, prefilter adapter (keyword matching,
-  case sensitivity, content-part arrays, comma-list parsing, trait
-  dispatch).
-- **Integration tests** (52): `LlamaClient` against the mock backend
+  acquire timeout, save semantics.
+- **Plugin library tests** (41 + 1 doctest): the `lpcache-plugins` trait
+  objects and built-ins — keyword matching, case sensitivity,
+  content-part arrays, result-cache put/get/expire, `RemoveAfterServe`
+  one-shot cleanup, store-trait dispatch, `LlamaClient` against a mock
+  server (slot pin in body/options/query, JSON/non-JSON answers), and the
+  plugin registry (`PluginSpec` parsing, builtin registration, unknown
+  plugin error, zero/one/many `load_prefilters` chaining).
+- **Integration tests** (57): the built-in `llama` plugin's `LlamaClient`
+  against the mock backend
   (slot pinning in body/options/query, save/restore status codes, JSON vs
   non-JSON provider answers, streaming), and end-to-end proxy behaviour
   (small vs big requests, meta file creation, restore on the second big
@@ -180,7 +196,10 @@ cargo test
   accept/reject before the backend — keyword reject with zero
   backend calls, case-insensitive matching, content-part inspection,
   stream/big-request rejection, reject-before-coalescing, custom
-  `Prefilter` adapter).
+  `Prefilter` adapter, result-cache serve/expire/one-shot cleanup driven
+  through plugin specs, legacy `PREFILTER_*` env behaviour).
 
 `cargo clippy --all-targets` and `cargo fmt --check` are clean.
 
+# Want to buy me a coffee?
+[![Buy Me A Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/kokleong98)

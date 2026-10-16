@@ -1,11 +1,27 @@
 //! Entry point (port of `proxycache.py` — uvicorn replaced by axum::serve).
+//!
+//! All adapter functionality (prefilter / result store / backend client)
+//! lives in the `lpcache-plugins` crate. This binary only configures and
+//! dynamically loads adapter instances from configuration at startup:
+//! [`Config::plugin_specs`] (the `PLUGINS` env var / `--plugins` flag, or
+//! the specs synthesized from the legacy `PREFILTER_*` settings) is fed to
+//! the plugin registry, and the resulting `Arc<dyn Prefilter>` /
+//! `Arc<dyn ResultStore>` / `Arc<dyn LlamaBackend>` objects are wired into
+//! `AppState`.
 
 use lpcache::app::{AppState, router};
 use lpcache::coalesce::SingleFlight;
 use lpcache::config::{Cli, Config};
-use lpcache::llama_client::{LlamaBackend, LlamaClient};
+use lpcache::plugins::{
+    LlamaBackend, PluginSpec, Prefilter, ResultStore, ensure_builtin, global, load_prefilters,
+};
 use lpcache::slot_manager::SlotManager;
+use serde_json::json;
 use std::sync::Arc;
+
+/// Plugin name of the built-in llama.cpp backend client (instantiated once
+/// per `BACKENDS` entry).
+const BACKEND_PLUGIN: &str = "llama";
 
 #[tokio::main]
 async fn main() {
@@ -43,23 +59,66 @@ async fn main() {
             config.meta_dir.display()
         );
     }
-    // Result cache (PREFILTER_RESULT_CACHE_DIR): pre-create the
-    // cache-result dir so a store failure is visible early.
-    if let Some(rc) = &config.result_cache()
-        && let Err(e) = std::fs::create_dir_all(rc.dir())
+
+    // Dynamically load the adapter plugins from configuration: the `PLUGINS`
+    // env var / `--plugins` flag, or — when unset — the specs synthesized
+    // from the legacy `PREFILTER_*` settings. A bad spec is a startup error
+    // (it names the offending entry — fix it instead of working around it).
+    let specs = match config.plugin_specs() {
+        Ok(specs) => specs,
+        Err(e) => {
+            eprintln!("lpcache: {e}");
+            std::process::exit(2);
+        }
+    };
+    ensure_builtin();
+    let registry = global();
+    // Prefilter plugins (built-ins: keyword / chain / result_cache),
+    // chained in spec order: short-circuit requests before any slot/backend
+    // work.
+    let prefilter: Option<Arc<dyn Prefilter>> = match load_prefilters(registry, &specs) {
+        Ok(prefilter) => prefilter,
+        Err(e) => {
+            eprintln!("lpcache: failed to load prefilter plugin: {e}");
+            std::process::exit(2);
+        }
+    };
+    // The result store of the loaded prefilter (when it is backed by one,
+    // e.g. the `result_cache` plugin): the proxy stores fresh non-streaming
+    // backend results there after the backend call.
+    let result_store: Option<Arc<dyn ResultStore>> =
+        prefilter.as_ref().and_then(|pf| pf.result_store());
+    if let Some(store) = &result_store
+        && let Err(e) = store.prepare()
     {
-        tracing::warn!(
-            "could not create result cache dir {}: {e}",
-            rc.dir().display()
+        // Pre-create the backing store (e.g. the cache-result dir) so a
+        // store failure is visible early.
+        tracing::warn!("could not prepare result store: {e}");
+    }
+    if let Some(pf) = &prefilter {
+        tracing::info!(
+            "prefilter enabled: filter={} plugins={:?}",
+            pf.name(),
+            specs.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
         );
     }
 
     let port = config.port;
+    // One backend client per `BACKENDS` entry, instantiated through the
+    // plugin registry by the built-in `llama` plugin with the per-backend
+    // URL plus the shared auth/timeout settings.
     let mut clients: Vec<Arc<dyn LlamaBackend>> = Vec::new();
     for be in &config.backends {
-        let client = LlamaClient::new(&be.url, config.request_timeout, config.api_key.as_deref());
-        match client {
-            Ok(c) => clients.push(Arc::new(c)),
+        let spec = PluginSpec::new(
+            BACKEND_PLUGIN,
+            json!({
+                "url": be.url,
+                "api_key": config.api_key,
+                "timeout_secs": config.request_timeout.as_secs_f64(),
+            }),
+        );
+        match registry.create_backend(&spec) {
+            Ok(client) => clients.push(client),
             Err(e) => tracing::error!("backend client init failed url={}: {e}", be.url),
         }
     }
@@ -70,27 +129,13 @@ async fn main() {
             std::time::Duration::from_millis(config.save_retry_delay_ms),
         ),
     );
-    // Optional prefilter adapter(s) (PREFILTER_BLOCKLIST keyword blocklist
-    // and/or PREFILTER_RESULT_CACHE_DIR result cache): short-circuit
-    // requests before any slot/backend work.
-    let prefilter = config.prefilter();
-    let result_cache = config.result_cache();
-    if let Some(pf) = &prefilter {
-        tracing::info!(
-            "prefilter enabled: filter={} keywords={} result_cache_dir={:?} result_cache_ttl_secs={}",
-            pf.name(),
-            config.prefilter_blocklist.len(),
-            config.prefilter_result_cache_dir,
-            config.prefilter_result_cache_ttl_secs
-        );
-    }
     let state = AppState {
         config: Arc::new(config.clone()),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
 
     // Warn early if a configured --slot-save-path dir is missing: pruning

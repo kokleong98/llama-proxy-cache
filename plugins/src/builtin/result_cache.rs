@@ -1,4 +1,5 @@
-//! Result cache + cached-result prefilter adapter.
+//! `result_cache` plugin — file-based result cache + cached-result
+//! prefilter adapter (+ optional post-serve cleanup).
 //!
 //! [`ResultCache`] stores completed non-streaming backend results (a JSON
 //! response body plus its status code) on disk, one file per request KV
@@ -7,30 +8,32 @@
 //! read (there is no background sweeper). Writes are atomic (temp file +
 //! rename), so a concurrent reader never sees a torn entry.
 //!
-//! [`CachedResultPrefilter`] is the prefilter adapter wired into
-//! `AppState::prefilter`: on a fresh (non-expired) cache hit for the
-//! request's hash key it answers the client with the cached backend result
-//! (`PrefilterDecision::Serve`) — **no slot is acquired, no backend is
-//! called, no KV cache is restored/saved, no meta file is written, and the
-//! request never leads or joins a coalescing group**. Streaming requests
-//! always pass through (`Accept`): only non-streaming JSON results are
-//! cached, so a `stream: true` request can never be answered from the
-//! cache.
+//! [`CachedResultPrefilter`] is the prefilter side of the plugin: on a
+//! fresh (non-expired) cache hit for the request's hash key it answers the
+//! client with the cached backend result (`PrefilterDecision::Serve`) —
+//! **no slot is acquired, no backend is called, no KV cache is
+//! restored/saved, no meta file is written, and the request never leads or
+//! joins a coalescing group**. Streaming requests always pass through
+//! (`Accept`): only non-streaming JSON results are cached, so a
+//! `stream: true` request can never be answered from the cache. The proxy
+//! obtains the same cache from `Prefilter::result_store` and stores fresh
+//! non-streaming backend results in it after the backend call.
 //!
 //! Post-serve cleanup: an optional [`PostCleanup`] adapter runs after a
 //! cached result has been read for the client (before the response is
 //! sent). The built-in [`RemoveAfterServe`] deletes the entry file — a
 //! one-shot cache where each result is served at most once.
 //!
-//! Enabled via `PREFILTER_RESULT_CACHE_DIR` / `--prefilter-result-cache-dir`
-//! (the cache-result path); the per-entry expiry is
-//! `PREFILTER_RESULT_CACHE_TTL` / `--prefilter-result-cache-ttl` (seconds,
-//! `0` = entries never expire). When both the keyword blocklist and the
-//! result cache are enabled, the `config` module chains them
-//! (blocklist first: a blocked request is rejected with `400` before a
-//! cache hit could serve it).
+//! Params:
+//! - `dir` (required): the cache-result path (dir holding the `{key}.json`
+//!   entries); created on first write.
+//! - `ttl_secs` (default `300`): per-entry expiry in seconds, `0` = entries
+//!   never expire.
+//! - `cleanup` (optional): `"remove_after_serve"` attaches the built-in
+//!   one-shot cleanup adapter; omitted/`null` = no cleanup.
 
-use crate::prefilter::{Prefilter, PrefilterDecision, PrefilterRequest};
+use crate::api::{PostCleanup, Prefilter, PrefilterDecision, PrefilterRequest, ResultStore};
+use crate::registry::{PluginError, PluginFactory};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,39 +87,34 @@ impl ResultCache {
         self.ttl
     }
 
-    /// The file path of the entry for `key`.
+    /// The file path for `key` (`{dir}/{key}.json`).
     pub fn path_for(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{key}.json"))
     }
 
-    /// Fetch the entry for `key`: `Some((status, body))` when the file
-    /// exists and is fresh. Expired entries are removed lazily (no
-    /// background sweeper); corrupt/unreadable entries are removed too
-    /// (they can never be served) and reported as a miss.
+    /// Read the entry for `key`: `None` on a miss, an expired entry
+    /// (lazily removed), or a corrupt entry (lazily removed).
     pub fn get(&self, key: &str) -> Option<(u16, Value)> {
         let path = self.path_for(key);
-        let raw = std::fs::read(&path).ok()?;
-        let entry: Entry = match serde_json::from_slice(&raw) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    "result_cache_corrupt key={} path={}: {e}; removing",
-                    key,
-                    path.display()
+        let Ok(raw) = std::fs::read(&path) else {
+            return None;
+        };
+        let Ok(entry) = serde_json::from_slice::<Entry>(&raw) else {
+            // Corrupt entry: drop it so it is not served (or retried) again.
+            let _ = std::fs::remove_file(&path);
+            return None;
+        };
+        if self.ttl > Duration::ZERO {
+            let age = (now_secs() - entry.stored_at).max(0.0);
+            if age > self.ttl.as_secs_f64() {
+                tracing::info!(
+                    "result_cache_expired key={} age_secs={age:.1} ttl_secs={}",
+                    key.chars().take(16).collect::<String>(),
+                    self.ttl.as_secs()
                 );
                 let _ = std::fs::remove_file(&path);
                 return None;
             }
-        };
-        if !self.ttl.is_zero() && now_secs() - entry.stored_at > self.ttl.as_secs_f64() {
-            tracing::debug!(
-                "result_cache_expired key={} age_s={:.1} ttl_s={}",
-                key,
-                now_secs() - entry.stored_at,
-                self.ttl.as_secs_f64()
-            );
-            let _ = std::fs::remove_file(&path);
-            return None;
         }
         Some((entry.status, entry.body))
     }
@@ -149,27 +147,18 @@ impl ResultCache {
     }
 }
 
-/// Post-serve cleanup adapter: invoked after the proxy has read a cached
-/// result to answer a request (the entry bytes are already in memory, so
-/// cleanup may safely remove the file before the response reaches the
-/// client). Implementations must be `Send + Sync` — they are shared across
-/// all requests behind an `Arc`.
-///
-/// ```ignore
-/// #[async_trait::async_trait]
-/// impl PostCleanup for MyCleanup {
-///     fn name(&self) -> &str { "my_cleanup" }
-///     async fn cleanup(&self, key: &str, path: &Path) { /* ... */ }
-/// }
-/// ```
-#[async_trait]
-pub trait PostCleanup: Send + Sync {
-    /// Short identifier used in log lines.
-    fn name(&self) -> &str;
+/// The proxy stores fresh non-streaming backend results through this
+/// trait object (obtained from `Prefilter::result_store`).
+impl ResultStore for ResultCache {
+    fn prepare(&self) -> Result<(), String> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("create {}: {e}", self.dir.display()))
+    }
 
-    /// Run after a cached result for `key` was served from `path`.
-    /// Failures are logged by the adapter; they never affect the response.
-    async fn cleanup(&self, key: &str, path: &Path);
+    fn store(&self, key: &str, status: u16, body: &Value) -> Result<(), String> {
+        self.put(key, status, body)
+            .map_err(|e| format!("write {}: {e}", self.path_for(key).display()))
+    }
 }
 
 /// Built-in cleanup: deletes the cached entry file after it has been
@@ -204,7 +193,7 @@ impl PostCleanup for RemoveAfterServe {
 /// - Streaming requests always return [`PrefilterDecision::Accept`]: only
 ///   non-streaming JSON results are cached.
 /// - A cache miss returns [`PrefilterDecision::Accept`]; the normal
-///   pipeline runs and stores a fresh result (see the `app` module).
+///   pipeline runs and stores a fresh result (see the `lpcache` app).
 /// - An optional [`PostCleanup`] adapter runs after a hit is read.
 #[derive(Clone)]
 pub struct CachedResultPrefilter {
@@ -238,7 +227,7 @@ impl CachedResultPrefilter {
         self
     }
 
-    /// The backing cache (the `app` module stores fresh non-streaming
+    /// The backing cache (the `lpcache` app stores fresh non-streaming
     /// results here after a successful backend call).
     pub fn cache(&self) -> &Arc<ResultCache> {
         &self.cache
@@ -270,11 +259,78 @@ impl Prefilter for CachedResultPrefilter {
         }
         PrefilterDecision::Serve { status, body }
     }
+
+    /// This adapter is backed by a result store: the proxy stores fresh
+    /// non-streaming backend results in the same cache it serves from.
+    fn result_store(&self) -> Option<Arc<dyn ResultStore>> {
+        Some(Arc::clone(&self.cache) as Arc<dyn ResultStore>)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin factory (configurable, dynamically loadable)
+// ---------------------------------------------------------------------------
+
+const NAME: &str = "result_cache";
+
+#[derive(Debug, Deserialize)]
+struct ResultCacheParams {
+    dir: String,
+    #[serde(default = "default_ttl_secs")]
+    ttl_secs: f64,
+    #[serde(default)]
+    cleanup: Option<String>,
+}
+
+fn default_ttl_secs() -> f64 {
+    300.0
+}
+
+/// Factory for the `result_cache` plugin (registered by
+/// [`crate::builtin::register`]).
+pub struct ResultCachePluginFactory;
+
+impl PluginFactory for ResultCachePluginFactory {
+    fn create_prefilter(&self, params: &Value) -> Result<Option<Arc<dyn Prefilter>>, PluginError> {
+        let ResultCacheParams {
+            dir,
+            ttl_secs,
+            cleanup,
+        } = ResultCacheParams::deserialize(params).map_err(|e| PluginError::BadParams {
+            name: NAME.to_string(),
+            message: e.to_string(),
+        })?;
+        if dir.trim().is_empty() {
+            return Err(PluginError::BadParams {
+                name: NAME.to_string(),
+                message: "`dir` must be a non-empty path".to_string(),
+            });
+        }
+        let ttl = Duration::from_secs_f64(ttl_secs.max(0.0));
+        let cache = Arc::new(ResultCache::new(PathBuf::from(dir), ttl));
+        let pf = CachedResultPrefilter::new(Arc::clone(&cache));
+        let pf = match cleanup {
+            None => pf,
+            Some(name) => match name.as_str() {
+                "remove_after_serve" => pf.with_cleanup(Arc::new(RemoveAfterServe)),
+                other => {
+                    return Err(PluginError::BadParams {
+                        name: NAME.to_string(),
+                        message: format!(
+                            "unknown cleanup adapter {other:?} (built-in: \"remove_after_serve\")"
+                        ),
+                    });
+                }
+            },
+        };
+        Ok(Some(Arc::new(pf)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::PluginFactory;
     use serde_json::json;
 
     fn preq(key: &str, stream: bool) -> PrefilterRequest {
@@ -312,6 +368,17 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn store_trait_wraps_put() {
+        let td = tempfile::tempdir().unwrap();
+        let cache: Arc<dyn ResultStore> = Arc::new(ResultCache::new(
+            td.path().to_path_buf(),
+            Duration::from_secs(60),
+        ));
+        cache.store("k1", 200, &json!({ "n": 1 })).unwrap();
+        assert_eq!(cache.store("k2", 200, &json!({ "n": 2 })), Ok(()));
     }
 
     #[test]
@@ -371,6 +438,28 @@ mod tests {
         );
         // the adapter exposes the backing cache for the write path
         assert_eq!(pf.cache().dir(), td.path());
+    }
+
+    #[tokio::test]
+    async fn prefilter_result_store_exposes_the_same_cache() {
+        let td = tempfile::tempdir().unwrap();
+        let cache = Arc::new(ResultCache::new(
+            td.path().to_path_buf(),
+            Duration::from_secs(60),
+        ));
+        let pf: Arc<dyn Prefilter> = Arc::new(CachedResultPrefilter::new(Arc::clone(&cache)));
+        let store = pf
+            .result_store()
+            .expect("result cache plugin exposes a store");
+        // The store and the prefilter share one cache instance.
+        store.store("k1", 200, &json!({ "n": 1 })).unwrap();
+        assert_eq!(
+            pf.check(&preq("k1", false)).await,
+            PrefilterDecision::Serve {
+                status: 200,
+                body: json!({ "n": 1 })
+            }
+        );
     }
 
     #[tokio::test]
@@ -439,5 +528,49 @@ mod tests {
         )));
         assert_eq!(pf.name(), "result_cache");
         assert_eq!(pf.check(&preq("k", false)).await, PrefilterDecision::Accept);
+    }
+
+    #[test]
+    fn factory_creates_plugin_from_json_params() {
+        let f = ResultCachePluginFactory;
+        let td = tempfile::tempdir().unwrap();
+        let pf = f
+            .create_prefilter(&json!({
+                "dir": td.path().to_string_lossy().into_owned(),
+                "ttl_secs": 120
+            }))
+            .unwrap()
+            .expect("prefilter");
+        assert_eq!(pf.name(), "result_cache");
+        let store = pf.result_store().expect("exposes the store");
+        assert_eq!(store.store("k", 200, &json!({ "n": 1 })), Ok(()));
+    }
+
+    #[test]
+    fn factory_requires_dir_and_validates_cleanup() {
+        let f = ResultCachePluginFactory;
+        // missing dir
+        assert!(matches!(
+            f.create_prefilter(&json!({})),
+            Err(crate::registry::PluginError::BadParams { .. })
+        ));
+        // unknown cleanup adapter
+        let td = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            f.create_prefilter(&json!({
+                "dir": td.path().to_string_lossy().into_owned(),
+                "cleanup": "nope"
+            })),
+            Err(crate::registry::PluginError::BadParams { .. })
+        ));
+        // cleanup name attaches RemoveAfterServe
+        let pf = f
+            .create_prefilter(&json!({
+                "dir": td.path().to_string_lossy().into_owned(),
+                "cleanup": "remove_after_serve"
+            }))
+            .unwrap()
+            .expect("prefilter");
+        assert!(matches!(pf, _ if pf.name() == "result_cache"));
     }
 }

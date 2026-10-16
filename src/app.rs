@@ -13,20 +13,21 @@
 //!     has no cancel endpoint) before running the cleanup
 //!   - non-stream: the full response is read before it is sent; if the
 //!     client drops its connection meanwhile, hyper drops the in-flight
-//!     handler future, which drops the LlamaClient future and aborts the
+//!     handler future, which drops the backend-client future and aborts the
 //!     upstream request to llama-server the same way
 //!   - 503 when no slot could be acquired within the 300 s timeout
 //!
-//! Request prefilter (optional): when a prefilter adapter is enabled
-//! (`PREFILTER_BLOCKLIST` keyword blocklist and/or
-//! `PREFILTER_RESULT_CACHE_DIR` result cache), every request is checked by
-//! it (`crate::prefilter`) right after body parsing / cache-key
-//! computation and **before** coalescing, slot acquisition and backend
-//! dispatch: rejected requests get an immediate JSON error, and cached
-//! results are served directly — in both cases the request never reaches
-//! the llama-server backend (no slot, no restore/save, no meta file, no
-//! coalescing group). Successful non-streaming backend results are stored
-//! in the result cache (when enabled) after the backend call.
+//! Request prefilter (optional): when a prefilter plugin is enabled
+//! (e.g. the `keyword` and/or `result_cache` plugins from the
+//! `lpcache-plugins` crate, configured via `PLUGINS` or the legacy
+//! `PREFILTER_*` settings), every request is checked by it right after
+//! body parsing / cache-key computation and **before** coalescing, slot
+//! acquisition and backend dispatch: rejected requests get an immediate
+//! JSON error, and cached results are served directly — in both cases the
+//! request never reaches the llama-server backend (no slot, no
+//! restore/save, no meta file, no coalescing group). Successful
+//! non-streaming backend results are stored in the result store (when the
+//! prefilter plugin is backed by one) after the backend call.
 //!
 //! Concurrent-request coalescing (`COALESCE_REQUESTS`): when enabled,
 //! concurrent requests with the same cache key form one group regardless
@@ -38,9 +39,6 @@
 use crate::coalesce::{Flight, SharedOutcome, SingleFlight};
 use crate::config::Config;
 use crate::hashing;
-use crate::llama_client::{BackendError, JsonChat, LlamaBackend, RestoreOutcome};
-use crate::prefilter::{Prefilter, PrefilterDecision, PrefilterRequest};
-use crate::result_cache::ResultCache;
 use crate::slot_manager::{AcquireTimeout, GSlot, SlotGuard, SlotManager};
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -50,6 +48,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
 use futures::StreamExt;
+use lpcache_plugins::{
+    BackendError, JsonChat, LlamaBackend, Prefilter, PrefilterDecision, PrefilterRequest,
+    RestoreOutcome, ResultStore,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Instant;
@@ -64,15 +66,15 @@ pub struct AppState {
     /// In-flight coalesced request groups (active when
     /// `config.coalesce_requests` is enabled).
     pub sf: Arc<SingleFlight>,
-    /// Optional prefilter adapter consulted before any slot/backend work
-    /// (`None` when no prefilter is configured — the default; see the
-    /// `prefilter` module).
+    /// Optional prefilter plugin consulted before any slot/backend work
+    /// (`None` when no prefilter plugin is configured — the default; see
+    /// the `lpcache_plugins` crate).
     pub prefilter: Option<Arc<dyn Prefilter>>,
-    /// Optional result cache (enabled when `PREFILTER_RESULT_CACHE_DIR` is
-    /// set): fresh non-streaming backend results are stored here under the
-    /// request's cache key, and the result-cache prefilter serves hits
-    /// before any slot/backend work (see the `result_cache` module).
-    pub result_cache: Option<Arc<ResultCache>>,
+    /// Optional result store (set when a prefilter plugin is backed by one,
+    /// e.g. the `result_cache` plugin): fresh non-streaming backend
+    /// results are stored here under the request's cache key, and the
+    /// backing prefilter serves hits before any slot/backend work.
+    pub result_store: Option<Arc<dyn ResultStore>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -653,9 +655,9 @@ async fn run_pipeline(
                     // request's cache key so a later same-key (non-stream)
                     // request is answered by the result-cache prefilter
                     // before any slot/backend work (see the `result_cache`
-                    // module). Streaming results are not stored.
-                    if let Some(rc) = &state.result_cache
-                        && let Err(e) = rc.put(key, 200, &out)
+                    // plugin). Streaming results are not stored.
+                    if let Some(store) = &state.result_store
+                        && let Err(e) = store.store(key, 200, &out)
                     {
                         tracing::warn!("result_cache_store_fail key={}: {e}", short16(key));
                     }

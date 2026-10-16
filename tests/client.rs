@@ -1,8 +1,9 @@
-//! Direct tests of `LlamaClient` against the mock llama.cpp backend.
+//! Direct tests of the built-in `llama` plugin's `LlamaClient` against the
+//! mock llama.cpp backend.
 
 use futures::StreamExt;
-use lpcache::llama_client::{BackendError, JsonChat, LlamaBackend, LlamaClient, RestoreOutcome};
 use lpcache::mock_backend::MockLlama;
+use lpcache::plugins::{BackendError, JsonChat, LlamaBackend, LlamaClient, RestoreOutcome};
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 use std::time::Duration;

@@ -14,7 +14,7 @@
 //!   between attempts
 
 use crate::config::{BackendConf, DEFAULT_SAVE_RETRIES, DEFAULT_SAVE_RETRY_DELAY_MS};
-use crate::llama_client::{BackendError, LlamaBackend, RestoreOutcome};
+use lpcache_plugins::{BackendError, LlamaBackend, RestoreOutcome};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -445,10 +445,10 @@ fn short(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llama_client::{JsonChat, RestoreOutcome, StreamChat};
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream;
+    use lpcache_plugins::{JsonChat, RestoreOutcome, StreamChat};
     use serde_json::Value;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
     use std::time::Duration;
@@ -685,10 +685,7 @@ mod tests {
             .store(2, std::sync::atomic::Ordering::SeqCst); // always Err
         assert!(sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.is_err());
         // 1 initial attempt + the configured retries
-        assert_eq!(
-            raw[0].saves.lock().await.len(),
-            1 + DEFAULT_SAVE_RETRIES
-        );
+        assert_eq!(raw[0].saves.lock().await.len(), 1 + DEFAULT_SAVE_RETRIES);
         // last_used not updated -> slot 0 still "free"
         let g = sm.acquire(None).await.unwrap();
         assert_eq!(g.slot, GSlot { be: 0, slot: 0 });
@@ -702,10 +699,7 @@ mod tests {
             .save_mode
             .store(1, std::sync::atomic::Ordering::SeqCst); // always Ok(false)
         assert!(!sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap());
-        assert_eq!(
-            raw[0].saves.lock().await.len(),
-            1 + DEFAULT_SAVE_RETRIES
-        );
+        assert_eq!(raw[0].saves.lock().await.len(), 1 + DEFAULT_SAVE_RETRIES);
         // a failed (500) save still marks the slot used
         let g = sm.acquire(None).await.unwrap();
         assert_eq!(g.slot, GSlot { be: 0, slot: 1 });

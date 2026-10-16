@@ -5,8 +5,9 @@ use axum::body::{Body, to_bytes};
 use lpcache::app::{AppState, router};
 use lpcache::coalesce::SingleFlight;
 use lpcache::config::{BackendConf, Config, DEFAULT_STREAM_QUEUE_SIZE};
-use lpcache::llama_client::{LlamaBackend, LlamaClient};
 use lpcache::mock_backend::MockLlama;
+use lpcache::plugins::registry::PluginFactory;
+use lpcache::plugins::{LlamaBackend, LlamaClient, Prefilter, ResultStore};
 use lpcache::slot_manager::SlotManager;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -84,6 +85,21 @@ async fn make_state_prefilter_coalesce(
     .await
 }
 
+/// (prefilter, result store) loaded from a config's plugin specs.
+type LoadedPrefilter = (Option<Arc<dyn Prefilter>>, Option<Arc<dyn ResultStore>>);
+
+/// Load the prefilter plugin (and the result store of the plugin that
+/// backs it, when it has one) from the config's plugin specs — the same
+/// dynamic loading path the `lpcache` binary uses.
+fn load_prefilter(cfg: &Config) -> LoadedPrefilter {
+    let specs = cfg.plugin_specs().expect("plugin specs");
+    let prefilter =
+        lpcache::plugins::load_prefilters(&lpcache::plugins::Registry::with_builtins(), &specs)
+            .expect("load prefilter");
+    let result_store = prefilter.as_ref().and_then(|pf| pf.result_store());
+    (prefilter, result_store)
+}
+
 async fn make_state_inner(
     n_slots: usize,
     acquire_timeout: Option<Duration>,
@@ -124,15 +140,14 @@ async fn make_state_inner(
         None => sm,
     };
     let sm = Arc::new(sm);
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     (state, mock, td)
 }
@@ -631,15 +646,14 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
         SlotManager::new(&cfg.backends, clients.clone())
             .with_backend_cooldown(Duration::from_secs(60)),
     );
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     let app = router(state);
 
@@ -707,15 +721,14 @@ async fn connection_failure_retries_on_other_backend() {
         Arc::clone(&c1) as Arc<dyn LlamaBackend>,
     ];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     let app = router(state);
 
@@ -779,15 +792,14 @@ async fn probe_recovers_cooled_down_backend() {
         SlotManager::new(&cfg.backends, clients.clone())
             .with_backend_cooldown(Duration::from_secs(60)),
     );
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm: Arc::clone(&sm),
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     let app = router(state);
 
@@ -864,15 +876,14 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         Arc::clone(&c1) as Arc<dyn LlamaBackend>,
     ];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     let app = router(state);
 
@@ -923,15 +934,14 @@ async fn prune_removes_oldest_meta_and_kv_files() {
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     let app = router(state);
 
@@ -1000,15 +1010,14 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     let app = router(state);
 
@@ -1121,15 +1130,14 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     let app = router(state);
 
@@ -1642,17 +1650,17 @@ struct LongPromptFilter {
 }
 
 #[async_trait::async_trait]
-impl lpcache::prefilter::Prefilter for LongPromptFilter {
+impl lpcache::plugins::Prefilter for LongPromptFilter {
     fn name(&self) -> &str {
         "long_prompt"
     }
 
     async fn check(
         &self,
-        req: &lpcache::prefilter::PrefilterRequest,
-    ) -> lpcache::prefilter::PrefilterDecision {
+        req: &lpcache::plugins::PrefilterRequest,
+    ) -> lpcache::plugins::PrefilterDecision {
         if req.n_words > self.max_words {
-            lpcache::prefilter::PrefilterDecision::Reject {
+            lpcache::plugins::PrefilterDecision::Reject {
                 status: 413,
                 message: format!(
                     "prompt too long: {} words (max {})",
@@ -1660,7 +1668,7 @@ impl lpcache::prefilter::Prefilter for LongPromptFilter {
                 ),
             }
         } else {
-            lpcache::prefilter::PrefilterDecision::Accept
+            lpcache::plugins::PrefilterDecision::Accept
         }
     }
 }
@@ -1724,15 +1732,14 @@ async fn make_state_result_cache(
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     (state, mock, td, td_rc)
 }
@@ -1849,13 +1856,20 @@ async fn result_cache_stream_requests_bypass_cache() {
 #[tokio::test]
 async fn result_cache_remove_after_serve_cleanup() {
     let (mut state, mock, _td, td_rc) = make_state_result_cache(300.0).await;
-    // Attach the built-in post-serve cleanup adapter: the entry file is
-    // removed after a cached result is served (one-shot cache).
-    let cache = state.result_cache.clone().expect("result cache");
-    state.prefilter = Some(Arc::new(
-        lpcache::result_cache::CachedResultPrefilter::new(cache)
-            .with_cleanup(Arc::new(lpcache::result_cache::RemoveAfterServe)),
-    ));
+    // Attach the result-cache plugin (loaded from a spec, exactly like the
+    // binary does) with the built-in post-serve cleanup adapter: the entry
+    // file is removed after a cached result is served (one-shot cache).
+    let factory = lpcache::plugins::builtin::result_cache::ResultCachePluginFactory;
+    state.prefilter = Some(
+        factory
+            .create_prefilter(&json!({
+                "dir": td_rc.path().to_string_lossy().into_owned(),
+                "ttl_secs": 300.0,
+                "cleanup": "remove_after_serve",
+            }))
+            .expect("result_cache plugin")
+            .expect("prefilter"),
+    );
     let app = router(state);
     let body = json!({
         "model": "m1",
@@ -1914,24 +1928,23 @@ async fn keyword_blocklist_rejects_before_result_cache_serves() {
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     // Pre-populate the cache for the blocked prompt's key (a blocked
     // request can never store a result itself).
     let key = expected_key("this is banned");
     state
-        .result_cache
+        .result_store
         .as_ref()
-        .expect("result cache")
-        .put(&key, 200, &json!({ "object": "chat.completion" }))
+        .expect("result store")
+        .store(&key, 200, &json!({ "object": "chat.completion" }))
         .unwrap();
     let app = router(state);
     let body = json!({
@@ -1979,15 +1992,14 @@ async fn make_state_with_save_dir(
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     (state, mock, td)
 }
@@ -2094,15 +2106,14 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
-    let prefilter = cfg.prefilter();
-    let result_cache = cfg.result_cache();
+    let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
         clients,
         sm,
         sf: Arc::new(SingleFlight::new()),
         prefilter,
-        result_cache,
+        result_store,
     };
     let app = router(state);
 
