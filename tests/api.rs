@@ -148,6 +148,7 @@ async fn make_state_inner(
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     (state, mock, td)
 }
@@ -654,6 +655,7 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     let app = router(state);
 
@@ -729,6 +731,7 @@ async fn connection_failure_retries_on_other_backend() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     let app = router(state);
 
@@ -800,6 +803,7 @@ async fn probe_recovers_cooled_down_backend() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     let app = router(state);
 
@@ -884,6 +888,7 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     let app = router(state);
 
@@ -942,6 +947,7 @@ async fn prune_removes_oldest_meta_and_kv_files() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     let app = router(state);
 
@@ -1018,6 +1024,7 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     let app = router(state);
 
@@ -1138,6 +1145,7 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     let app = router(state);
 
@@ -1432,8 +1440,8 @@ async fn stream_queue_size_one_delivers_full_stream() {
     assert!(text.contains("Hello"), "stream: {text}");
     assert!(text.contains("world"), "stream: {text}");
     assert!(text.ends_with("data: [DONE]\n\n"), "stream: {text}");
-    // all three mock chunks were generated exactly once
-    assert_eq!(mock.state.chunks_produced(), 3);
+    // all four mock chunks were generated exactly once
+    assert_eq!(mock.state.chunks_produced(), 4);
     // the reader task ran its cleanup despite the backpressure
     let key = expected_key("queue size one");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1740,6 +1748,7 @@ async fn make_state_result_cache(
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     (state, mock, td, td_rc)
 }
@@ -1936,6 +1945,7 @@ async fn keyword_blocklist_rejects_before_result_cache_serves() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     // Pre-populate the cache for the blocked prompt's key (a blocked
     // request can never store a result itself).
@@ -2000,6 +2010,7 @@ async fn make_state_with_save_dir(
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     (state, mock, td)
 }
@@ -2114,6 +2125,7 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log: None,
     };
     let app = router(state);
 
@@ -2141,4 +2153,332 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
         td.path().join(format!("{key1}.meta.json")).exists(),
         "meta must be kept when the slot-save dir is not visible locally"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Request logging (the built-in `request_log` plugin: W3C-XLF records)
+// ---------------------------------------------------------------------------
+
+/// Like [`make_state`], but with the built-in `request_log` plugin enabled
+/// through the same config → spec → registry path the `lpcache` binary
+/// uses (`with_request_log` synthesizes the spec, the registry
+/// instantiates the logger, `prepare` runs at startup). Returns the state
+/// plus the log file path.
+async fn make_state_request_log(
+    max_bytes: u64,
+    keep: usize,
+) -> (AppState, MockLlama, tempfile::TempDir, std::path::PathBuf) {
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("tempdir");
+    let log_path = td.path().join("req.log");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_request_log(log_path.clone(), max_bytes, keep, None);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let specs = cfg.plugin_specs().expect("plugin specs");
+    let request_log = lpcache::plugins::load_request_loggers(
+        &lpcache::plugins::Registry::with_builtins(),
+        &specs,
+    )
+    .expect("load request log")
+    .expect("request log spec present");
+    request_log.prepare().expect("prepare request log");
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: Some(request_log),
+    };
+    (state, mock, td, log_path)
+}
+
+/// A chat-completions POST with an explicit `User-Agent` and
+/// `Content-Length` (in-process requests don't get one automatically;
+/// the request log's `cs-bytes` is taken from the header).
+fn post_json_ua(body: &Value, ua: &str) -> axum::http::Request<Body> {
+    let raw = body.to_string();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-length", raw.len())
+        .header("user-agent", ua)
+        .body(Body::from(raw))
+        .expect("request")
+}
+
+/// Parse one XLF file: validates the 4 header lines and returns the
+/// `#Fields:` names plus one field → value map per record line.
+fn parse_xlf(content: &str) -> (Vec<String>, Vec<std::collections::HashMap<String, String>>) {
+    let mut lines = content.lines();
+    let line1 = lines.next().expect("header line 1");
+    assert!(line1.starts_with("#Software: lpcache-plugins/"), "{line1}");
+    assert_eq!(lines.next().expect("header line 2"), "#Version: 1.0");
+    assert_eq!(
+        lines.next().expect("header line 3"),
+        "#Date-format: %Y-%m-%dT%H:%M:%S.%fZ"
+    );
+    let fields_line = lines.next().expect("header line 4");
+    let fields: Vec<String> = fields_line
+        .strip_prefix("#Fields: ")
+        .expect("#Fields: prefix")
+        .split(' ')
+        .map(str::to_string)
+        .collect();
+    let records = lines
+        .map(|line| {
+            let vals = line.split(' ').collect::<Vec<_>>();
+            assert_eq!(vals.len(), fields.len(), "field count: {line}");
+            fields
+                .iter()
+                .cloned()
+                .zip(vals.into_iter().map(str::to_string))
+                .collect()
+        })
+        .collect();
+    (fields, records)
+}
+
+#[tokio::test]
+async fn request_log_writes_xlf_record() {
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await; // 0 = no rotation
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    let raw = body.to_string();
+    let resp = app
+        .clone()
+        .oneshot(post_json_ua(&body, "lpcache-test/1.0"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    // Draining the body drops the pending record, writing it to the file.
+    read_body(resp).await;
+
+    let content = std::fs::read_to_string(&log_path).expect("log file");
+    let (_fields, records) = parse_xlf(&content);
+    assert_eq!(records.len(), 1, "one record per request: {content}");
+    let rec = &records[0];
+    // W3C fields.
+    assert_eq!(rec["cs-method"], "POST");
+    assert_eq!(rec["cs-uri"], "/v1/chat/completions");
+    assert_eq!(rec["c-ip"], "-", "tower::oneshot carries no ConnectInfo");
+    assert_eq!(rec["cs(User-Agent)"], "lpcache-test/1.0");
+    let dt = &rec["datetime"];
+    assert!(dt.ends_with('Z') && dt.len() == 24, "datetime: {dt}");
+    let cs_time: f64 = rec["cs-time"].parse().expect("cs-time");
+    assert!(cs_time >= 0.0);
+    assert_eq!(
+        rec["cs-bytes"],
+        raw.len().to_string(),
+        "from Content-Length"
+    );
+    assert_eq!(rec["sc-status"], "200");
+    let sc_bytes: u64 = rec["sc-bytes"].parse().expect("sc-bytes");
+    assert!(sc_bytes > 0, "response bytes counted");
+    // lpcache pipeline fields (small request: no restore attempt, no
+    // prefilter, no coalescing, no failure).
+    assert_eq!(rec["lpcache-model"], "m1");
+    assert_eq!(rec["lpcache-stream"], "false");
+    assert_eq!(rec["lpcache-key"], &expected_key("hello world")[..16]);
+    assert_eq!(rec["lpcache-n-words"], "2");
+    assert_eq!(rec["lpcache-is-big"], "false");
+    assert_eq!(rec["lpcache-backend"], "0");
+    assert!(
+        rec["lpcache-slot"] == "0" || rec["lpcache-slot"] == "1",
+        "slot: {}",
+        rec["lpcache-slot"]
+    );
+    assert_eq!(
+        rec["lpcache-restored"], "-",
+        "no restore attempt on small requests"
+    );
+    assert_eq!(rec["lpcache-cache-hit"], "-", "no prefilter enabled");
+    assert_eq!(rec["lpcache-coalesced"], "-");
+    assert_eq!(rec["lpcache-reason"], "-", "the request completed normally");
+    // performance fields: the mock's fixed `usage`/`timings`.
+    assert_eq!(rec["lpcache-prompt-tokens"], "10");
+    assert_eq!(rec["lpcache-completion-tokens"], "5");
+    assert_eq!(rec["lpcache-cached-tokens"], "8");
+    assert_eq!(rec["lpcache-prefill-ms"], "25.00");
+    assert_eq!(rec["lpcache-gen-ms"], "15.00");
+    assert_eq!(rec["lpcache-prefill-tps"], "400.0");
+    assert_eq!(rec["lpcache-gen-tps"], "333.3");
+    assert_eq!(rec["lpcache-ttft-ms"], "-", "non-streaming has no ttft");
+}
+
+#[tokio::test]
+async fn request_log_stream_writes_perf_fields() {
+    // Streaming: the proxy-side ttft is measured by the reader; the
+    // backend `usage`/`timings` arrive in the stream's final chunk.
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "perf check stream" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("stream body");
+
+    let content = std::fs::read_to_string(&log_path).expect("log file");
+    let (_fields, records) = parse_xlf(&content);
+    assert_eq!(records.len(), 1);
+    let rec = &records[0];
+    assert_eq!(rec["lpcache-stream"], "true");
+    let ttft: f64 = rec["lpcache-ttft-ms"].parse().expect("ttft-ms");
+    assert!(
+        ttft >= 0.0,
+        "ttft measured by the proxy: {}",
+        rec["lpcache-ttft-ms"]
+    );
+    assert_eq!(rec["lpcache-prompt-tokens"], "10");
+    assert_eq!(rec["lpcache-completion-tokens"], "5");
+    assert_eq!(rec["lpcache-cached-tokens"], "8");
+    assert_eq!(rec["lpcache-prefill-ms"], "25.00");
+    assert_eq!(rec["lpcache-gen-ms"], "15.00");
+    assert_eq!(rec["lpcache-prefill-tps"], "400.0");
+    assert_eq!(rec["lpcache-gen-tps"], "333.3");
+}
+
+#[tokio::test]
+async fn request_log_stream_request_counts_delivered_bytes() {
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi there" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("stream body");
+    let sse_len = bytes.len() as u64;
+    assert!(sse_len > 0);
+
+    let content = std::fs::read_to_string(&log_path).expect("log file");
+    let (_fields, records) = parse_xlf(&content);
+    assert_eq!(records.len(), 1);
+    let rec = &records[0];
+    assert_eq!(rec["lpcache-stream"], "true");
+    assert_eq!(rec["sc-status"], "200");
+    assert_eq!(
+        rec["sc-bytes"],
+        sse_len.to_string(),
+        "every SSE byte counted"
+    );
+    assert_eq!(rec["lpcache-reason"], "-");
+}
+
+#[tokio::test]
+async fn request_log_logs_failed_request_without_pipeline() {
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await;
+    let app = router(state);
+    // Invalid JSON: the handler fails before it builds the pipeline view,
+    // so the record still exists (the middleware logs it) with the
+    // lpcache fields all `-`.
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from("{not json"))
+        .expect("request");
+    let resp = app.clone().oneshot(req).await.expect("resp");
+    assert_eq!(resp.status(), 422);
+    read_body(resp).await;
+
+    let content = std::fs::read_to_string(&log_path).expect("log file");
+    let (_fields, records) = parse_xlf(&content);
+    assert_eq!(records.len(), 1);
+    let rec = &records[0];
+    assert_eq!(rec["sc-status"], "422");
+    assert_eq!(rec["cs-method"], "POST");
+    assert_eq!(rec["lpcache-model"], "-", "no pipeline view was attached");
+    assert_eq!(rec["lpcache-reason"], "-");
+}
+
+#[tokio::test]
+async fn request_log_rotates_and_bounds_keep() {
+    // max_bytes small enough that a few records rotate the file (the 28
+    // field names make each file header large, so the threshold sits
+    // between one and a few records); keep=2 caps the rotated generations.
+    let (state, _mock, _td, log_path) = make_state_request_log(2048, 2).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    // Send until two rotations happened (or give up).
+    let gen2 = log_path.with_extension("log.2");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    for _ in 0..50 {
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        read_body(resp).await;
+        if gen2.exists() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected two rotations ({} bytes so far)",
+            std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0)
+        );
+    }
+    let gen1 = log_path.with_extension("log.1");
+    // One more request: a rotation leaves the current file missing until
+    // the next record recreates it.
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await;
+    assert!(gen1.exists(), "at least one rotation");
+    assert!(gen2.exists(), "at least two rotations");
+    // keep=2: no generation beyond `.2` survives.
+    assert!(!log_path.with_extension("log.3").exists());
+    // Every existing generation starts with a fresh XLF header and parses.
+    for p in [log_path.clone(), gen1, gen2] {
+        let content = std::fs::read_to_string(&p).expect("read generation");
+        let (_fields, records) = parse_xlf(&content);
+        if !records.is_empty() {
+            for rec in &records {
+                assert_eq!(rec["sc-status"], "200");
+            }
+        }
+    }
+    // The rotated generations hold the overflowed records.
+    for p in [
+        log_path.with_extension("log.1"),
+        log_path.with_extension("log.2"),
+    ] {
+        let records = parse_xlf(&std::fs::read_to_string(&p).expect("read")).1;
+        assert!(!records.is_empty(), "{p:?} must hold rotated records");
+    }
 }

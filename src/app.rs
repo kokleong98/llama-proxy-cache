@@ -35,6 +35,18 @@
 //! pipeline above and every other request ("follower") waits for the
 //! leader and receives its result. Followers never touch slots, backends
 //! or meta files. See the `coalesce` module.
+//!
+//! Request log (optional): when `REQUEST_LOG` is enabled (or a
+//! `request_log` spec is present in `PLUGINS`), a middleware wraps every
+//! request: the W3C fields (method, URI, client IP, user agent, request
+//! bytes, duration, status) are captured by the middleware, and the
+//! lpcache pipeline fields (model, stream, key, n_words, is_big, backend,
+//! slot, restored, cache_hit, coalesced, reason) are attached by the
+//! handlers through the response's extensions (`PipelineLog`). One W3C-XLF
+//! record is written through the `RequestLogger` plugin when the response
+//! body is done — completed, errored, or the client went away — and
+//! logging failures are swallowed: logging never breaks request serving.
+//! The built-in plugin size-rotates the log file.
 
 use crate::coalesce::{Flight, SharedOutcome, SingleFlight};
 use crate::config::Config;
@@ -43,18 +55,20 @@ use crate::slot_manager::{AcquireTimeout, GSlot, SlotGuard, SlotManager};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
 use futures::StreamExt;
 use lpcache_plugins::{
     BackendError, JsonChat, LlamaBackend, Prefilter, PrefilterDecision, PrefilterRequest,
-    RestoreOutcome, ResultStore,
+    RequestLogRecord, RequestLogger, RestoreOutcome, ResultStore, format_utc,
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 /// Shared application state (Python: `app.state`).
@@ -75,17 +89,331 @@ pub struct AppState {
     /// results are stored here under the request's cache key, and the
     /// backing prefilter serves hits before any slot/backend work.
     pub result_store: Option<Arc<dyn ResultStore>>,
+    /// Optional request logger (the built-in `request_log` plugin, loaded
+    /// from `REQUEST_LOG` / the `PLUGINS` settings): one W3C-XLF record is
+    /// appended per finished request (`None` = disabled — the default).
+    pub request_log: Option<Arc<dyn RequestLogger>>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
+        // `from_fn_with_state` because the middleware extracts
+        // `State<AppState>` (plain `from_fn` has no state).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            request_log_middleware,
+        ))
         .with_state(state)
 }
 
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(json!({ "data": [{ "id": state.config.model_id }] }))
+}
+
+/// The lpcache pipeline view of one request, carried in the response's
+/// extensions to the request-log middleware (see
+/// [`request_log_middleware`]). Every field is optional: it is filled in
+/// as far as the request got (a rejected request carries no slot, a small
+/// request carries no restore outcome, ...), and whatever is missing
+/// renders as `-` in the XLF record.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PipelineLog {
+    /// `lpcache-model`: the model the client asked for.
+    pub model: Option<String>,
+    /// `lpcache-stream`.
+    pub stream: Option<bool>,
+    /// `lpcache-key`: the first 16 hex chars of the cache key.
+    pub key: Option<String>,
+    /// `lpcache-n-words`.
+    pub n_words: Option<usize>,
+    /// `lpcache-is-big`.
+    pub is_big: Option<bool>,
+    /// `lpcache-backend`: the backend index the request ran on.
+    pub backend: Option<usize>,
+    /// `lpcache-slot`.
+    pub slot: Option<usize>,
+    /// `lpcache-restored`: present when a KV cache restore was attempted
+    /// (missing = not attempted, e.g. small requests).
+    pub restored: Option<bool>,
+    /// `lpcache-cache-hit`: present when a prefilter ran (`true` = served
+    /// from the prefilter, `false` = let through).
+    pub cache_hit: Option<bool>,
+    /// `lpcache-coalesced`: `leader`/`follower` when coalescing is enabled.
+    pub coalesced: Option<&'static str>,
+    /// `lpcache-reason`: a short pipeline outcome for non-successful
+    /// requests (missing = the request completed normally).
+    pub reason: Option<String>,
+    /// Shared backend-reported performance state (see [`PerfInner`]).
+    /// Filled in as data arrives — the completion JSON (non-streaming) or
+    /// the SSE chunks (streaming) — and read by the request log when the
+    /// response body completes. `None` for requests outside the chat
+    /// pipeline (e.g. `GET /v1/models`).
+    pub perf: Option<Arc<Mutex<PerfInner>>>,
+}
+
+/// Attach the pipeline view to a response's extensions (the request-log
+/// middleware reads it there when the response body finishes).
+fn with_pipeline_log(mut resp: Response, pl: PipelineLog) -> Response {
+    resp.extensions_mut().insert(pl);
+    resp
+}
+
+/// Fill in the slot-related fields for a request that ran on slot `g`
+/// (`restored` is present when a KV cache restore was attempted).
+fn with_slot(mut pl: PipelineLog, g: GSlot, restored: Option<bool>) -> PipelineLog {
+    pl.backend = Some(g.be);
+    pl.slot = Some(g.slot);
+    pl.restored = restored;
+    pl
+}
+
+/// Backend-reported performance data for one request, shared between the
+/// pipeline (which fills it in as data arrives) and the request-log
+/// middleware (which reads it when the response body completes). Every
+/// field is optional: it is set only when the backend reports it —
+/// missing on failure paths and on backends that predate the `timings`
+/// object.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PerfInner {
+    /// Proxy-side time to first token (streaming): from the start of
+    /// stream processing until the first SSE chunk from the backend.
+    pub ttft_ms: Option<f64>,
+    /// `usage.prompt_tokens`.
+    pub prompt_tokens: Option<u64>,
+    /// `usage.completion_tokens`.
+    pub completion_tokens: Option<u64>,
+    /// `usage.prompt_tokens_details.cached_tokens` (or `timings.cache_n`)
+    /// — the visible effect of a KV restore.
+    pub cached_tokens: Option<u64>,
+    /// `timings.prompt_ms` (backend prompt processing, ms).
+    pub prefill_ms: Option<f64>,
+    /// `timings.predicted_ms` (backend generation, ms).
+    pub gen_ms: Option<f64>,
+    /// `timings.prompt_per_second`.
+    pub prefill_tps: Option<f64>,
+    /// `timings.predicted_per_second`.
+    pub gen_tps: Option<f64>,
+}
+
+/// Fill `perf` from a backend completion object (a non-streaming response,
+/// or one parsed SSE `data:` payload): the `usage` token counts and the
+/// `timings` statistics (llama.cpp sends both in the final response/chunk
+/// of every chat completion). Fields the backend did not report are left
+/// untouched.
+fn fill_perf_from_value(perf: &Arc<Mutex<PerfInner>>, value: &Value) {
+    let Ok(mut p) = perf.lock() else {
+        return;
+    };
+    if let Some(u) = value.get("usage") {
+        p.prompt_tokens = p
+            .prompt_tokens
+            .or_else(|| u.get("prompt_tokens").and_then(Value::as_u64));
+        p.completion_tokens = p
+            .completion_tokens
+            .or_else(|| u.get("completion_tokens").and_then(Value::as_u64));
+        p.cached_tokens = p.cached_tokens.or_else(|| {
+            u.pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+        });
+    }
+    if let Some(t) = value.get("timings") {
+        p.cached_tokens = p
+            .cached_tokens
+            .or_else(|| t.get("cache_n").and_then(Value::as_u64));
+        p.prefill_ms = p
+            .prefill_ms
+            .or_else(|| t.get("prompt_ms").and_then(Value::as_f64));
+        p.gen_ms = p
+            .gen_ms
+            .or_else(|| t.get("predicted_ms").and_then(Value::as_f64));
+        p.prefill_tps = p
+            .prefill_tps
+            .or_else(|| t.get("prompt_per_second").and_then(Value::as_f64));
+        p.gen_tps = p
+            .gen_tps
+            .or_else(|| t.get("predicted_per_second").and_then(Value::as_f64));
+    }
+}
+
+/// Scan complete SSE `data:` lines in `buf` (consuming them; an incomplete
+/// trailing line is kept for the next chunk) and feed each parsed payload
+/// to [`fill_perf_from_value`]. The proxy passes the stream through
+/// byte-for-byte — this only observes it for the request log.
+fn process_sse_perf(buf: &mut String, perf: &Arc<Mutex<PerfInner>>) {
+    while let Some(pos) = buf.find('\n') {
+        let line: String = buf.drain(..=pos).collect();
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        fill_perf_from_value(perf, &v);
+    }
+}
+
+/// Fill `perf` from a coalesced group's terminal outcome (the leader's
+/// completion object, or the leader's recorded SSE stream).
+fn perf_from_outcome(perf: Option<&Arc<Mutex<PerfInner>>>, outcome: &SharedOutcome) {
+    let Some(perf) = perf else {
+        return;
+    };
+    match outcome {
+        SharedOutcome::Json(status, value) if *status == 200 => fill_perf_from_value(perf, value),
+        SharedOutcome::Sse(bytes) => {
+            let mut buf = String::from_utf8_lossy(bytes).into_owned();
+            process_sse_perf(&mut buf, perf);
+        }
+        SharedOutcome::Json(_, _) | SharedOutcome::Raw(..) => {}
+    }
+}
+
+/// One finished request, pending its XLF record. Rides along in the
+/// response body's stream state, so it is dropped exactly when the body
+/// is done — the stream completed or the client went away — and the
+/// record is written from [`Drop`] (the plugin's `log` is synchronous,
+/// and the drop is the only hook a disappearing body offers). Logging
+/// failures are warned about and swallowed: request logging never breaks
+/// request serving.
+struct PendingRequestLog {
+    logger: Arc<dyn RequestLogger>,
+    method: String,
+    uri: Option<String>,
+    client_ip: Option<String>,
+    user_agent: Option<String>,
+    request_bytes: Option<u64>,
+    status: u16,
+    pl: PipelineLog,
+    t0: Instant,
+    delivered: Arc<AtomicUsize>,
+}
+
+impl Drop for PendingRequestLog {
+    fn drop(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        // Read the shared performance state last: by the time the body is
+        // done, the streaming reader has observed the final chunks (unless
+        // the client went away early — then whatever arrived is logged).
+        let perf = self
+            .pl
+            .perf
+            .as_ref()
+            .and_then(|p| p.lock().ok().map(|g| g.clone()));
+        let record = RequestLogRecord {
+            datetime: Some(format_utc(now.as_secs(), now.subsec_nanos())),
+            method: Some(self.method.clone()),
+            uri: self.uri.clone(),
+            client_ip: self.client_ip.clone(),
+            user_agent: self.user_agent.clone(),
+            request_bytes: self.request_bytes,
+            duration_secs: Some(self.t0.elapsed().as_secs_f64()),
+            status: Some(self.status),
+            response_bytes: Some(self.delivered.load(Ordering::Relaxed) as u64),
+            model: self.pl.model.clone(),
+            stream: self.pl.stream,
+            key: self.pl.key.clone(),
+            n_words: self.pl.n_words,
+            is_big: self.pl.is_big,
+            backend: self.pl.backend,
+            slot: self.pl.slot,
+            restored: self.pl.restored,
+            cache_hit: self.pl.cache_hit,
+            coalesced: self.pl.coalesced,
+            reason: self.pl.reason.clone(),
+            prompt_tokens: perf.as_ref().and_then(|p| p.prompt_tokens),
+            completion_tokens: perf.as_ref().and_then(|p| p.completion_tokens),
+            cached_tokens: perf.as_ref().and_then(|p| p.cached_tokens),
+            prefill_ms: perf.as_ref().and_then(|p| p.prefill_ms),
+            gen_ms: perf.as_ref().and_then(|p| p.gen_ms),
+            prefill_tps: perf.as_ref().and_then(|p| p.prefill_tps),
+            gen_tps: perf.as_ref().and_then(|p| p.gen_tps),
+            ttft_ms: perf.as_ref().and_then(|p| p.ttft_ms),
+        };
+        if let Err(e) = self.logger.log(&record) {
+            tracing::warn!(
+                "request_log_write_fail logger={} status={:?}: {e}",
+                self.logger.name(),
+                record.status
+            );
+        }
+    }
+}
+
+/// Request-log middleware (active only when `AppState::request_log` is
+/// set): captures the W3C fields of every request (method, URI, client
+/// IP, user agent, request bytes from `Content-Length`), wraps the
+/// response body to count the bytes actually handed to the client, and
+/// hands the finished request to the plugin (see [`PendingRequestLog`])
+/// when the body is done.
+async fn request_log_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(logger) = state.request_log.clone() else {
+        return next.run(req).await;
+    };
+    let t0 = Instant::now();
+    let method = req.method().to_string();
+    let uri = req.uri().path_and_query().map(|pq| pq.as_str().to_string());
+    let client_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.to_string());
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let request_bytes = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let resp = next.run(req).await;
+    let (mut parts, body) = resp.into_parts();
+    let pl = parts.extensions.remove::<PipelineLog>().unwrap_or_default();
+    let status = parts.status.as_u16();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&delivered);
+    let pending = PendingRequestLog {
+        logger,
+        method,
+        uri,
+        client_ip,
+        user_agent,
+        request_bytes,
+        status,
+        pl,
+        t0,
+        delivered,
+    };
+    // Count the bytes handed to the client; the pending record rides
+    // along in the stream state and is dropped (writing the record) when
+    // the body is done or the client goes away.
+    let stream = futures::stream::unfold(
+        (body.into_data_stream(), counter, pending),
+        |(mut body, counter, pending)| async move {
+            match body.next().await {
+                Some(Ok(chunk)) => {
+                    counter.fetch_add(chunk.len(), Ordering::Relaxed);
+                    Some((Ok(chunk), (body, counter, pending)))
+                }
+                Some(Err(err)) => Some((Err(err), (body, counter, pending))),
+                None => None,
+            }
+        },
+    );
+    (parts, Body::from_stream(stream)).into_response()
 }
 
 async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> Response {
@@ -128,6 +456,21 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
     let n_words = hashing::words_from_text(&prefix).len();
     let is_big = n_words > state.config.big_threshold_words;
 
+    // Request log: the pipeline view of this request (carried in the
+    // response's extensions to the request-log middleware); filled in as
+    // far as the request gets.
+    let mut pl = PipelineLog {
+        model: Some(client_model.clone()),
+        stream: Some(stream),
+        key: Some(short16(&key)),
+        n_words: Some(n_words),
+        is_big: Some(is_big),
+        // Shared performance state (request log); filled in as the backend
+        // response arrives.
+        perf: Some(Arc::new(Mutex::new(PerfInner::default()))),
+        ..Default::default()
+    };
+
     // Prefilter adapter: short-circuit the request before coalescing,
     // slot acquisition, or backend dispatch. A `Reject` gets an immediate
     // JSON error, a `Serve` gets a previously cached backend result — in
@@ -146,6 +489,7 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
         };
         match pf.check(&preq).await {
             PrefilterDecision::Accept => {
+                pl.cache_hit = Some(false);
                 tracing::debug!(
                     "prefilter_accept filter={} key={}",
                     pf.name(),
@@ -158,7 +502,9 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
                     pf.name(),
                     short16(&key)
                 );
-                return json_error(status, message);
+                pl.cache_hit = Some(false);
+                pl.reason = Some("prefilter_reject".into());
+                return with_pipeline_log(json_error(status, message), pl);
             }
             PrefilterDecision::Serve { status, body } => {
                 tracing::info!(
@@ -167,7 +513,14 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
                     short16(&key)
                 );
                 let st = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-                return (st, axum::Json(body)).into_response();
+                pl.cache_hit = Some(true);
+                // The cached backend result carries the original
+                // `usage`/`timings` — log them as this request's
+                // performance (it never reached the backend).
+                if let Some(perf) = &pl.perf {
+                    fill_perf_from_value(perf, &body);
+                }
+                return with_pipeline_log((st, axum::Json(body)).into_response(), pl);
             }
         }
     }
@@ -187,13 +540,18 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
             Some((fk, flight))
         } else {
             tracing::info!("coalesce_join key={} group={}", short16(&key), short16(&fk));
-            return follower_response(
-                flight,
-                &client_model,
-                stream,
-                state.config.stream_queue_size,
-            )
-            .await;
+            pl.coalesced = Some("follower");
+            return with_pipeline_log(
+                follower_response(
+                    flight,
+                    &client_model,
+                    stream,
+                    state.config.stream_queue_size,
+                    pl.perf.clone(),
+                )
+                .await,
+                pl,
+            );
         }
     } else {
         None
@@ -203,6 +561,7 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
         // Leader. Run the pipeline in a spawned task so a disconnect of the
         // leader's own client cannot strand the group's followers: the task
         // always runs to completion and finishes the flight.
+        pl.coalesced = Some("leader");
         let state2 = state.clone();
         let body2 = body.clone();
         let client_model2 = client_model.clone();
@@ -210,6 +569,7 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
         let key2 = key.clone();
         let blocks2 = blocks.clone();
         let prefix2 = prefix.clone();
+        let pl2 = pl.clone();
         let grouped2 = Some((fk.clone(), Arc::clone(&flight)));
         let handle = tokio::spawn(async move {
             run_pipeline(
@@ -225,6 +585,7 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
                 n_words,
                 t0,
                 grouped2,
+                pl2,
             )
             .await
         });
@@ -237,7 +598,11 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
                     json!({ "error": format!("coalesced leader failed: {e}") }),
                 ));
                 state.sf.forget(&fk);
-                return json_error(500, format!("internal error: coalesced leader failed: {e}"));
+                pl.reason = Some("coalesce_leader_failed".into());
+                return with_pipeline_log(
+                    json_error(500, format!("internal error: coalesced leader failed: {e}")),
+                    pl,
+                );
             }
         };
         if let Some(o) = outcome {
@@ -263,6 +628,7 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
         n_words,
         t0,
         None,
+        pl,
     )
     .await;
     resp
@@ -272,7 +638,9 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
 /// -> save/meta -> release). Returns the response and, when coalescing is
 /// active, the outcome shared with the group's followers (`None` for a
 /// streaming leader: its reader task finishes the flight after the stream
-/// ends).
+/// ends). `pl` (the request log's pipeline view) is filled in with the
+/// slot-related fields plus the failure reason, and attached to the
+/// returned response.
 #[allow(clippy::too_many_arguments)]
 async fn run_pipeline(
     state: &AppState,
@@ -287,6 +655,7 @@ async fn run_pipeline(
     n_words: usize,
     t0: Instant,
     grouped: Option<(String, Arc<Flight>)>,
+    mut pl: PipelineLog,
 ) -> (Response, Option<SharedOutcome>) {
     let mut restore_key: Option<String> = None;
     if is_big {
@@ -325,12 +694,19 @@ async fn run_pipeline(
                 "acquire_timeout is_big={is_big} restore_key={}",
                 restore_key.as_ref().map(|k| short16(k)).unwrap_or_default()
             );
+            pl.reason = Some("slot_timeout".into());
             let (resp, o) = err_outcome(503, "all slots busy, please retry later");
-            return (resp, Some(o));
+            return (with_pipeline_log(resp, pl), Some(o));
         }
     };
     let mut g: GSlot = guard.slot;
     tracing::info!("after_acquire g={g} restored={:?}", guard.restored);
+    // Request log: whether the acquire actually loaded the KV cache
+    // (`lpcache-restored`; re-tracked when a failover retry re-acquires).
+    let mut restored = guard
+        .restored
+        .as_ref()
+        .map(|o| matches!(o, RestoreOutcome::Restored));
     // LRU bookkeeping: a successful restore counts as a "use" of the
     // cached entry — bump its meta timestamp so the post-save prune of
     // this very request cannot evict a cache that was just used
@@ -371,22 +747,30 @@ async fn run_pipeline(
                     {
                         Some(g2) => {
                             g = g2.slot;
+                            restored = g2
+                                .restored
+                                .as_ref()
+                                .map(|o| matches!(o, RestoreOutcome::Restored));
                             touch_restored_meta(state, &g2, &restore_key);
                             remove_stale_meta(state, &g2, &restore_key);
                             guard = g2;
                             continue;
                         }
                         None => {
+                            pl = with_slot(pl, g, restored);
+                            pl.reason = Some("backend_unreachable".into());
                             let (resp, o) = err_outcome(500, format!("backend unreachable: {e}"));
-                            return (resp, Some(o));
+                            return (with_pipeline_log(resp, pl), Some(o));
                         }
                     }
                 }
                 Err(e) => {
                     state.sm.mark_used(g);
                     state.sm.release(guard);
+                    pl = with_slot(pl, g, restored);
+                    pl.reason = Some("backend_error".into());
                     let (resp, o) = err_outcome(500, e.to_string());
-                    return (resp, Some(o));
+                    return (with_pipeline_log(resp, pl), Some(o));
                 }
             };
             if sc.status != 200 {
@@ -409,8 +793,10 @@ async fn run_pipeline(
                 let status =
                     StatusCode::from_u16(sc.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let val = json!({ "error": err_txt });
+                pl = with_slot(pl, g, restored);
+                pl.reason = Some(format!("provider_http_{}", sc.status));
                 return (
-                    (status, axum::Json(val.clone())).into_response(),
+                    with_pipeline_log((status, axum::Json(val.clone())).into_response(), pl),
                     Some(SharedOutcome::Json(sc.status, val)),
                 );
             }
@@ -447,9 +833,17 @@ async fn run_pipeline(
             }
             tracing::info!("stream_reader_start g={g} key={}", short16(&key2));
 
+            // Request log: shared performance state (the reader fills in
+            // ttft + the backend `usage`/`timings` as the chunks arrive).
+            let perf = pl.perf.clone();
             tokio::spawn(async move {
                 let mut s = sc.stream;
                 let mut client_gone = false;
+                let stream_t0 = Instant::now();
+                let mut ttft_ms: Option<f64> = None;
+                // Line buffer for SSE perf extraction (a chunk may split a
+                // `data:` line; the remainder waits for the next chunk).
+                let mut perf_buf = String::new();
                 loop {
                     tokio::select! {
                         _ = &mut client_gone_rx => {
@@ -467,6 +861,18 @@ async fn run_pipeline(
                             Some(Ok(bytes)) if !bytes.is_empty() => {
                                 if let Some((_, f)) = &flight {
                                     f.append_sse(&bytes);
+                                }
+                                if let Some(perf) = &perf {
+                                    if ttft_ms.is_none() {
+                                        ttft_ms =
+                                            Some(stream_t0.elapsed().as_secs_f64() * 1000.0);
+                                        if let Ok(mut pi) = perf.lock() {
+                                            pi.ttft_ms = ttft_ms;
+                                        }
+                                    }
+                                    perf_buf
+                                        .push_str(&String::from_utf8_lossy(&bytes));
+                                    process_sse_perf(&mut perf_buf, perf);
                                 }
                                 if tx.send(Ok(bytes)).await.is_err() {
                                     // client went away (body dropped) -> stop
@@ -549,7 +955,11 @@ async fn run_pipeline(
                 futures::stream::unfold((rx, client_gone_tx), |(mut rx, gone_tx)| async move {
                     rx.recv().await.map(|item| (item, (rx, gone_tx)))
                 });
-            return ((headers, Body::from_stream(stream)).into_response(), None);
+            pl = with_slot(pl, g, restored);
+            return (
+                with_pipeline_log((headers, Body::from_stream(stream)).into_response(), pl),
+                None,
+            );
         } else {
             match client.chat_json(&out_body, Some(g.slot)).await {
                 Err(BackendError::HttpStatus { status, body }) => {
@@ -559,9 +969,11 @@ async fn run_pipeline(
                     state.sm.mark_used(g);
                     state.sm.release(guard);
                     let body: String = body.chars().take(512).collect();
+                    pl = with_slot(pl, g, restored);
+                    pl.reason = Some(format!("provider_http_{status}"));
                     let (resp, o) =
                         err_outcome(500, format!("provider returned HTTP {status}: {body}"));
-                    return (resp, Some(o));
+                    return (with_pipeline_log(resp, pl), Some(o));
                 }
                 Err(e) if matches!(e, BackendError::Other(_)) => {
                     match retry_after_failure(
@@ -577,29 +989,39 @@ async fn run_pipeline(
                     {
                         Some(g2) => {
                             g = g2.slot;
+                            restored = g2
+                                .restored
+                                .as_ref()
+                                .map(|o| matches!(o, RestoreOutcome::Restored));
                             touch_restored_meta(state, &g2, &restore_key);
                             remove_stale_meta(state, &g2, &restore_key);
                             guard = g2;
                             continue;
                         }
                         None => {
+                            pl = with_slot(pl, g, restored);
+                            pl.reason = Some("backend_unreachable".into());
                             let (resp, o) = err_outcome(500, format!("backend unreachable: {e}"));
-                            return (resp, Some(o));
+                            return (with_pipeline_log(resp, pl), Some(o));
                         }
                     }
                 }
                 Err(e) => {
                     state.sm.mark_used(g);
                     state.sm.release(guard);
+                    pl = with_slot(pl, g, restored);
+                    pl.reason = Some("backend_error".into());
                     let (resp, o) = err_outcome(500, e.to_string());
-                    return (resp, Some(o));
+                    return (with_pipeline_log(resp, pl), Some(o));
                 }
                 Ok(JsonChat::NonObject) => {
                     state.sm.report_success(g);
                     state.sm.mark_used(g);
                     state.sm.release(guard);
+                    pl = with_slot(pl, g, restored);
+                    pl.reason = Some("provider_non_object".into());
                     let (resp, o) = err_outcome(502, "provider non-JSON body");
-                    return (resp, Some(o));
+                    return (with_pipeline_log(resp, pl), Some(o));
                 }
                 Ok(JsonChat::NonJson { message, raw }) => {
                     // provider answered 200 with a non-JSON / broken body (the
@@ -613,7 +1035,9 @@ async fn run_pipeline(
                             Err(b) => {
                                 let (resp, o) = *b;
                                 state.sm.release(guard);
-                                return (resp, Some(o));
+                                pl = with_slot(pl, g, restored);
+                                pl.reason = Some("save_failed".into());
+                                return (with_pipeline_log(resp, pl), Some(o));
                             }
                         }
                     } else {
@@ -626,8 +1050,12 @@ async fn run_pipeline(
                         t0.elapsed().as_millis()
                     );
                     let val = json!({ "object": "error", "message": message, "raw": raw });
+                    pl = with_slot(pl, g, restored);
                     return (
-                        (StatusCode::OK, axum::Json(val.clone())).into_response(),
+                        with_pipeline_log(
+                            (StatusCode::OK, axum::Json(val.clone())).into_response(),
+                            pl,
+                        ),
                         Some(SharedOutcome::Json(200, val)),
                     );
                 }
@@ -639,7 +1067,9 @@ async fn run_pipeline(
                             Err(b) => {
                                 let (resp, o) = *b;
                                 state.sm.release(guard);
-                                return (resp, Some(o));
+                                pl = with_slot(pl, g, restored);
+                                pl.reason = Some("save_failed".into());
+                                return (with_pipeline_log(resp, pl), Some(o));
                             }
                         }
                     } else {
@@ -661,8 +1091,17 @@ async fn run_pipeline(
                     {
                         tracing::warn!("result_cache_store_fail key={}: {e}", short16(key));
                     }
+                    pl = with_slot(pl, g, restored);
+                    // Request log: the backend's `usage`/`timings` from the
+                    // completion (llama.cpp includes them in the response).
+                    if let Some(perf) = &pl.perf {
+                        fill_perf_from_value(perf, &out);
+                    }
                     return (
-                        (StatusCode::OK, axum::Json(out.clone())).into_response(),
+                        with_pipeline_log(
+                            (StatusCode::OK, axum::Json(out.clone())).into_response(),
+                            pl,
+                        ),
                         Some(SharedOutcome::Json(200, out)),
                     );
                 }
@@ -698,15 +1137,19 @@ async fn wait_outcome(flight: &Flight) -> SharedOutcome {
 }
 
 /// Serve a coalesced (follower) request from the leader's result: no slot
-/// is acquired, no backend call is made, and no meta file is written.
+/// is acquired, no backend call is made, and no meta file is written. The
+/// leader's `usage`/`timings` (carried in its terminal outcome) are
+/// copied into `perf` for the follower's request-log record.
 async fn follower_response(
     flight: Arc<Flight>,
     client_model: &str,
     stream: bool,
     stream_queue_size: usize,
+    perf: Option<Arc<Mutex<PerfInner>>>,
 ) -> Response {
     if !stream {
         let outcome = wait_outcome(&flight).await;
+        perf_from_outcome(perf.as_ref(), &outcome);
         return render_follower_json(&outcome, client_model);
     }
     // Stream follower: wait until the leader either starts streaming or
@@ -715,6 +1158,7 @@ async fn follower_response(
         let notified = flight.notified();
         tokio::pin!(notified);
         if let Some(o) = flight.outcome() {
+            perf_from_outcome(perf.as_ref(), &o);
             return render_stream_follower_terminal(&o, client_model);
         }
         if flight.stream_started() {
@@ -724,6 +1168,7 @@ async fn follower_response(
     }
     let (tx, rx) = mpsc::channel(stream_queue_size);
     let flight2 = Arc::clone(&flight);
+    let perf2 = perf;
     tokio::spawn(async move {
         let mut pos = 0usize;
         loop {
@@ -738,6 +1183,10 @@ async fn follower_response(
                 let rest = flight2.drain_sse_from(&mut pos);
                 if !rest.is_empty() {
                     let _ = tx.send(Ok(Bytes::from(rest))).await;
+                }
+                // Request log: the leader's performance data.
+                if let Some(o) = flight2.outcome() {
+                    perf_from_outcome(perf2.as_ref(), &o);
                 }
                 return;
             }

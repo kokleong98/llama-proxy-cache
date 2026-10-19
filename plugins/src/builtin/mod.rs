@@ -11,10 +11,12 @@
 //! | `chain`          | prefilter (runs nested plugins in order) | `filters`: array of plugin specs |
 //! | `result_cache`   | prefilter + result store             | `dir`, `ttl_secs` (default `300`), `cleanup` (`"remove_after_serve"` or omitted) |
 //! | `llama`          | llama.cpp backend client             | `url`, `api_key` (optional), `timeout_secs` (default `600`) |
+//! | `request_log`    | request logger (W3C-XLF request log file) | `path` (default `lpcache-request.log`), `max_bytes` (default 10 MiB, `0` = no rotation), `keep` (default `5`, `0` = keep all), `fields` (optional subset) |
 
 pub mod chain;
 pub mod keyword;
 pub mod llama;
+pub mod request_log;
 pub mod result_cache;
 
 use crate::registry::Registry;
@@ -33,4 +35,8 @@ pub fn register(registry: &Registry) {
         Arc::new(result_cache::ResultCachePluginFactory),
     );
     registry.register("llama", Arc::new(llama::LlamaPluginFactory));
+    registry.register(
+        "request_log",
+        Arc::new(request_log::RequestLogPluginFactory),
+    );
 }
