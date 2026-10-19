@@ -4,30 +4,31 @@ Complete catalog of the **lpcache** regression suite (KV-cache-aware,
 OpenAI-compatible proxy for llama.cpp). Every entry maps 1:1 to a test
 function; the full suite runs with `cargo test`.
 
-**Total: 175 test cases** — 77 lpcache unit + 41 lpcache-plugins
-unit + 42 API integration + 15 client integration.
+**Total: 197 test cases** — 80 lpcache unit + 55 lpcache-plugins
+unit + 47 API integration + 15 client integration.
 
 | # | Suite | Location | Tests |
 |---|-------|----------|-------|
-| 1 | Configuration (env vars, CLI, precedence, `PLUGINS` specs) | `src/config.rs` | 33 |
+| 1 | Configuration (env vars, CLI, precedence, `PLUGINS` specs) | `src/config.rs` | 36 |
 | 2 | Prefilter plugins (keyword, chain) | `plugins/src/builtin/keyword.rs`, `chain.rs` | 14 |
 | 3 | Hashing, meta files, pruning | `src/hashing.rs` | 19 |
 | 4 | Request coalescing (`SingleFlight`) | `src/coalesce.rs` | 4 |
 | 5 | llama backend client plugin | `plugins/src/builtin/llama.rs` | 5 |
 | 6 | Slot management (selection, locks, breaker) | `src/slot_manager.rs` | 21 |
-| 7 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 42 |
+| 7 | API end-to-end (proxy ↔ mock llama.cpp) | `tests/api.rs` | 47 |
 | 8 | Backend client — HTTP behavior | `tests/client.rs` | 15 |
 | 9 | Result cache plugin | `plugins/src/builtin/result_cache.rs` | 14 |
-| 10 | Plugin registry (specs, loading, chaining) | `plugins/src/registry.rs` | 8 |
+| 10 | Plugin registry (specs, loading, chaining) | `plugins/src/registry.rs` | 9 |
+| 11 | Request log plugin (W3C-XLF format, rotation) | `plugins/src/builtin/request_log.rs` | 13 |
 
 ## How to run
 
 ```sh
 cd lpcache
-cargo test                    # full regression suite (175 tests, ~4 s)
-cargo test --lib              # 77 lpcache unit tests only
-cargo test -p lpcache-plugins # 41 plugin library unit tests
-cargo test --test api         # 42 API integration tests
+cargo test                    # full regression suite (197 tests, ~4 s)
+cargo test --lib              # 80 lpcache unit tests only
+cargo test -p lpcache-plugins # 55 plugin library unit tests
+cargo test --test api         # 46 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test <name-substring>   # run a single test by name filter
 cargo clippy --all-targets    # lint gate (expected: 0 warnings)
@@ -37,7 +38,7 @@ Integration tests start `MockLlama` — an in-process mock of the llama.cpp
 server (`src/mock_backend.rs`) on free localhost ports — so the suite needs
 no real `llama-server`, model files, or network access.
 
-## 1. Configuration — `src/config.rs` (33)
+## 1. Configuration — `src/config.rs` (36)
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
@@ -74,6 +75,9 @@ no real `llama-server`, model files, or network access.
 | 31 | `plugin_specs_plugins_take_precedence_over_legacy` | `PLUGINS` set **and** legacy `PREFILTER_*` set | `PLUGINS` used verbatim; legacy settings ignored |
 | 32 | `plugin_specs_synthesized_from_legacy_settings` | legacy `PREFILTER_*` only (no `PLUGINS`) | `keyword` spec (keywords, case_insensitive) + `result_cache` spec (dir, ttl_secs) in order; both unset → no specs |
 | 33 | `plugin_specs_invalid_json_errors` | malformed `PLUGINS` JSON | `Err` mentioning `PLUGINS` |
+| 34 | `request_log_env_settings` | `REQUEST_LOG*` env vars (enabled + `PATH`/`MAX_BYTES`/`KEEP`/`FIELDS` with surrounding whitespace and empty entries) | all applied (trimmed, empty entries dropped); invalid `REQUEST_LOG`/numbers fall back to the defaults (disabled, 10 MiB, keep 5, all fields) |
+| 35 | `request_log_spec_synthesized_when_enabled` | `Config::with_request_log` + a legacy blocklist; `plugin_specs()` | two specs: `keyword` first, then a `request_log` spec carrying `path`/`max_bytes`/`keep`/`fields` params; disabled → no `request_log` spec at all |
+| 36 | `request_log_spec_in_plugins_wins` | a `request_log` spec in `PLUGINS` **and** enabled `REQUEST_LOG*` settings | the explicit spec is used verbatim — the synthesized one is not appended; the spec alone enables logging even with `REQUEST_LOG` unset |
 
 ## 2. Prefilter plugins — `plugins/src/builtin/keyword.rs` + `chain.rs` (14)
 
@@ -180,7 +184,7 @@ save/restore semantics and the backend circuit breaker.
 | 20 | `save_after_retries_exhausted_500_returns_false` | always-500 save | `Ok(false)` after 1 + `SAVE_RETRIES` attempts; slot still marked used |
 | 21 | `save_after_no_retry_when_retries_disabled` | `SAVE_RETRIES=0` | exactly one save attempt, `Err` propagated |
 
-## 7. API end-to-end — `tests/api.rs` (42)
+## 7. API end-to-end — `tests/api.rs` (46)
 
 The real proxy router (axum) in front of `MockLlama`, which records every
 chat body/query, restore and save. Default setup: 1 backend, 2 slots,
@@ -232,6 +236,11 @@ behaviour requires a real connection).
 | | 40 | `result_cache_stream_requests_bypass_cache` | same key, `stream: true` after a cached non-stream result | SSE (`text/event-stream`) from the backend — streaming requests are never served from the cache |
 | | 41 | `result_cache_remove_after_serve_cleanup` | `RemoveAfterServe` post-cleanup attached; 3 same-key requests | 1st → backend (entry stored); 2nd → served from cache, then entry file removed; 3rd → backend again (one-shot cache) |
 | | 42 | `keyword_blocklist_rejects_before_result_cache_serves` | blocklist + result cache chained; blocked prompt with a pre-populated cache entry | `400` from the blocklist — the reject beats the cached serve; backend never called |
+| 43 | `request_log_writes_xlf_record` | non-stream chat with the built-in `request_log` plugin enabled (via `Config::with_request_log` → `Registry::with_builtins` + `load_request_loggers` + `prepare`, the `main.rs` path) | the file starts with the 4 XLF header lines and holds 1 record: W3C fields (`POST`, URI, user agent, 24-char `…Z` datetime, `cs-time` ≥ 0, `cs-bytes` = `Content-Length`, 200, `sc-bytes` > 0; `c-ip` = `-` — `oneshot` carries no `ConnectInfo`) + lpcache fields (model, `stream` false, key = `expected_key(..)[..16]`, `n-words` 2, `is-big` false, backend 0, slot 0/1, `restored`/`cache-hit`/`coalesced`/`reason` = `-`) + performance fields (mock `usage`/`timings`: prompt/completion/cached tokens `10`/`5`/`8`, `prefill-ms` `25.00`, `gen-ms` `15.00`, `prefill-tps` `400.0`, `gen-tps` `333.3`, `ttft-ms` = `-` — non-streaming) |
+| 44 | `request_log_stream_request_counts_delivered_bytes` | `stream: true` chat, logger enabled | `lpcache-stream` = `true`, 200, and `sc-bytes` equals exactly the number of SSE bytes delivered to the client (byte counting via `Body::into_data_stream`) |
+| 45 | `request_log_logs_failed_request_without_pipeline` | malformed JSON body — the handler fails before any pipeline view exists | 422 **and** one log record: `sc-status` 422, method/URI filled, every lpcache field `-` |
+| 46 | `request_log_rotates_and_bounds_keep` | `max_bytes=2048` (between one and a few records, given the 28-field header), `keep=2`, repeated requests | ≥ 2 rotations: `.1` and `.2` exist, `.3` does not; every generation parses (fresh XLF header); the rotated generations hold the overflowed records; the current file is recreated after a rotation |
+| 47 | `request_log_stream_writes_perf_fields` | `stream: true` chat, logger enabled | `lpcache-ttft-ms` is a proxy-measured value ≥ 0 (time to the first SSE chunk); the backend `usage`/`timings` carried in the stream's final chunk are logged (prompt/completion/cached tokens `10`/`5`/`8`, `prefill-ms` `25.00`, `gen-ms` `15.00`, `prefill-tps` `400.0`, `gen-tps` `333.3`) |
 
 ## 8. Backend client — HTTP behavior — `tests/client.rs` (15)
 
@@ -281,15 +290,16 @@ the `PostCleanup` post-serve cleanup adapter.
 | 13 | `store_trait_wraps_put` | `ResultStore::store` through the trait object | entry file written via the trait |
 | 14 | `prefilter_result_store_exposes_the_same_cache` | the plugin's prefilter + result store together | both share the same cache (a store is visible to the prefilter) |
 
-## 10. Plugin registry — `plugins/src/registry.rs` (8)
+## 10. Plugin registry — `plugins/src/registry.rs` (9)
 
 The runtime registry: plugin factories registered by name, `PluginSpec`
-parsing from `PLUGINS` JSON, and `load_prefilters` (zero/one/many specs
-→ no prefilter / one prefilter / a `chain`).
+parsing from `PLUGINS` JSON, `load_prefilters` (zero/one/many specs
+→ no prefilter / one prefilter / a `chain`), and `load_request_loggers`
+(the single request logger, if any).
 
 | # | Test case | What it verifies | Expected result |
 |---|-----------|------------------|-----------------|
-| 1 | `with_builtins_registers_all_builtin_plugins` | `Registry::with_builtins()` | `chain`, `keyword`, `llama`, `result_cache` registered; unknown names not |
+| 1 | `with_builtins_registers_all_builtin_plugins` | `Registry::with_builtins()` | `chain`, `keyword`, `llama`, `request_log`, `result_cache` registered; unknown names not |
 | 2 | `global_registry_and_ensure_builtin_are_idempotent` | `global()` + repeated `ensure_builtin()` | same registry; built-ins registered exactly once |
 | 3 | `register_custom_plugin_and_create_it` | custom factory registered at runtime | created by name; `name()` = custom plugin |
 | 4 | `unknown_plugin_is_an_error` | spec naming an unregistered plugin | `PluginError::UnknownPlugin` naming it |
@@ -297,6 +307,30 @@ parsing from `PLUGINS` JSON, and `load_prefilters` (zero/one/many specs
 | 6 | `plugin_spec_from_value_defaults_empty_params` | JSON object with/without `params` | name kept; missing `params` → empty object |
 | 7 | `load_prefilters_zero_one_many` | empty list / 1 spec / 2 specs | `None` / the single prefilter (unwrapped) / a `chain` prefilter |
 | 8 | `load_prefilters_propagates_errors` | a spec whose factory fails | the factory's error propagates |
+| 9 | `loaders_skip_specs_of_other_adapter_kinds` | mixed specs (`keyword` + `request_log`) | `load_prefilters` skips the logger spec (returns the `keyword` prefilter); `load_request_loggers` skips the prefilter spec (returns the `request_log` logger); a known non-logger plugin → no logger; unknown names are `UnknownPlugin` errors for both loaders; a second request-logger spec is `BadParams` |
+
+## 11. Request log plugin — `plugins/src/builtin/request_log.rs` (13)
+
+The built-in `request_log` plugin: a W3C Extended Log Format (XLF)
+request-log writer (`RequestLog` — lazy open, XLF escaping,
+size-based rotation — and its `PluginFactory`), plus the shared
+`format_utc` XLF datetime formatter in `plugins/src/api.rs`.
+
+| # | Test case | What it verifies | Expected result |
+|---|-----------|------------------|-----------------|
+| 1 | `header_and_record_format` | one record into a fresh file | 4 XLF header lines (`#Software: lpcache-plugins/…`, `#Version: 1.0`, `#Date-format: %Y-%m-%dT%H:%M:%S.%fZ`, `#Fields: …` in the declared order) followed by one space-separated record line in `#Fields` order |
+| 2 | `missing_fields_render_dash` | a record with `None` fields | `-` at each missing position |
+| 3 | `escaping_rules` | values with whitespace/quote/backslash; values starting with `-`/`"` | quoted, with `\`, `"`, CR and LF escaped; plain values unquoted |
+| 4 | `custom_fields_subset_and_order` | a `fields` subset in non-default order | `#Fields` and the record lines contain exactly those fields in that order |
+| 5 | `invalid_field_lists_are_rejected` | factory `fields` with an unknown name | factory `Err` |
+| 6 | `rotation_moves_generations_and_rewrites_header` | small `max_bytes`, many records | current file → `.1`, `.1` → `.2` (shifted); the fresh current file carries a new XLF header + the new record; the old records live in the generations |
+| 7 | `keep_bounds_retained_generations` | `keep` bound vs `keep=0` | generations beyond `keep` are dropped on rotation; `keep=0` keeps them all |
+| 8 | `rotation_disabled_when_max_bytes_zero` | `max_bytes=0`, 200 records | no `.1` file; one file with header + 200 record lines |
+| 9 | `prepare_creates_parent_dirs` | `prepare()` on a nested path | parent dirs + file created; re-running `prepare` keeps the existing file (no truncation, single header) |
+| 10 | `concurrent_writes_are_not_lost` | 8 threads × 50 records | all 400 records present; every record line has exactly the `#Fields` field count (no interleaved/corrupt lines) |
+| 11 | `factory_applies_params_and_defaults` | factory with JSON params (explicit / missing / invalid) | `path`/`max_bytes`/`keep` applied or defaulted (10 MiB / 5); unknown `fields` entry or blank `path` → `BadParams`; other adapters' factories return `None` for this spec |
+| 12 | `format_utc_millisecond_precision` | `format_utc` on epoch values | UTC `%Y-%m-%dT%H:%M:%S.%fZ` with millisecond precision (calendar boundaries exact) |
+| 13 | `perf_fields_render_dash_when_backend_reports_none` | a record with every performance field `None` (failure path / backend without `timings`) | all 8 `lpcache-*` performance fields render `-`; the other fields stay intact |
 
 ## Coverage notes
 
@@ -319,12 +353,40 @@ client-disconnect behaviour.
 | Concurrent-request coalescing (Rust-only feature) | 4 unit + 6 E2E coalesce tests |
 | Prefilter plugins (Rust-only feature) | 14 plugin unit tests (keyword 11, chain 3) + 8 E2E prefilter tests |
 | Result cache plugin (Rust-only feature) | 14 plugin unit + 5 E2E tests (4 result-cache + 1 blocklist-over-cache chain) |
-| Plugin system (`PLUGINS` env/flag, `lpcache-plugins` registry) | 5 `PLUGINS` config tests + 8 registry tests + 9 plugin `factory_*` tests; E2E state is built via `load_prefilters` |
+| Plugin system (`PLUGINS` env/flag, `lpcache-plugins` registry) | 5 `PLUGINS` config tests + 9 registry tests + 8 plugin `factory_*` tests; E2E state is built via `load_prefilters` / `load_request_loggers` |
+| Request log (`REQUEST_LOG*` env/flags or a `request_log` spec in `PLUGINS`, Rust-only feature) | 3 config tests + 13 plugin unit tests (section 11) + 5 E2E tests (`request_log_writes_xlf_record` — incl. the performance fields, `request_log_stream_request_counts_delivered_bytes`, `request_log_logs_failed_request_without_pipeline`, `request_log_rotates_and_bounds_keep`, `request_log_stream_writes_perf_fields`) |
 | KV cache save auto-retry (`SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS`, Rust-only feature) | `save_after_retries_until_success`, `save_after_retries_exhausted_propagates_error`, `save_after_retries_exhausted_500_returns_false`, `save_after_no_retry_when_retries_disabled` (unit), `save_retry_env_and_cli` (config) |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 
-**Suite health (2026-10-16).** 175/175 passing, clippy clean, ~4 s wall
+**Suite health (2026-10-19).** 197/197 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
+On 2026-10-19 the request log gained 8 performance XLF fields
+(`lpcache-prompt-tokens`, `lpcache-completion-tokens`,
+`lpcache-cached-tokens`, `lpcache-prefill-ms`, `lpcache-gen-ms`,
+`lpcache-prefill-tps`, `lpcache-gen-tps`, `lpcache-ttft-ms` — the
+backend's `usage`/`timings` plus the proxy-side time to first token): 1
+plugin unit test (`perf_fields_render_dash_when_backend_reports_none`)
+and 1 E2E test (`request_log_stream_writes_perf_fields`);
+`request_log_writes_xlf_record` now asserts the non-streaming perf
+fields too. The mock backend reports realistic `usage`/`timings` in its
+completions (its SSE stream gained a final chunk carrying them, so its
+streams have 4 chunks). On 2026-10-19 the configurable request log
+(the built-in `request_log`
+plugin: `REQUEST_LOG*` env vars + `--request-log*` flags, or a
+`request_log` spec in `PLUGINS`, which takes precedence) added 20 cases:
+3 config tests (`request_log_env_settings`,
+`request_log_spec_synthesized_when_enabled`,
+`request_log_spec_in_plugins_wins`), 1 registry loader test
+(`loaders_skip_specs_of_other_adapter_kinds`), 12 `request_log` plugin
+unit tests (new section 11) and 4 E2E tests
+(`request_log_writes_xlf_record`,
+`request_log_stream_request_counts_delivered_bytes`,
+`request_log_logs_failed_request_without_pipeline`,
+`request_log_rotates_and_bounds_keep`). The E2E request-log tests build
+state the same way `main.rs` does (`Config::with_request_log` →
+`load_request_loggers` → `prepare`); because they drive the router with
+`tower::Service::oneshot`, `c-ip` is `-` (no `ConnectInfo`) and
+in-process requests set an explicit `Content-Length` for `cs-bytes`.
 On 2026-10-16 the adapter modules (`src/prefilter.rs`,
 `src/result_cache.rs`, `src/llama_client.rs`) moved into the
 `lpcache-plugins` workspace library behind the `Prefilter` /

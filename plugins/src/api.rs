@@ -1,6 +1,6 @@
 //! Adapter API: the traits every lpcache plugin implements.
 //!
-//! Four adapter kinds exist:
+//! Five adapter kinds exist:
 //!
 //! - [`Prefilter`] — request prefilter, consulted **before** any slot
 //!   acquisition, KV-cache restore/save, or backend dispatch. Built-ins:
@@ -13,6 +13,9 @@
 //! - [`LlamaBackend`] — one llama.cpp backend (chat stream/JSON, slot
 //!   save/restore, model id); the built-in `llama` plugin provides the
 //!   reqwest-based [`crate::LlamaClient`].
+//! - [`RequestLogger`] — one W3C Extended Log Format (XLF) record per
+//!   finished request; the built-in `request_log` plugin writes the
+//!   records to a (size-rotated) log file.
 //!
 //! All traits are object-safe and used behind `Arc<dyn …>` in the proxy's
 //! `AppState`.
@@ -244,4 +247,147 @@ pub trait LlamaBackend: Send + Sync {
         body: &Value,
         slot_id: Option<usize>,
     ) -> Result<JsonChat, BackendError>;
+}
+
+// ---------------------------------------------------------------------------
+// RequestLogger
+// ---------------------------------------------------------------------------
+
+/// Format a unix timestamp as the request log's W3C-XLF datetime
+/// (`%Y-%m-%dT%H:%M:%S.%fZ` — UTC, millisecond precision; the `#Date-format`
+/// declared by the built-in `request_log` plugin).
+pub fn format_utc(secs: u64, nanos: u32) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Civil-from-days (Howard Hinnant's algorithm): days since 1970-01-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    let millis = nanos / 1_000_000;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// One finished HTTP request, rendered as a single W3C Extended Log Format
+/// (XLF) line by a [`RequestLogger`].
+///
+/// The W3C-style fields (`datetime`, `cs-method`, ...) describe the HTTP
+/// transaction; the `lpcache-*` fields carry the KV-cache pipeline's view
+/// of the request (filled in as far as the request got). `None` values
+/// render as `-` ("not available") in the log file.
+#[derive(Debug, Clone, Default)]
+pub struct RequestLogRecord {
+    // W3C XLF standard fields.
+    /// `datetime`: request completion timestamp (UTC,
+    /// `%Y-%m-%dT%H:%M:%S.%fZ`; see [`format_utc`]).
+    pub datetime: Option<String>,
+    /// `cs-method`: the HTTP method (`POST`, `GET`, ...).
+    pub method: Option<String>,
+    /// `cs-uri`: the request target (path + query string).
+    pub uri: Option<String>,
+    /// `c-ip`: the client address.
+    pub client_ip: Option<String>,
+    /// `cs(User-Agent)`: the `User-Agent` request header.
+    pub user_agent: Option<String>,
+    /// `cs-bytes`: the request body size in bytes (Content-Length; `-`
+    /// when the client did not announce one).
+    pub request_bytes: Option<u64>,
+    /// `cs-time`: request duration in seconds, until the response body is
+    /// complete (or the client went away early).
+    pub duration_secs: Option<f64>,
+    /// `sc-status`: the response status code.
+    pub status: Option<u16>,
+    /// `sc-bytes`: the response body size in bytes (the bytes actually
+    /// handed to the client).
+    pub response_bytes: Option<u64>,
+    // lpcache pipeline fields.
+    /// `lpcache-model`: the model the client asked for (the proxy model id
+    /// when the body has none).
+    pub model: Option<String>,
+    /// `lpcache-stream`: `true`/`false` once the request body was parsed.
+    pub stream: Option<bool>,
+    /// `lpcache-key`: the request's KV cache key (first 16 hex chars).
+    pub key: Option<String>,
+    /// `lpcache-n-words`: word count of the concatenated message contents.
+    pub n_words: Option<usize>,
+    /// `lpcache-is-big`: `true` when the request is cache-eligible
+    /// (more than `BIG_THRESHOLD_WORDS` words).
+    pub is_big: Option<bool>,
+    /// `lpcache-backend`: the backend index the request ran on.
+    pub backend: Option<usize>,
+    /// `lpcache-slot`: the slot id the request ran on.
+    pub slot: Option<usize>,
+    /// `lpcache-restored`: `true`/`false` when a KV cache restore was
+    /// attempted (missing = no restore attempted, e.g. small requests).
+    pub restored: Option<bool>,
+    /// `lpcache-cache-hit`: `true` when a prefilter served the request
+    /// (e.g. the result cache) without a backend call; `false` when a
+    /// prefilter ran and let the request through (missing = no prefilter).
+    pub cache_hit: Option<bool>,
+    /// `lpcache-coalesced`: `leader`/`follower` when concurrent-request
+    /// coalescing is enabled (missing = the request ran on its own).
+    pub coalesced: Option<&'static str>,
+    /// `lpcache-reason`: a short pipeline outcome for non-successful
+    /// requests (`slot_timeout`, `backend_unreachable`, `provider_http_*`,
+    /// `save_failed`, ...; missing = the request completed normally).
+    pub reason: Option<String>,
+    // lpcache performance fields (backend-reported token counts and
+    // timings; missing when the backend did not report them — failure
+    // paths, or backends that predate the `timings` object).
+    /// `lpcache-prompt-tokens`: the prompt token count
+    /// (`usage.prompt_tokens`).
+    pub prompt_tokens: Option<u64>,
+    /// `lpcache-completion-tokens`: the generated token count
+    /// (`usage.completion_tokens`).
+    pub completion_tokens: Option<u64>,
+    /// `lpcache-cached-tokens`: prompt tokens served from the backend's KV
+    /// cache (`usage.prompt_tokens_details.cached_tokens`, or
+    /// `timings.cache_n`) — the visible effect of a KV restore.
+    pub cached_tokens: Option<u64>,
+    /// `lpcache-prefill-ms`: backend prompt-processing time in
+    /// milliseconds (`timings.prompt_ms`).
+    pub prefill_ms: Option<f64>,
+    /// `lpcache-gen-ms`: backend generation time in milliseconds
+    /// (`timings.predicted_ms`).
+    pub gen_ms: Option<f64>,
+    /// `lpcache-prefill-tps`: backend prompt tokens per second
+    /// (`timings.prompt_per_second`).
+    pub prefill_tps: Option<f64>,
+    /// `lpcache-gen-tps`: backend generation tokens per second
+    /// (`timings.predicted_per_second`).
+    pub gen_tps: Option<f64>,
+    /// `lpcache-ttft-ms`: proxy-side time to first token in milliseconds —
+    /// from the start of stream processing until the first SSE chunk
+    /// received from the backend (streaming requests only).
+    pub ttft_ms: Option<f64>,
+}
+
+/// A request-log adapter: receives one [`RequestLogRecord`] per finished
+/// request and renders it — the built-in `request_log` plugin writes one
+/// XLF line per record to a file, rotating it when it reaches a max size
+/// (see the `builtin` module).
+///
+/// Implementations must be `Send + Sync` — they are shared across all
+/// requests behind an `Arc` (see `AppState::request_log` in the `lpcache`
+/// crate). Failures are logged by the proxy and swallowed: request logging
+/// never breaks request serving.
+pub trait RequestLogger: Send + Sync {
+    /// The plugin name (for diagnostics).
+    fn name(&self) -> &str;
+
+    /// Prepare the backing store (create the parent dir, open the current
+    /// file, write the XLF header for a new file). Called once at startup;
+    /// [`Self::log`] also works when `prepare` was never called (the file
+    /// is opened lazily).
+    fn prepare(&self) -> Result<(), String>;
+
+    /// Record one finished request.
+    fn log(&self, record: &RequestLogRecord) -> Result<(), String>;
 }

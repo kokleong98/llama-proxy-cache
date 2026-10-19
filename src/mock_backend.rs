@@ -247,6 +247,10 @@ async fn chat_handler(
                 .to_string(),
             "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n"
                 .to_string(),
+            // final chunk: empty choices + `usage`/`timings` (mirrors
+            // llama-server, which appends the stats to the last chunk)
+            "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":8}},\"timings\":{\"cache_n\":8,\"prompt_n\":10,\"prompt_ms\":25.0,\"prompt_per_token_ms\":2.5,\"prompt_per_second\":400.0,\"predicted_n\":5,\"predicted_ms\":15.0,\"predicted_per_token_ms\":3.0,\"predicted_per_second\":333.3}}\n\n"
+                .to_string(),
             "data: [DONE]\n\n".to_string(),
         ];
         let s = stream::iter(events).then(move |e| {
@@ -283,7 +287,25 @@ async fn chat_handler(
             "message": { "role": "assistant", "content": "mock reply" },
             "finish_reason": "stop"
         }],
-        "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "prompt_tokens_details": { "cached_tokens": 8 }
+        },
+        // llama-server appends the slot stats to every chat completion;
+        // fixed values keep the request-log perf assertions deterministic.
+        "timings": {
+            "cache_n": 8,
+            "prompt_n": 10,
+            "prompt_ms": 25.0,
+            "prompt_per_token_ms": 2.5,
+            "prompt_per_second": 400.0,
+            "predicted_n": 5,
+            "predicted_ms": 15.0,
+            "predicted_per_token_ms": 3.0,
+            "predicted_per_second": 333.3
+        }
     });
     let delay_ms = st.chat_body_delay_ms.load(Ordering::SeqCst);
     if delay_ms == 0 {

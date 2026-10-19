@@ -24,13 +24,16 @@
 //!
 //! - [`api`] — the adapter traits and shared types: [`Prefilter`] (request
 //!   prefilter), [`ResultStore`] (storage of fresh backend results),
-//!   [`PostCleanup`] (post-serve cleanup) and [`LlamaBackend`] (the
-//!   llama.cpp backend HTTP adapter).
+//!   [`PostCleanup`] (post-serve cleanup), [`LlamaBackend`] (the
+//!   llama.cpp backend HTTP adapter) and [`RequestLogger`] (per-request
+//!   log records, W3C-XLF style).
 //! - [`registry`] — `PluginSpec`, `PluginFactory`, the [`Registry`], the
 //!   process-wide [`global`] registry ([`ensure_builtin`] registers the
-//!   built-ins into it) and [`load_prefilters`].
+//!   built-ins into it) and the loaders ([`load_prefilters`],
+//!   [`load_request_loggers`]).
 //! - [`builtin`] — the built-in plugins: `keyword`, `chain`,
-//!   `result_cache` and `llama`, each with a JSON-parameter factory.
+//!   `result_cache`, `llama` and `request_log`, each with a
+//!   JSON-parameter factory.
 //!
 //! ## Writing a custom plugin
 //!
@@ -64,7 +67,12 @@ pub mod registry;
 
 pub use api::{
     BackendError, JsonChat, LlamaBackend, PostCleanup, Prefilter, PrefilterDecision,
-    PrefilterRequest, RestoreOutcome, ResultStore, StreamChat,
+    PrefilterRequest, RequestLogRecord, RequestLogger, RestoreOutcome, ResultStore, StreamChat,
+    format_utc,
 };
 pub use builtin::llama::LlamaClient;
-pub use registry::{PluginError, PluginSpec, Registry, ensure_builtin, global, load_prefilters};
+pub use builtin::request_log::RequestLog;
+pub use registry::{
+    PluginError, PluginSpec, Registry, ensure_builtin, global, load_prefilters,
+    load_request_loggers,
+};

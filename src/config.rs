@@ -41,10 +41,32 @@
 //! - `PLUGINS` (optional: a JSON array of plugin specs
 //!   `[{"name": "...", "params": {...}}, ...]` — the prefilter plugins to
 //!   load from the `lpcache-plugins` registry (built-ins: `keyword`,
-//!   `chain`, `result_cache`; custom plugin crates can register more).
+//!   `chain`, `result_cache`) plus, when present, the `request_log`
+//!   plugin (a spec in `PLUGINS` takes precedence over the `REQUEST_LOG`
+//!   settings). Custom plugin crates can register more.
 //!   When set, the specs are used as-is and the legacy `PREFILTER_*`
 //!   settings above are **ignored**; when unset, the specs are
 //!   synthesized from them (see [`Config::plugin_specs`])
+//! - `REQUEST_LOG` (`false`; when true, one W3C Extended Log Format (XLF)
+//!   record per finished request is appended to the file named by
+//!   `REQUEST_LOG_PATH` — the built-in `request_log` plugin)
+//! - `REQUEST_LOG_PATH` (`lpcache-request.log`; relative paths resolve
+//!   against the current working directory; the parent dir is created)
+//! - `REQUEST_LOG_MAX_BYTES` (10 MiB; the file is rotated when it grows
+//!   beyond this size — `<path>.1`, `<path>.2`, ...; `0` = no rotation)
+//! - `REQUEST_LOG_KEEP` (5; rotated generations retained, the oldest is
+//!   dropped; `0` = keep them all)
+//! - `REQUEST_LOG_FIELDS` (optional; comma-separated ordered subset of the
+//!   known XLF field names — W3C fields `datetime`, `cs-method`,
+//!   `cs-uri`, `c-ip`, `cs(User-Agent)`, `cs-bytes`, `cs-time`,
+//!   `sc-status`, `sc-bytes` plus lpcache pipeline fields `lpcache-model`,
+//!   `lpcache-stream`, `lpcache-key`, `lpcache-n-words`, `lpcache-is-big`,
+//!   `lpcache-backend`, `lpcache-slot`, `lpcache-restored`,
+//!   `lpcache-cache-hit`, `lpcache-coalesced`, `lpcache-reason` and
+//!   lpcache performance fields `lpcache-prompt-tokens`,
+//!   `lpcache-completion-tokens`, `lpcache-cached-tokens`,
+//!   `lpcache-prefill-ms`, `lpcache-gen-ms`, `lpcache-prefill-tps`,
+//!   `lpcache-gen-tps`, `lpcache-ttft-ms`; default: all of them)
 //! - `LOG_LEVEL` (`INFO`)
 //!
 //! Every variable can also be set with a command-line flag (see [`Cli`]);
@@ -80,6 +102,14 @@ pub const DEFAULT_SAVE_RETRIES: usize = 3;
 /// `SAVE_RETRY_DELAY_MS` default: delay in milliseconds between save retry
 /// attempts.
 pub const DEFAULT_SAVE_RETRY_DELAY_MS: u64 = 1000;
+/// `REQUEST_LOG_PATH` default: the request-log file location.
+pub const DEFAULT_REQUEST_LOG_PATH: &str = "lpcache-request.log";
+/// `REQUEST_LOG_MAX_BYTES` default: rotation threshold (10 MiB);
+/// `0` disables rotation.
+pub const DEFAULT_REQUEST_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// `REQUEST_LOG_KEEP` default: rotated generations retained (`0` keeps
+/// them all).
+pub const DEFAULT_REQUEST_LOG_KEEP: usize = 5;
 
 /// Crate version from `Cargo.toml`, reported by `-V` / `--version` and
 /// logged at startup in the `app_start` line.
@@ -157,6 +187,24 @@ pub struct Config {
     /// `SAVE_RETRY_DELAY_MS`: delay in milliseconds between save retry
     /// attempts.
     pub save_retry_delay_ms: u64,
+    /// `REQUEST_LOG`: when true, every finished request is recorded as one
+    /// W3C-XLF line in the request-log file (the built-in `request_log`
+    /// plugin; see the `lpcache-plugins` crate for the record format).
+    /// A `request_log` spec in `PLUGINS` is equivalent to enabling this
+    /// (and takes precedence over the `REQUEST_LOG_*` settings).
+    pub request_log_enabled: bool,
+    /// `REQUEST_LOG_PATH`: the request-log file location (relative paths
+    /// resolve against the current working directory).
+    pub request_log_path: PathBuf,
+    /// `REQUEST_LOG_MAX_BYTES`: the request-log rotation threshold in
+    /// bytes (`0` = no rotation).
+    pub request_log_max_bytes: u64,
+    /// `REQUEST_LOG_KEEP`: rotated log generations retained
+    /// (`0` = keep them all).
+    pub request_log_keep: usize,
+    /// `REQUEST_LOG_FIELDS`: ordered subset of XLF field names to emit
+    /// (empty = all known fields).
+    pub request_log_fields: Vec<String>,
 }
 
 /// Command-line options, one-to-one with the environment variables above.
@@ -205,6 +253,16 @@ pub struct Cli {
     pub save_retries: Option<String>,
     /// Maps to `SAVE_RETRY_DELAY_MS` (delay between save retry attempts).
     pub save_retry_delay_ms: Option<String>,
+    /// Maps to `REQUEST_LOG` (`true`/`false`, or `1`/`0`).
+    pub request_log: Option<String>,
+    /// Maps to `REQUEST_LOG_PATH` (the request-log file location).
+    pub request_log_path: Option<String>,
+    /// Maps to `REQUEST_LOG_MAX_BYTES` (rotation threshold; `0` = none).
+    pub request_log_max_bytes: Option<String>,
+    /// Maps to `REQUEST_LOG_KEEP` (rotated generations retained; `0` = all).
+    pub request_log_keep: Option<String>,
+    /// Maps to `REQUEST_LOG_FIELDS` (comma-separated field subset).
+    pub request_log_fields: Option<String>,
 }
 
 impl Config {
@@ -242,6 +300,11 @@ impl Config {
             prefilter_result_cache_ttl_secs: DEFAULT_PREFILTER_RESULT_CACHE_TTL_SECS,
             save_retries: DEFAULT_SAVE_RETRIES,
             save_retry_delay_ms: DEFAULT_SAVE_RETRY_DELAY_MS,
+            request_log_enabled: false,
+            request_log_path: PathBuf::from(DEFAULT_REQUEST_LOG_PATH),
+            request_log_max_bytes: DEFAULT_REQUEST_LOG_MAX_BYTES,
+            request_log_keep: DEFAULT_REQUEST_LOG_KEEP,
+            request_log_fields: Vec::new(),
         }
     }
 
@@ -300,6 +363,24 @@ impl Config {
         self
     }
 
+    /// Enable the request log (`REQUEST_LOG`) with the given file settings
+    /// (`fields` is an ordered subset of the known XLF field names;
+    /// `None` = all of them).
+    pub fn with_request_log(
+        mut self,
+        path: PathBuf,
+        max_bytes: u64,
+        keep: usize,
+        fields: Option<Vec<String>>,
+    ) -> Self {
+        self.request_log_enabled = true;
+        self.request_log_path = path;
+        self.request_log_max_bytes = max_bytes;
+        self.request_log_keep = keep;
+        self.request_log_fields = fields.unwrap_or_default();
+        self
+    }
+
     /// The prefilter plugin specs to load from the `lpcache-plugins`
     /// registry, in evaluation order:
     /// - when `PLUGINS` is set, its JSON array is parsed and used as-is
@@ -310,18 +391,24 @@ impl Config {
     ///   (blocklist first: a blocked request is rejected with `400` before
     ///   a cache hit could serve it).
     ///
-    /// An empty list means no prefilter (the default). `Err` when
-    /// `PLUGINS` is set but is not a JSON array of spec objects
-    /// (`{"name": "...", "params": {...}}`).
+    /// When `REQUEST_LOG` is enabled and the list does not already contain
+    /// a `request_log` spec, one is appended (a spec in `PLUGINS` always
+    /// wins: its params are used as-is).
+    ///
+    /// An empty list means no prefilter and no request logging (the
+    /// default). `Err` when `PLUGINS` is set but is not a JSON array of
+    /// spec objects (`{"name": "...", "params": {...}}`).
     pub fn plugin_specs(&self) -> Result<Vec<lpcache_plugins::PluginSpec>, String> {
         use lpcache_plugins::PluginSpec;
-        if let Some(raw) = self.plugins.as_deref().filter(|v| !v.trim().is_empty()) {
+        let mut specs: Vec<PluginSpec> = if let Some(raw) =
+            self.plugins.as_deref().filter(|v| !v.trim().is_empty())
+        {
             let arr: Vec<serde_json::Value> =
                 serde_json::from_str(raw).map_err(|e| format!("PLUGINS is not valid JSON: {e}"))?;
             arr.into_iter()
                 .enumerate()
                 .map(|(i, v)| PluginSpec::try_from(&v).map_err(|e| format!("PLUGINS[{i}]: {e}")))
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             let mut specs = Vec::new();
             if !self.prefilter_blocklist.is_empty() {
@@ -342,8 +429,28 @@ impl Config {
                     }),
                 ));
             }
-            Ok(specs)
+            specs
+        };
+        if self.request_log_enabled && !specs.iter().any(|s| s.name == "request_log") {
+            specs.push(self.request_log_spec());
         }
+        Ok(specs)
+    }
+
+    /// The `request_log` plugin spec synthesized from the `REQUEST_LOG_*`
+    /// settings (used by [`Config::plugin_specs`] when `REQUEST_LOG` is
+    /// enabled and `PLUGINS` has no `request_log` spec).
+    fn request_log_spec(&self) -> lpcache_plugins::PluginSpec {
+        use lpcache_plugins::PluginSpec;
+        let mut params = serde_json::json!({
+            "path": self.request_log_path.to_string_lossy(),
+            "max_bytes": self.request_log_max_bytes,
+            "keep": self.request_log_keep,
+        });
+        if !self.request_log_fields.is_empty() {
+            params["fields"] = serde_json::json!(self.request_log_fields);
+        }
+        PluginSpec::new("request_log", params)
     }
 
     /// `--slot-save-path` directories known to the proxy, used to remove
@@ -469,6 +576,28 @@ impl Config {
                 "SAVE_RETRY_DELAY_MS",
                 DEFAULT_SAVE_RETRY_DELAY_MS as usize,
             ) as u64,
+            request_log_enabled: env_bool(vars, "REQUEST_LOG", false),
+            request_log_path: vars
+                .get("REQUEST_LOG_PATH")
+                .map(|raw| raw.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_REQUEST_LOG_PATH)),
+            request_log_max_bytes: env_int(
+                vars,
+                "REQUEST_LOG_MAX_BYTES",
+                DEFAULT_REQUEST_LOG_MAX_BYTES as usize,
+            ) as u64,
+            request_log_keep: env_int(vars, "REQUEST_LOG_KEEP", DEFAULT_REQUEST_LOG_KEEP),
+            request_log_fields: vars
+                .get("REQUEST_LOG_FIELDS")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|f| f.trim().to_string())
+                        .filter(|f| !f.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -620,6 +749,11 @@ impl Cli {
                 "--prefilter-result-cache-ttl" => cli.prefilter_result_cache_ttl = Some(value),
                 "--save-retries" => cli.save_retries = Some(value),
                 "--save-retry-delay-ms" => cli.save_retry_delay_ms = Some(value),
+                "--request-log" => cli.request_log = Some(value),
+                "--request-log-path" => cli.request_log_path = Some(value),
+                "--request-log-max-bytes" => cli.request_log_max_bytes = Some(value),
+                "--request-log-keep" => cli.request_log_keep = Some(value),
+                "--request-log-fields" => cli.request_log_fields = Some(value),
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -658,6 +792,11 @@ Options:
   --prefilter-result-cache-ttl <SECS>  PREFILTER_RESULT_CACHE_TTL  cached-result expiry in seconds (default 300, 0 = never)
   --save-retries <N>            SAVE_RETRIES         retries after a failed KV cache save (backend 500 or other error) (default 3, 0 = no retry)
   --save-retry-delay-ms <MS>    SAVE_RETRY_DELAY_MS  delay in milliseconds between save retry attempts (default 1000)
+  --request-log <BOOL>          REQUEST_LOG          write one W3C-XLF record per finished request to the request-log file (default false)
+  --request-log-path <PATH>     REQUEST_LOG_PATH     request-log file location; relative paths resolve against the CWD (default lpcache-request.log)
+  --request-log-max-bytes <N>   REQUEST_LOG_MAX_BYTES rotation threshold in bytes; the file is rotated when exceeded (default 10 MiB, 0 = no rotation)
+  --request-log-keep <N>        REQUEST_LOG_KEEP     rotated generations retained (default 5, 0 = keep all)
+  --request-log-fields <LIST>   REQUEST_LOG_FIELDS   comma-separated ordered subset of XLF field names (default: all fields)
   -V, --version                 show version and exit
   -h, --help                    show this help and exit
 
@@ -684,6 +823,14 @@ Notes:
     served from the cache; PREFILTER_RESULT_CACHE_TTL is the per-entry
     expiry in seconds (0 = never); when both PREFILTER_BLOCKLIST and the
     result cache are set, the blocklist runs first (reject wins over serve)
+  * REQUEST_LOG=1 enables the built-in request_log plugin: each finished
+    request (success, error, 400 block, abort or disconnect) appends one
+    W3C-XLF record (header + space-separated values, missing values as -)
+    to REQUEST_LOG_PATH; the file is size-rotated at REQUEST_LOG_MAX_BYTES
+    (current becomes .1, older generations shift up, REQUEST_LOG_KEEP
+    retained); REQUEST_LOG_FIELDS selects an ordered subset of fields
+    (defaults to all W3C + lpcache-* pipeline fields); a request_log spec
+    in PLUGINS takes precedence over the REQUEST_LOG_* settings
   * the backend should be started with matching llama-server flags:
     -np/--parallel (N_SLOTS), --api-key (LLAMA_API_KEY) and a
     --slot-save-path directory (SLOT_SAVE_PATH)
@@ -729,6 +876,11 @@ Notes:
             ),
             ("SAVE_RETRIES", &self.save_retries),
             ("SAVE_RETRY_DELAY_MS", &self.save_retry_delay_ms),
+            ("REQUEST_LOG", &self.request_log),
+            ("REQUEST_LOG_PATH", &self.request_log_path),
+            ("REQUEST_LOG_MAX_BYTES", &self.request_log_max_bytes),
+            ("REQUEST_LOG_KEEP", &self.request_log_keep),
+            ("REQUEST_LOG_FIELDS", &self.request_log_fields),
         ];
         for (env_name, value) in opts {
             if let Some(v) = value {
@@ -748,6 +900,20 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// A minimal `Config` (all defaults) for exercising the builder methods.
+    fn base_cfg() -> Config {
+        Config::new(
+            vec![],
+            100,
+            500,
+            0.1,
+            std::path::PathBuf::from("kv_meta"),
+            std::time::Duration::from_secs(600),
+            "llama.cpp".to_string(),
+            8081,
+        )
     }
 
     #[test]
@@ -772,6 +938,11 @@ mod tests {
         assert!(c.prefilter_blocklist.is_empty());
         assert_eq!(c.save_retries, DEFAULT_SAVE_RETRIES);
         assert_eq!(c.save_retry_delay_ms, DEFAULT_SAVE_RETRY_DELAY_MS);
+        assert!(!c.request_log_enabled);
+        assert_eq!(c.request_log_path, PathBuf::from(DEFAULT_REQUEST_LOG_PATH));
+        assert_eq!(c.request_log_max_bytes, DEFAULT_REQUEST_LOG_MAX_BYTES);
+        assert_eq!(c.request_log_keep, DEFAULT_REQUEST_LOG_KEEP);
+        assert!(c.request_log_fields.is_empty());
     }
 
     #[test]
@@ -1474,5 +1645,82 @@ mod tests {
         assert_eq!(Config::from_cli(&cli).port, 1234);
         let empty = Cli::default();
         assert_eq!(Config::from_cli(&empty).port, Config::from_env().port);
+    }
+
+    #[test]
+    fn request_log_env_settings() {
+        let c = Config::from_env_map(&vars(&[
+            ("REQUEST_LOG", "true"),
+            ("REQUEST_LOG_PATH", " logs/req.log "),
+            ("REQUEST_LOG_MAX_BYTES", "12345"),
+            ("REQUEST_LOG_KEEP", "7"),
+            (
+                "REQUEST_LOG_FIELDS",
+                " cs-method , sc-status ,, lpcache-key ",
+            ),
+        ]));
+        assert!(c.request_log_enabled);
+        assert_eq!(c.request_log_path.to_string_lossy(), "logs/req.log");
+        assert_eq!(c.request_log_max_bytes, 12345);
+        assert_eq!(c.request_log_keep, 7);
+        assert_eq!(
+            c.request_log_fields,
+            vec!["cs-method", "sc-status", "lpcache-key"]
+        );
+        // Invalid values fall back to the defaults with a warning.
+        let c = Config::from_env_map(&vars(&[
+            ("REQUEST_LOG", "maybe"),
+            ("REQUEST_LOG_MAX_BYTES", "oops"),
+            ("REQUEST_LOG_KEEP", "2.5"),
+        ]));
+        assert!(!c.request_log_enabled);
+        assert_eq!(c.request_log_max_bytes, DEFAULT_REQUEST_LOG_MAX_BYTES);
+        assert_eq!(c.request_log_keep, DEFAULT_REQUEST_LOG_KEEP);
+        assert_eq!(c.request_log_path, PathBuf::from(DEFAULT_REQUEST_LOG_PATH));
+        assert!(c.request_log_fields.is_empty());
+    }
+
+    #[test]
+    fn request_log_spec_synthesized_when_enabled() {
+        let c = base_cfg()
+            .with_request_log(
+                PathBuf::from("/var/log/lpcache/req.log"),
+                1000,
+                2,
+                Some(vec!["cs-method".to_string()]),
+            )
+            .with_prefilter_blocklist(vec!["foo".to_string()]);
+        let specs = c.plugin_specs().unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "keyword");
+        let log = &specs[1];
+        assert_eq!(log.name, "request_log");
+        assert_eq!(log.params["path"], "/var/log/lpcache/req.log");
+        assert_eq!(log.params["max_bytes"], 1000);
+        assert_eq!(log.params["keep"], 2);
+        assert_eq!(log.params["fields"], serde_json::json!(["cs-method"]));
+        // Disabled by default: no spec at all (and no legacy plugins here).
+        assert!(base_cfg().plugin_specs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_log_spec_in_plugins_wins() {
+        let explicit = r#"[{"name": "request_log", "params": {"path": "/explicit/req.log"}}]"#;
+        // A request_log spec in PLUGINS takes precedence: the synthesized
+        // one (from the enabled REQUEST_LOG_* settings) is not appended.
+        let c = base_cfg()
+            .with_plugins(Some(explicit.to_string()))
+            .with_request_log(PathBuf::from("/synthesized/req.log"), 1000, 2, None);
+        let specs = c.plugin_specs().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "request_log");
+        assert_eq!(specs[0].params["path"], "/explicit/req.log");
+        // A request_log spec in PLUGINS is loaded on its own (the
+        // REQUEST_LOG* settings stay at their defaults).
+        let c = base_cfg().with_plugins(Some(explicit.to_string()));
+        assert!(!c.request_log_enabled);
+        let specs = c.plugin_specs().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(specs.iter().any(|s| s.name == "request_log"));
     }
 }

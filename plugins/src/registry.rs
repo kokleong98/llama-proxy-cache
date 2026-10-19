@@ -8,7 +8,8 @@
 //! by compile-time wiring in the main module.
 //!
 //! A registry maps plugin names to [`PluginFactory`]s. The built-in
-//! plugins (`keyword`, `chain`, `result_cache`, `llama`) are registered by
+//! plugins (`keyword`, `chain`, `result_cache`, `llama`, `request_log`)
+//! are registered by
 //! [`ensure_builtin`] (process-wide [`global`] registry) or
 //! [`Registry::with_builtins`] (private registry). Custom plugin crates
 //! register their own factories under new names — in the global registry
@@ -28,7 +29,7 @@
 //! assert_eq!(prefilter.name(), "keyword");
 //! ```
 
-use crate::api::{LlamaBackend, Prefilter};
+use crate::api::{LlamaBackend, Prefilter, RequestLogger};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -123,6 +124,16 @@ pub trait PluginFactory: Send + Sync {
         let _ = params;
         Ok(None)
     }
+
+    /// Build a request logger, or `Ok(None)` when this plugin does not
+    /// provide one.
+    fn create_request_logger(
+        &self,
+        params: &Value,
+    ) -> Result<Option<Arc<dyn RequestLogger>>, PluginError> {
+        let _ = params;
+        Ok(None)
+    }
 }
 
 /// A name → factory registry. Clones are cheap (shared map) and may be
@@ -166,6 +177,16 @@ impl Registry {
             .lock()
             .expect("plugin registry poisoned")
             .contains_key(name)
+    }
+
+    /// The factory registered under `name` (the loaders use this to tell
+    /// "not this adapter kind" — `Ok(None)` — apart from "unknown plugin").
+    pub fn factory(&self, name: &str) -> Option<Arc<dyn PluginFactory>> {
+        self.factories
+            .lock()
+            .expect("plugin registry poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// Registered plugin names, sorted.
@@ -214,6 +235,27 @@ impl Registry {
                 kind: "backend",
             })
     }
+
+    /// Instantiate the spec's plugin as a request logger.
+    ///
+    /// Returns `Ok(None)` when the plugin is registered but does not
+    /// provide a request logger (a request-logger spec mixed into a
+    /// prefilter list, or vice versa — the loaders skip such specs);
+    /// `Err(PluginError::UnknownPlugin)` when no plugin is registered
+    /// under the spec's name at all.
+    pub fn create_request_logger(
+        &self,
+        spec: &PluginSpec,
+    ) -> Result<Option<Arc<dyn RequestLogger>>, PluginError> {
+        let factory = self
+            .factories
+            .lock()
+            .expect("plugin registry poisoned")
+            .get(&spec.name)
+            .cloned()
+            .ok_or_else(|| PluginError::UnknownPlugin(spec.name.clone()))?;
+        factory.create_request_logger(&spec.params)
+    }
 }
 
 /// The process-wide registry (the `lpcache` binary loads plugins from it).
@@ -236,6 +278,10 @@ pub fn ensure_builtin() {
 /// - several → a `ChainPrefilter` running them in order (the first
 ///   non-`Accept` decision wins).
 ///
+/// The `PLUGINS` list may also contain specs for other adapter kinds
+/// (e.g. `request_log`); those are skipped here, and only unknown plugin
+/// names are an error.
+///
 /// This is the main module's entry point for dynamically loading the
 /// request-prefilter pipeline from configuration.
 pub fn load_prefilters(
@@ -245,16 +291,53 @@ pub fn load_prefilters(
     if specs.is_empty() {
         return Ok(None);
     }
-    let filters = specs
-        .iter()
-        .map(|spec| registry.create_prefilter(spec))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut filters: Vec<Arc<dyn Prefilter>> = Vec::new();
+    for spec in specs {
+        let factory = registry
+            .factory(&spec.name)
+            .ok_or_else(|| PluginError::UnknownPlugin(spec.name.clone()))?;
+        // Specs for other adapter kinds (e.g. request_log) return None —
+        // skip.
+        if let Some(filter) = factory.create_prefilter(&spec.params)? {
+            filters.push(filter);
+        }
+    }
     Ok(match filters.len() {
+        0 => None,
         1 => Some(filters.into_iter().next().expect("one filter")),
         _ => Some(Arc::new(crate::builtin::chain::ChainPrefilter::new(
             filters,
         ))),
     })
+}
+
+/// Load the request-logger plugin from `specs`: the first spec whose
+/// plugin provides a request logger (zero specs of that kind → `Ok(None)`
+/// = request logging disabled). Specs for other adapter kinds are skipped;
+/// an unknown plugin name is an error, as is a second request-logger spec.
+pub fn load_request_loggers(
+    registry: &Registry,
+    specs: &[PluginSpec],
+) -> Result<Option<Arc<dyn RequestLogger>>, PluginError> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut logger: Option<Arc<dyn RequestLogger>> = None;
+    for spec in specs {
+        // Specs for other adapter kinds (e.g. a prefilter) return None —
+        // skip.
+        let Some(l) = registry.create_request_logger(spec)? else {
+            continue;
+        };
+        if logger.is_some() {
+            return Err(PluginError::BadParams {
+                name: spec.name.clone(),
+                message: "only one request logger plugin is supported".to_string(),
+            });
+        }
+        logger = Some(l);
+    }
+    Ok(logger)
 }
 
 #[cfg(test)]
@@ -269,6 +352,17 @@ mod tests {
         }
     }
 
+    /// `Result::expect` needs `T: Debug`; `dyn RequestLogger` is not
+    /// `Debug`, so match instead.
+    fn logger_of(
+        r: Result<Option<Arc<dyn RequestLogger>>, PluginError>,
+    ) -> Option<Arc<dyn RequestLogger>> {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("expected Ok: {e}"),
+        }
+    }
+
     #[test]
     fn with_builtins_registers_all_builtin_plugins() {
         let reg = Registry::with_builtins();
@@ -278,11 +372,53 @@ mod tests {
                 "chain".to_string(),
                 "keyword".to_string(),
                 "llama".to_string(),
+                "request_log".to_string(),
                 "result_cache".to_string()
             ]
         );
         assert!(reg.is_registered("keyword"));
         assert!(!reg.is_registered("nope"));
+    }
+
+    #[test]
+    fn loaders_skip_specs_of_other_adapter_kinds() {
+        let reg = Registry::with_builtins();
+        let specs = vec![
+            keyword_spec("a"),
+            PluginSpec::new(
+                "request_log",
+                json!({ "path": "req.log", "max_bytes": 0, "keep": 0 }),
+            ),
+        ];
+        // load_prefilters skips the request-logger spec,
+        let prefilter = load_prefilters(&reg, &specs).unwrap().expect("prefilter");
+        assert_eq!(prefilter.name(), "keyword");
+        // load_request_loggers skips the prefilter spec,
+        let Some(logger) = logger_of(load_request_loggers(&reg, &specs)) else {
+            panic!("expected a logger");
+        };
+        assert_eq!(logger.name(), "request_log");
+        // a known non-logger plugin is skipped (no logger at all),
+        assert!(logger_of(load_request_loggers(&reg, &[keyword_spec("a")])).is_none());
+        // unknown names are errors for both loaders,
+        let unknown = PluginSpec {
+            name: "nope".to_string(),
+            params: Value::Object(Default::default()),
+        };
+        assert!(matches!(
+            load_request_loggers(&reg, std::slice::from_ref(&unknown)),
+            Err(PluginError::UnknownPlugin(_))
+        ));
+        assert!(matches!(
+            load_prefilters(&reg, &[unknown]),
+            Err(PluginError::UnknownPlugin(_))
+        ));
+        // a second request-logger spec is an error,
+        let err = match load_request_loggers(&reg, &[specs[1].clone(), specs[1].clone()]) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, PluginError::BadParams { .. }));
     }
 
     #[test]

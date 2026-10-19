@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "lpcache"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "KV-cache aware OpenAI-compatible proxy for llama.cpp"
 license = "MIT"

@@ -64,6 +64,10 @@ full prefill cost every time.
    the configured `--slot-save-path` directories. `META_MAX=0` disables
    pruning. A later restore of a pruned key simply fails and falls back to
    a full prefill.
+8. **Request log** (optional) — when `REQUEST_LOG` is enabled, every
+   finished request (including failed ones) becomes one W3C Extended Log
+   Format (XLF) record appended to a size-rotated file — see [Request
+   log](#request-log).
 
 ## Stack
 
@@ -91,7 +95,12 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `LOG_LEVEL`         | `INFO`              | log level (`RUST_LOG` overrides it)            |
 | `STREAM_QUEUE_SIZE` | `16`                | per-request SSE channel capacity (must be >= 1) |
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
-| `PLUGINS` | —                 | JSON **array** of prefilter plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `result_cache`, `chain`; specs are chained in list order (empty array = no prefilter); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs (when set, `PLUGINS` takes precedence over them) |
+| `PLUGINS` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter) and `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables below); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent prefilter specs (when set, `PLUGINS` takes precedence over them) |
+| `REQUEST_LOG` | `false` | when true, one W3C-XLF record per finished request is appended to the request-log file (the built-in `request_log` plugin) |
+| `REQUEST_LOG_PATH` | `lpcache-request.log` | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
+| `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB) | rotation threshold in bytes; the file is rotated when exceeded (`<path>.1`, `<path>.2`, …); `0` = no rotation |
+| `REQUEST_LOG_KEEP` | `5` | rotated generations retained (the oldest is dropped); `0` = keep them all |
+| `REQUEST_LOG_FIELDS` | all 28 fields | comma-separated ordered subset of the known XLF field names (W3C fields + `lpcache-*` pipeline/performance fields — see [Request log](#request-log)) |
 | `PREFILTER_BLOCKLIST` | —                 | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; requests whose message contents contain any are rejected with `400` before the backend (default: no prefilter) |
 | `PREFILTER_CASE_INSENSITIVE` | `true`     | **legacy**: keyword matching is case-insensitive           |
 | `PREFILTER_RESULT_CACHE_DIR` | —          | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): cache-result path (`{key}.json` per cache key); fresh same-key requests are answered from the cached backend result before the backend (default: disabled) |
@@ -106,6 +115,11 @@ Every variable is also available as a command-line flag (see
 `--model-id`, `--port`, `--api-key` (→ `LLAMA_API_KEY`), `--log-level`,
 `--stream-queue-size`,
 `--coalesce-requests`, `--plugins` (→ `PLUGINS`),
+`--request-log` (→ `REQUEST_LOG`),
+`--request-log-path` (→ `REQUEST_LOG_PATH`),
+`--request-log-max-bytes` (→ `REQUEST_LOG_MAX_BYTES`),
+`--request-log-keep` (→ `REQUEST_LOG_KEEP`),
+`--request-log-fields` (→ `REQUEST_LOG_FIELDS`),
 `--prefilter-blocklist` (→ `PREFILTER_BLOCKLIST`, legacy),
 `--prefilter-case-insensitive` (→ `PREFILTER_CASE_INSENSITIVE`, legacy),
 `--prefilter-result-cache-dir` (→ `PREFILTER_RESULT_CACHE_DIR`, legacy),
@@ -120,6 +134,68 @@ precedence over the built-in defaults:
 ```bash
 ./target/release/lpcache --llama-url http://127.0.0.1:8000 --n-slots 1 \
   --port 8081 --meta-dir ./kv_meta --log-level INFO
+```
+
+## Request log
+
+When `REQUEST_LOG=true` — or a `request_log` spec is listed in `PLUGINS`
+(which takes precedence) — the built-in `request_log` plugin appends one
+[W3C Extended Log Format (XLF)](https://www.w3.org/TR/xlf-10/) record per
+**finished** request to `REQUEST_LOG_PATH`: successes, errors, and client
+disconnects (the record is written when the response body completes or is
+dropped). The file starts with:
+
+```text
+#Software: lpcache-plugins/<version>
+#Version: 1.0
+#Date-format: %Y-%m-%dT%H:%M:%S.%fZ
+#Fields: datetime cs-method cs-uri ... lpcache-reason
+```
+
+Default fields (W3C fields first, then lpcache pipeline fields, then
+lpcache performance fields — `REQUEST_LOG_FIELDS` selects an ordered
+subset): `datetime`, `cs-method`, `cs-uri`, `c-ip`, `cs(User-Agent)`,
+`cs-bytes`, `cs-time`, `sc-status`, `sc-bytes`, `lpcache-model`,
+`lpcache-stream`, `lpcache-key`, `lpcache-n-words`, `lpcache-is-big`,
+`lpcache-backend`, `lpcache-slot`, `lpcache-restored`,
+`lpcache-cache-hit`, `lpcache-coalesced`, `lpcache-reason`,
+`lpcache-prompt-tokens`, `lpcache-completion-tokens`,
+`lpcache-cached-tokens`, `lpcache-prefill-ms`, `lpcache-gen-ms`,
+`lpcache-prefill-tps`, `lpcache-gen-tps`, `lpcache-ttft-ms`.
+
+- Missing values render as `-` (XLF "not available"); values containing
+  whitespace, a quote, or a backslash — or starting with `-`/`"` — are
+  quoted and escaped per XLF.
+- **Performance fields**: `lpcache-prompt-tokens` /
+  `lpcache-completion-tokens` / `lpcache-cached-tokens` come from the
+  backend's `usage` (the last one is the prompt tokens served from the
+  backend's KV cache — the per-request effect of a restore);
+  `lpcache-prefill-ms`, `lpcache-gen-ms`, `lpcache-prefill-tps` and
+  `lpcache-gen-tps` come from the `timings` object llama.cpp appends to
+  every chat completion (backend-side prefill/generation time and
+  throughput). `lpcache-ttft-ms` is measured by the proxy (streaming
+  only): time from stream start to the first SSE chunk. All of them
+  render `-` when the backend did not report them (failure paths,
+  non-chat requests, backends without `timings`).
+- **Rotation**: when the file grows beyond `REQUEST_LOG_MAX_BYTES` it is
+  renamed to `<path>.1`, older generations shift upward (`<path>.2`,
+  …), and at most `REQUEST_LOG_KEEP` generations are retained (the oldest
+  is dropped). `max_bytes=0` disables rotation; `keep=0` keeps all
+  generations. The fresh current file starts with a new XLF header.
+- Request-log I/O failures are logged and swallowed — logging never breaks
+  request serving.
+- `lpcache-reason` is `-` on success, otherwise a short pipeline outcome:
+  `prefilter_reject`, `slot_timeout`, `backend_unreachable`,
+  `backend_error`, `provider_http_<status>`, `provider_non_object`,
+  `coalesce_leader_failed`, `save_failed`.
+- Caveats: `c-ip` is only populated when the proxy is served over a real
+  socket (Axum `ConnectInfo`); `cs-bytes` is taken from the request's
+  `Content-Length` header, so chunked requests without one log `-`.
+
+```bash
+BACKENDS='[{"url":"http://127.0.0.1:8000","n_slots":4}]' \
+  REQUEST_LOG=true REQUEST_LOG_PATH=/var/log/lpcache/req.log \
+  REQUEST_LOG_MAX_BYTES=10485760 REQUEST_LOG_KEEP=5 ./target/release/lpcache
 ```
 
 ## Build & run

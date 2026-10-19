@@ -13,10 +13,12 @@ use lpcache::app::{AppState, router};
 use lpcache::coalesce::SingleFlight;
 use lpcache::config::{Cli, Config};
 use lpcache::plugins::{
-    LlamaBackend, PluginSpec, Prefilter, ResultStore, ensure_builtin, global, load_prefilters,
+    LlamaBackend, PluginSpec, Prefilter, RequestLogger, ResultStore, ensure_builtin, global,
+    load_prefilters, load_request_loggers,
 };
 use lpcache::slot_manager::SlotManager;
 use serde_json::json;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Plugin name of the built-in llama.cpp backend client (instantiated once
@@ -103,6 +105,25 @@ async fn main() {
         );
     }
 
+    // The optional request-log plugin (a `request_log` spec in `PLUGINS`, or
+    // the one synthesized from the `REQUEST_LOG*` settings when `REQUEST_LOG`
+    // is set): when present, every request is appended as one W3C XLF record
+    // when its response completes. A bad spec is a startup error.
+    let request_log: Option<Arc<dyn RequestLogger>> = match load_request_loggers(registry, &specs) {
+        Ok(log) => log,
+        Err(e) => {
+            eprintln!("lpcache: failed to load request-log plugin: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(rlog) = &request_log {
+        if let Err(e) = rlog.prepare() {
+            eprintln!("lpcache: failed to prepare request log: {e}");
+            std::process::exit(2);
+        }
+        tracing::info!("request logging enabled: {}", rlog.name());
+    }
+
     let port = config.port;
     // One backend client per `BACKENDS` entry, instantiated through the
     // plugin registry by the built-in `llama` plugin with the per-backend
@@ -136,6 +157,7 @@ async fn main() {
         sf: Arc::new(SingleFlight::new()),
         prefilter,
         result_store,
+        request_log,
     };
 
     // Warn early if a configured --slot-save-path dir is missing: pruning
@@ -182,7 +204,9 @@ async fn main() {
         });
     }
 
-    let app = router(state);
+    // `into_make_service_with_connect_info` so the request log's `c-ip`
+    // field is populated with the client address.
+    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
     let _ = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
