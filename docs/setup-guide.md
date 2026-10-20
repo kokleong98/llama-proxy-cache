@@ -26,7 +26,7 @@ client (OpenAI API)                llama.cpp backend(s)
 | Rust (stable)          | `rustup` toolchain; `cargo` in `PATH`. Recent stable recommended.    |
 | llama.cpp server       | A build with **slot save/restore** support (the `--slot-save-path` flag and `POST /slots/{id}?action=save\|restore` endpoint). A recent release build is fine. |
 | A GGUF model           | e.g. `model.gguf` in a directory the server can read.               |
-| Ports                  | One port per llama.cpp server (default `8000`), one for the proxy (default `8081`). |
+| Ports                  | One port per llama.cpp server (llama.cpp's own default is `8080`), one for the proxy (default `8081`). |
 
 Check your llama.cpp build supports slot save/restore:
 
@@ -53,7 +53,7 @@ Optional quality gate (CI-style):
 ```bash
 cargo fmt --check
 cargo clippy --all-targets
-cargo test
+cargo test --workspace
 ```
 
 ---
@@ -156,7 +156,7 @@ Expected startup logs:
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
 slot_manager n_backends=2 total_slots=2
-app_start version=0.2.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
+app_start version=0.5.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
 
@@ -180,11 +180,18 @@ listening on 0.0.0.0:8081
 | `STREAM_QUEUE_SIZE`   | `16`                       | capacity of the per-request SSE channel that buffers streamed bytes between the background reader and the HTTP response (must be >= 1; smaller values backpressure the backend faster) |
 | `COALESCE_REQUESTS`   | `false`                    | group concurrent same-cache-key requests into one backend call (Rust-only) |
 | `LLAMA_API_KEY`       | —                          | sent to the backend as `Authorization: Bearer <key>` (llama-server `--api-key`); unset = no auth |
-| `PLUGINS`             | —                          | JSON **array** of prefilter plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `result_cache`, `chain`; specs are chained in list order (empty array = no prefilter). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
+| `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter) and `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
 | `PREFILTER_BLOCKLIST` | —                          | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
 | `PREFILTER_CASE_INSENSITIVE` | `true`              | **legacy**: keyword matching is case-insensitive (set `false` for exact-case) |
 | `PREFILTER_RESULT_CACHE_DIR` | —                   | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): the **cache-result path**; when set, fresh same-key non-streaming requests are answered from a cached backend result (`{dir}/{key}.json`) before any slot/backend work — streaming requests always bypass the cache; unset/blank = disabled |
 | `PREFILTER_RESULT_CACHE_TTL` | `300`               | per-entry result-cache expiry in seconds (`0` = entries never expire) |
+| `SAVE_RETRIES`          | `3`                        | retries after a failed KV cache save (backend 500 or other error); `0` = no retry |
+| `SAVE_RETRY_DELAY_MS`   | `1000` (ms)                | delay between KV cache save retry attempts |
+| `REQUEST_LOG`           | `false`                    | when true, one W3C-XLF record per finished request is appended to the request-log file (the built-in `request_log` plugin; see 4.5) |
+| `REQUEST_LOG_PATH`      | `lpcache-request.log`      | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
+| `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB)        | rotation threshold in bytes (`<path>.1`, `<path>.2`, …); `0` = no rotation |
+| `REQUEST_LOG_KEEP`      | `5`                        | rotated generations retained (the oldest is dropped); `0` = keep them all |
+| `REQUEST_LOG_FIELDS`    | all 28 fields              | comma-separated ordered subset of the known XLF field names (W3C + `lpcache-*` pipeline/performance fields) |
 
 Every variable also has a command-line flag; explicit flags take
 precedence over environment variables, which take precedence over the
@@ -213,6 +220,13 @@ built-in defaults. `--help` prints the full list with defaults:
 | `--prefilter-case-insensitive <BOOL>` | `PREFILTER_CASE_INSENSITIVE` (legacy) |
 | `--prefilter-result-cache-dir <PATH>` | `PREFILTER_RESULT_CACHE_DIR` (legacy) |
 | `--prefilter-result-cache-ttl <SECS>` | `PREFILTER_RESULT_CACHE_TTL` (legacy) |
+| `--save-retries <N>`            | `SAVE_RETRIES` |
+| `--save-retry-delay-ms <MS>`    | `SAVE_RETRY_DELAY_MS` |
+| `--request-log <BOOL>`          | `REQUEST_LOG` |
+| `--request-log-path <PATH>`     | `REQUEST_LOG_PATH` |
+| `--request-log-max-bytes <N>`   | `REQUEST_LOG_MAX_BYTES` |
+| `--request-log-keep <N>`        | `REQUEST_LOG_KEEP` |
+| `--request-log-fields <LIST>`   | `REQUEST_LOG_FIELDS` |
 
 The cache key is `sha256(backend_model_id + "\n" + prefix)`, where
 `backend_model_id` is the model id reported by the **first** configured
@@ -273,6 +287,39 @@ and runs the normal pipeline.
 > **Note:** the result cache is a whole-request cache keyed on the KV cache
 > key (`sha256(backend_model_id + "\n" + prefix)`) — a separate, faster
 > layer on top of the KV-cache restore, disabled by default.
+
+### 4.5 Request log (optional)
+
+When `REQUEST_LOG=true` — or a `request_log` spec is listed in `PLUGINS`
+(which takes precedence) — the built-in `request_log` plugin appends one
+[W3C Extended Log Format (XLF)](https://www.w3.org/TR/xlf-10/) record per
+**finished** request (successes, errors and client disconnects — the
+record is written when the response body completes or is dropped) to
+`REQUEST_LOG_PATH`. The file starts with the XLF header (`#Software`,
+`#Version: 1.0`, `#Date-format`, `#Fields`), followed by one
+space-separated record per request: the W3C fields (`datetime`,
+`cs-method`, `cs-uri`, `c-ip`, `cs(User-Agent)`, `cs-bytes`, `cs-time`,
+`sc-status`, `sc-bytes`) plus the `lpcache-*` pipeline fields (model,
+stream, key, n-words, is-big, backend, slot, restored, cache-hit,
+coalesced, reason) and the `lpcache-*` performance fields (prompt /
+completion / cached tokens, prefill and generation time and throughput
+from the backend's `usage`/`timings`, plus the proxy-side time to first
+token). Missing values render as `-`.
+
+- **Rotation**: when the file grows beyond `REQUEST_LOG_MAX_BYTES`
+  (default 10 MiB) it is rotated (`<path>.1`, `<path>.2`, …, each fresh
+  file starting with a new XLF header) and at most
+  `REQUEST_LOG_KEEP` (default 5) generations are kept; `0` for either
+  disables rotation / keeps all generations. `REQUEST_LOG_FIELDS`
+  selects an ordered subset of the 28 known fields.
+- Logging never breaks request serving: log I/O failures are logged and
+  swallowed.
+- The full field list and format details are in the
+  [README — Request log](../README.md#request-log).
+
+```bash
+REQUEST_LOG=true REQUEST_LOG_PATH=/var/log/lpcache/req.log ./target/release/lpcache
+```
 
 ---
 
@@ -353,7 +400,7 @@ Then, with a >500-word prompt in the messages, send the prompt twice
 ```
 
 This is the same flow the test-suite validates; the identical flows are
-covered by `cargo test` (148 tests) against the in-process mock.
+covered by `cargo test --workspace` (197 tests) against the in-process mock.
 
 ### 7.1 Load test (optional)
 

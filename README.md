@@ -51,7 +51,7 @@ full prefill cost every time.
    shares the longest common prefix; if the LCP ratio is at least `LCP_TH`
    (default 0.1), that cache is restored into the chosen slot *before* the
    chat is dispatched.
-5. **Slot management** — every llama.cpp slot is guarded by a lock
+5. **Slot management** — every llama.cpp slot is guarded by a lock.
    The proxy picks a never-used slot first, otherwise the
    least recently used one, waits up to 300 s for it (`503 all slots busy`
    on timeout), and releases it when the response is fully handled.
@@ -239,25 +239,28 @@ words appended — the second request logs
 ## Tests
 
 ```bash
-cargo test
+cargo test --workspace
 ```
 
-- **Unit tests** (77): config parsing/defaults (incl. `META_MAX` /
-  `SLOT_SAVE_PATH` / `PREFILTER_*` / `PLUGINS` spec synthesis and
-  precedence), raw-prefix construction, word
+- **Unit tests** (80): config parsing/defaults (incl. `META_MAX` /
+  `SLOT_SAVE_PATH` / `PREFILTER_*` / `REQUEST_LOG*` / `PLUGINS` spec
+  synthesis and precedence), raw-prefix construction, word
   tokenization, block hashing, LCP, SHA256 vectors, meta file round-trips,
   candidate filtering/thresholds, LRU pruning, slot selection (free/oldest
   ordering, idle-aware, multi-backend, circuit breaker, escalating
   backoff, success/probe recovery, retry slot exclusion), per-slot locking,
-  acquire timeout, save semantics.
-- **Plugin library tests** (41 + 1 doctest): the `lpcache-plugins` trait
-  objects and built-ins — keyword matching, case sensitivity,
-  content-part arrays, result-cache put/get/expire, `RemoveAfterServe`
-  one-shot cleanup, store-trait dispatch, `LlamaClient` against a mock
-  server (slot pin in body/options/query, JSON/non-JSON answers), and the
+  acquire timeout, save semantics (incl. save auto-retry).
+- **Plugin library tests** (55 + 3 doctests, 2 ignored): the
+  `lpcache-plugins` trait objects and built-ins — keyword matching, case
+  sensitivity, content-part arrays, result-cache put/get/expire,
+  `RemoveAfterServe` one-shot cleanup, store-trait dispatch,
+  `LlamaClient` against a mock server (slot pin in body/options/query,
+  JSON/non-JSON answers), the `request_log` plugin (XLF header, field
+  rendering/escaping, field selection, size rotation with `keep`), and the
   plugin registry (`PluginSpec` parsing, builtin registration, unknown
-  plugin error, zero/one/many `load_prefilters` chaining).
-- **Integration tests** (57): the built-in `llama` plugin's `LlamaClient`
+  plugin error, zero/one/many `load_prefilters` chaining, loader kind
+  filtering).
+- **Integration tests** (62): the built-in `llama` plugin's `LlamaClient`
   against the mock backend
   (slot pinning in body/options/query, save/restore status codes, JSON vs
   non-JSON provider answers, streaming), and end-to-end proxy behaviour
@@ -268,12 +271,18 @@ cargo test
   restore of surviving entries after a prune with graceful fallback for
   pruned keys, LRU timestamp bump on successful restore, stale-meta
   cleanup after a rejected restore (KV file gone from all slot-save
-  dirs), prefilter
+  dirs), concurrent-request coalescing (identical merges, generation-param
+  independence, shared stream/JSON groups, full stream for followers,
+  off-flag per-request calls, fresh group after completion), stream queue
+  backpressure at size 1, prefilter
   accept/reject before the backend — keyword reject with zero
   backend calls, case-insensitive matching, content-part inspection,
   stream/big-request rejection, reject-before-coalescing, custom
   `Prefilter` adapter, result-cache serve/expire/one-shot cleanup driven
-  through plugin specs, legacy `PREFILTER_*` env behaviour).
+  through plugin specs, legacy `PREFILTER_*` env behaviour, W3C-XLF
+  request log (record per finished request, delivered stream bytes,
+  failed requests without pipeline fields, size rotation + `keep` bound,
+  backend performance fields)).
 
 `cargo clippy --all-targets` and `cargo fmt --check` are clean.
 
