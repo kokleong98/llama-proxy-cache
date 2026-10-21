@@ -43,7 +43,10 @@
 //!   load from the `lpcache-plugins` registry (built-ins: `keyword`,
 //!   `chain`, `result_cache`) plus, when present, the `request_log`
 //!   plugin (a spec in `PLUGINS` takes precedence over the `REQUEST_LOG`
-//!   settings). Custom plugin crates can register more.
+//!   settings) and at most one `dashboard` plugin (the real-time
+//!   statistics web page; when present, the page is served at its
+//!   configured `path`, default `/dashboard`). Custom plugin crates can
+//!   register more.
 //!   When set, the specs are used as-is and the legacy `PREFILTER_*`
 //!   settings above are **ignored**; when unset, the specs are
 //!   synthesized from them (see [`Config::plugin_specs`])
@@ -785,7 +788,7 @@ Options:
   --log-level <LEVEL>           LOG_LEVEL            TRACE..ERROR (default INFO; RUST_LOG overrides)
   --stream-queue-size <N>       STREAM_QUEUE_SIZE    per-request SSE channel capacity (default 16, must be >= 1)
   --coalesce-requests <BOOL>    COALESCE_REQUESTS    group concurrent same-key requests into one backend call (default false)
-  --plugins <JSON>              PLUGINS              JSON array of plugin specs [{"name": "...", "params": {...}}] selecting the prefilter plugins (built-ins: keyword, chain, result_cache); when set, the legacy PREFILTER_* settings are ignored (default: synthesized from them)
+  --plugins <JSON>              PLUGINS              JSON array of plugin specs [{"name": "...", "params": {...}}] selecting the prefilter plugins (built-ins: keyword, chain, result_cache) plus optional request_log and dashboard plugins; when set, the legacy PREFILTER_* settings are ignored (default: synthesized from them)
   --prefilter-blocklist <LIST>  PREFILTER_BLOCKLIST  (legacy: keyword plugin) comma-separated keywords; matching requests are rejected (400) before the backend (default: disabled)
   --prefilter-case-insensitive <BOOL>  PREFILTER_CASE_INSENSITIVE  keyword matching is case-insensitive (default true)
   --prefilter-result-cache-dir <PATH>  PREFILTER_RESULT_CACHE_DIR  dir for cached backend results ({key}.json); when set, fresh same-key non-stream requests are answered from the cache before the backend (default: disabled)

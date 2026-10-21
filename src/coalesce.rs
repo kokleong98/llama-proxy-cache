@@ -146,6 +146,16 @@ impl SingleFlight {
     pub fn forget(&self, flight_key: &str) {
         self.map.lock().unwrap().remove(flight_key);
     }
+
+    /// Number of active coalesced request groups (the dashboard).
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+
+    /// Whether there are no active coalesced request groups.
+    pub fn is_empty(&self) -> bool {
+        self.map.lock().unwrap().is_empty()
+    }
 }
 
 impl Default for SingleFlight {

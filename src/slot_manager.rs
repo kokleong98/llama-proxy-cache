@@ -158,6 +158,46 @@ impl SlotManager {
         self.failure_streak[be].load(Ordering::SeqCst)
     }
 
+    /// Live snapshot of every slot (occupancy + LRU age) for
+    /// observability (the dashboard plugin's slot grid).
+    pub fn slot_snapshot(&self) -> Vec<lpcache_plugins::SlotStatus> {
+        let now = now_nanos();
+        self.all
+            .iter()
+            .map(|&g| {
+                let t = self.last_used[self.idx(g)].load(Ordering::SeqCst);
+                lpcache_plugins::SlotStatus {
+                    be: g.be,
+                    slot: g.slot,
+                    busy: self.sems[self.idx(g)].available_permits() == 0,
+                    last_used_secs: if t == 0 {
+                        None
+                    } else {
+                        Some((now.saturating_sub(t)) as f64 / 1e9)
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Circuit-breaker state of every backend (index = backend index),
+    /// for observability (the dashboard plugin's backend table).
+    pub fn breaker_state(&self) -> Vec<lpcache_plugins::BackendBreaker> {
+        let now = now_nanos();
+        self.down_until
+            .iter()
+            .enumerate()
+            .map(|(be, d)| {
+                let until = d.load(Ordering::SeqCst);
+                lpcache_plugins::BackendBreaker {
+                    down: until > now,
+                    cooldown_secs: until.saturating_sub(now) as f64 / 1e9,
+                    failure_streak: self.failure_streak[be].load(Ordering::SeqCst),
+                }
+            })
+            .collect()
+    }
+
     /// Record a connection-level failure for `g`'s backend and exclude that
     /// backend from slot selection for the cooldown duration (circuit
     /// breaker).

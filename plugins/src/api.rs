@@ -1,6 +1,6 @@
 //! Adapter API: the traits every lpcache plugin implements.
 //!
-//! Five adapter kinds exist:
+//! Six adapter kinds exist:
 //!
 //! - [`Prefilter`] — request prefilter, consulted **before** any slot
 //!   acquisition, KV-cache restore/save, or backend dispatch. Built-ins:
@@ -16,6 +16,11 @@
 //! - [`RequestLogger`] — one W3C Extended Log Format (XLF) record per
 //!   finished request; the built-in `request_log` plugin writes the
 //!   records to a (size-rotated) log file.
+//! - [`Dashboard`] — the real-time statistics web dashboard; the proxy
+//!   feeds it one [`RequestLogRecord`] per finished request and hands it
+//!   a live [`ProxyStatus`] snapshot on every stats poll, and serves its
+//!   HTML page + JSON stats endpoint on the paths it declares. The
+//!   built-in `dashboard` plugin provides it.
 //!
 //! All traits are object-safe and used behind `Arc<dyn …>` in the proxy's
 //! `AppState`.
@@ -23,6 +28,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
+use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 use std::pin::Pin;
@@ -390,4 +396,145 @@ pub trait RequestLogger: Send + Sync {
 
     /// Record one finished request.
     fn log(&self, record: &RequestLogRecord) -> Result<(), String>;
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
+
+/// Live state of one proxy slot (the dashboard's slot grid).
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotStatus {
+    /// Backend index the slot belongs to.
+    pub be: usize,
+    /// Local slot id on that backend.
+    pub slot: usize,
+    /// `true` while a request holds the slot.
+    pub busy: bool,
+    /// Seconds since the slot was last used (`None` = never used).
+    pub last_used_secs: Option<f64>,
+}
+
+/// Circuit-breaker state of one backend (index = backend index).
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct BackendBreaker {
+    /// `true` while the breaker excludes the backend from slot selection.
+    pub down: bool,
+    /// Seconds remaining in the cooldown (`0.0` = healthy).
+    pub cooldown_secs: f64,
+    /// Consecutive connection-failure count (drives the escalating
+    /// cooldown; reset by any success).
+    pub failure_streak: u32,
+}
+
+/// Live state of one backend (the dashboard's backend table).
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendStatus {
+    /// The backend URL (from `BACKENDS`).
+    pub url: String,
+    /// Configured slot count for this backend.
+    pub n_slots: usize,
+    /// Slots currently held by in-flight requests.
+    pub busy_slots: usize,
+    /// `true` while the circuit breaker excludes the backend.
+    pub down: bool,
+    /// Seconds remaining in the breaker cooldown (`0.0` = healthy).
+    pub cooldown_secs: f64,
+    /// Consecutive connection-failure count (reset by any success).
+    pub failure_streak: u32,
+}
+
+/// Snapshot of the proxy's live state, handed to a [`Dashboard`] plugin on
+/// every stats request. The proxy fills this in (it knows the slot
+/// manager, the coalescing table and the config); the plugin merges it
+/// with its own per-request aggregates into the JSON the dashboard polls.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyStatus {
+    /// The proxy version string.
+    pub version: String,
+    /// Seconds since the proxy started.
+    pub uptime_secs: f64,
+    /// The proxy model id (`MODEL_ID`).
+    pub model_id: String,
+    /// The proxy listen port.
+    pub port: u16,
+    /// Whether concurrent-request coalescing is enabled.
+    pub coalesce_requests: bool,
+    /// The big-request word threshold (`BIG_THRESHOLD_WORDS`).
+    pub big_threshold_words: usize,
+    /// KV cache words per block (`WORDS_PER_BLOCK`).
+    pub words_per_block: usize,
+    /// LRU bound on meta files (`META_MAX`; `0` = unlimited).
+    pub meta_max: usize,
+    /// KV meta files currently on disk (`META_DIR`).
+    pub meta_files: usize,
+    /// Slots currently held by in-flight requests.
+    pub in_flight: usize,
+    /// Total slots across all backends.
+    pub total_slots: usize,
+    /// Active coalesced request groups (`0` when coalescing is disabled).
+    pub active_groups: usize,
+    /// One entry per backend (index = backend index).
+    pub backends: Vec<BackendStatus>,
+    /// One entry per slot across all backends.
+    pub slots: Vec<SlotStatus>,
+}
+
+/// A dashboard adapter: serves the proxy's real-time statistics as a web
+/// page. The proxy mounts two routes for a loaded dashboard plugin —
+/// `GET {path}` (the page) and `GET {path}/api/stats` (the JSON payload
+/// produced by [`Self::stats`]) — and feeds it one
+/// [`RequestLogRecord`] per finished request through [`Self::record`]
+/// (the same records the request logger receives). The dashboard's own
+/// two routes are excluded: the proxy neither logs nor feeds its page
+/// and stats requests, so the page's polling never inflates the
+/// aggregates.
+///
+/// The built-in `dashboard` plugin keeps request counters, throughput
+/// time series and a recent-requests ring in memory and renders a
+/// self-contained HTML page (no external assets) that polls the stats
+/// endpoint.
+///
+/// Implementations must be `Send + Sync` — they are shared across all
+/// requests behind an `Arc` (see `AppState::dashboard` in the `lpcache`
+/// crate).
+pub trait Dashboard: Send + Sync {
+    /// The plugin name (for diagnostics).
+    fn name(&self) -> &str;
+
+    /// The URL path the proxy serves the dashboard page on (e.g.
+    /// `/dashboard`; must start with `/`). The stats API is mounted at
+    /// `{path}/api/stats` automatically.
+    fn path(&self) -> &str;
+
+    /// The URL path of the stats JSON endpoint: `{path}/api/stats`
+    /// (trailing slashes on `path` are dropped, so it always matches the
+    /// route the proxy mounts).
+    fn stats_path(&self) -> String {
+        format!("{}/api/stats", self.path().trim_end_matches('/'))
+    }
+
+    /// The dashboard page: a complete, self-contained HTML document (CSS
+    /// and JS inline, no external assets) served as `text/html`.
+    fn html(&self) -> String;
+
+    /// The current stats payload, served as JSON from `{path}/api/stats`,
+    /// optionally range-scoped by `since` (unix seconds): the proxy's
+    /// live [`ProxyStatus`] merged with the plugin's aggregates over
+    /// `[since, now]`. `None` selects the plugin's default aggregation
+    /// (the built-in dashboard: lifetime counters plus the trailing
+    /// `window_secs` series). The built-in dashboard's page polls with
+    /// `?since=<unix seconds>` so its time filter can scope the KPIs,
+    /// charts and recent-requests table to the selected range.
+    fn stats(&self, proxy: &ProxyStatus, since: Option<u64>) -> Value;
+
+    /// Feed one finished request into the plugin's aggregates. Called
+    /// (synchronously) exactly once per finished request — success,
+    /// error, rejection or client disconnect alike — but never for the
+    /// dashboard's own page/stats routes. The default is a no-op for
+    /// dashboards that only report live proxy state.
+    fn record(&self, record: &RequestLogRecord) -> Result<(), String> {
+        let _ = record;
+        Ok(())
+    }
 }

@@ -30,9 +30,9 @@
 //! - [`registry`] — `PluginSpec`, `PluginFactory`, the [`Registry`], the
 //!   process-wide [`global`] registry ([`ensure_builtin`] registers the
 //!   built-ins into it) and the loaders ([`load_prefilters`],
-//!   [`load_request_loggers`]).
+//!   [`load_request_loggers`], [`load_dashboard`]).
 //! - [`builtin`] — the built-in plugins: `keyword`, `chain`,
-//!   `result_cache`, `llama` and `request_log`, each with a
+//!   `result_cache`, `llama`, `request_log` and `dashboard`, each with a
 //!   JSON-parameter factory.
 //!
 //! ## Writing a custom plugin
@@ -66,13 +66,14 @@ pub mod builtin;
 pub mod registry;
 
 pub use api::{
-    BackendError, JsonChat, LlamaBackend, PostCleanup, Prefilter, PrefilterDecision,
-    PrefilterRequest, RequestLogRecord, RequestLogger, RestoreOutcome, ResultStore, StreamChat,
-    format_utc,
+    BackendBreaker, BackendError, BackendStatus, Dashboard, JsonChat, LlamaBackend, PostCleanup,
+    Prefilter, PrefilterDecision, PrefilterRequest, ProxyStatus, RequestLogRecord, RequestLogger,
+    RestoreOutcome, ResultStore, SlotStatus, StreamChat, format_utc,
 };
+pub use builtin::dashboard::DashboardPlugin;
 pub use builtin::llama::LlamaClient;
 pub use builtin::request_log::RequestLog;
 pub use registry::{
-    PluginError, PluginSpec, Registry, ensure_builtin, global, load_prefilters,
+    PluginError, PluginSpec, Registry, ensure_builtin, global, load_dashboard, load_prefilters,
     load_request_loggers,
 };

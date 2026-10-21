@@ -47,6 +47,12 @@
 //! body is done — completed, errored, or the client went away — and
 //! logging failures are swallowed: logging never breaks request serving.
 //! The built-in plugin size-rotates the log file.
+//!
+//! The same middleware feeds the loaded dashboard (when one is present)
+//! for its aggregates. The dashboard's own routes (its page and
+//! `{path}/api/stats`) are its internal polling, not proxy traffic — the
+//! middleware skips them, so they are neither written to the request log
+//! nor counted in the dashboard's own statistics.
 
 use crate::coalesce::{Flight, SharedOutcome, SingleFlight};
 use crate::config::Config;
@@ -54,7 +60,7 @@ use crate::hashing;
 use crate::slot_manager::{AcquireTimeout, GSlot, SlotGuard, SlotManager};
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -62,8 +68,9 @@ use axum::routing::{get, post};
 use bytes::Bytes;
 use futures::StreamExt;
 use lpcache_plugins::{
-    BackendError, JsonChat, LlamaBackend, Prefilter, PrefilterDecision, PrefilterRequest,
-    RequestLogRecord, RequestLogger, RestoreOutcome, ResultStore, format_utc,
+    BackendError, BackendStatus, Dashboard, JsonChat, LlamaBackend, Prefilter, PrefilterDecision,
+    PrefilterRequest, ProxyStatus, RequestLogRecord, RequestLogger, RestoreOutcome, ResultStore,
+    format_utc,
 };
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,12 +100,27 @@ pub struct AppState {
     /// from `REQUEST_LOG` / the `PLUGINS` settings): one W3C-XLF record is
     /// appended per finished request (`None` = disabled — the default).
     pub request_log: Option<Arc<dyn RequestLogger>>,
+    /// Optional dashboard plugin (the built-in `dashboard` plugin, loaded
+    /// from the `PLUGINS` settings): serves the real-time statistics web
+    /// page at its configured path and receives one
+    /// [`RequestLogRecord`] per finished request for its aggregates —
+    /// its own page/stats routes are excluded (`None` = disabled — the
+    /// default).
+    pub dashboard: Option<Arc<dyn Dashboard>>,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat))
+        .route("/v1/chat/completions", post(chat));
+    // The dashboard plugin (when loaded) owns its routes: the page at its
+    // configured `path` and the stats API at `{path}/api/stats`.
+    if let Some(d) = &state.dashboard {
+        router = router
+            .route(d.path(), get(dashboard_page))
+            .route(&d.stats_path(), get(dashboard_stats));
+    }
+    router
         // `from_fn_with_state` because the middleware extracts
         // `State<AppState>` (plain `from_fn` has no state).
         .layer(axum::middleware::from_fn_with_state(
@@ -110,6 +132,95 @@ pub fn router(state: AppState) -> Router {
 
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(json!({ "data": [{ "id": state.config.model_id }] }))
+}
+
+/// Process start (for the dashboard's `uptime_secs`).
+fn process_start() -> &'static Instant {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now)
+}
+
+/// The dashboard page route (mounted only when a dashboard plugin is
+/// loaded).
+async fn dashboard_page(State(state): State<AppState>) -> Response {
+    let d = state
+        .dashboard
+        .as_ref()
+        .expect("dashboard page route only mounted when a dashboard is loaded");
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        d.html(),
+    )
+        .into_response()
+}
+
+/// The dashboard stats API query: the page's time filter polls with
+/// `?since=<unix seconds>` to scope the plugin's aggregates to
+/// `[since, now]` (absent = the plugin's default aggregation). A bad
+/// value is a 400 (axum's `Query` extractor rejects it).
+#[derive(serde::Deserialize)]
+struct StatsQuery {
+    since: Option<u64>,
+}
+
+/// The dashboard stats API route (`{path}/api/stats`): the proxy's live
+/// [`ProxyStatus`] merged with the plugin's per-request aggregates,
+/// range-scoped by the optional `?since` query parameter.
+async fn dashboard_stats(
+    State(state): State<AppState>,
+    Query(q): Query<StatsQuery>,
+) -> impl IntoResponse {
+    let d = state
+        .dashboard
+        .as_ref()
+        .expect("dashboard stats route only mounted when a dashboard is loaded");
+    axum::Json(d.stats(&capture_status(&state), q.since))
+}
+
+/// Snapshot of the proxy's live state for a dashboard stats poll: slot
+/// occupancy, backend circuit breakers, coalesced groups and the KV meta
+/// cache size (the plugin adds its own request aggregates on top).
+pub(crate) fn capture_status(state: &AppState) -> ProxyStatus {
+    let cfg = &state.config;
+    let slots = state.sm.slot_snapshot();
+    let in_flight = slots.iter().filter(|s| s.busy).count();
+    let breaker = state.sm.breaker_state();
+    let backends: Vec<BackendStatus> = cfg
+        .backends
+        .iter()
+        .enumerate()
+        .map(|(be, b)| {
+            let br = breaker.get(be).cloned().unwrap_or_default();
+            let busy = slots.iter().filter(|s| s.be == be && s.busy).count();
+            BackendStatus {
+                url: b.url.clone(),
+                n_slots: b.n_slots,
+                busy_slots: busy,
+                down: br.down,
+                cooldown_secs: br.cooldown_secs,
+                failure_streak: br.failure_streak,
+            }
+        })
+        .collect();
+    let meta_files = std::fs::read_dir(&cfg.meta_dir)
+        .map(|d| d.filter(|e| e.is_ok()).count())
+        .unwrap_or(0);
+    ProxyStatus {
+        version: crate::config::VERSION.to_string(),
+        uptime_secs: process_start().elapsed().as_secs_f64(),
+        model_id: cfg.model_id.clone(),
+        port: cfg.port,
+        coalesce_requests: cfg.coalesce_requests,
+        big_threshold_words: cfg.big_threshold_words,
+        words_per_block: cfg.words_per_block,
+        meta_max: cfg.meta_max,
+        meta_files,
+        in_flight,
+        total_slots: slots.len(),
+        active_groups: state.sf.len(),
+        backends,
+        slots,
+    }
 }
 
 /// The lpcache pipeline view of one request, carried in the response's
@@ -282,7 +393,8 @@ fn perf_from_outcome(perf: Option<&Arc<Mutex<PerfInner>>>, outcome: &SharedOutco
 /// failures are warned about and swallowed: request logging never breaks
 /// request serving.
 struct PendingRequestLog {
-    logger: Arc<dyn RequestLogger>,
+    logger: Option<Arc<dyn RequestLogger>>,
+    dashboard: Option<Arc<dyn Dashboard>>,
     method: String,
     uri: Option<String>,
     client_ip: Option<String>,
@@ -337,30 +449,65 @@ impl Drop for PendingRequestLog {
             gen_tps: perf.as_ref().and_then(|p| p.gen_tps),
             ttft_ms: perf.as_ref().and_then(|p| p.ttft_ms),
         };
-        if let Err(e) = self.logger.log(&record) {
+        if let Some(logger) = &self.logger
+            && let Err(e) = logger.log(&record)
+        {
             tracing::warn!(
                 "request_log_write_fail logger={} status={:?}: {e}",
-                self.logger.name(),
+                logger.name(),
+                record.status
+            );
+        }
+        // The dashboard (when loaded) gets the same record for its
+        // aggregates; a failure only affects the dashboard, not the log.
+        if let Some(dashboard) = &self.dashboard
+            && let Err(e) = dashboard.record(&record)
+        {
+            tracing::warn!(
+                "dashboard_record_fail dashboard={} status={:?}: {e}",
+                dashboard.name(),
                 record.status
             );
         }
     }
 }
 
-/// Request-log middleware (active only when `AppState::request_log` is
-/// set): captures the W3C fields of every request (method, URI, client
-/// IP, user agent, request bytes from `Content-Length`), wraps the
-/// response body to count the bytes actually handed to the client, and
-/// hands the finished request to the plugin (see [`PendingRequestLog`])
-/// when the body is done.
+/// Whether `path` is one of the dashboard's own routes (the page at
+/// `d.path()` or the stats API at `d.stats_path()` — the only two routes
+/// the proxy mounts for a dashboard).
+fn is_dashboard_own_route(path: &str, d: &dyn Dashboard) -> bool {
+    path == d.path() || path == d.stats_path()
+}
+
+/// Request-log / dashboard middleware (active when `AppState::request_log`
+/// and/or `AppState::dashboard` is set): captures the W3C fields of every
+/// request (method, URI, client IP, user agent, request bytes from
+/// `Content-Length`), wraps the response body to count the bytes actually
+/// handed to the client, and hands the finished request (see
+/// [`PendingRequestLog`]) to the request logger and/or the dashboard when
+/// the body is done. The dashboard's own routes (its page and stats API)
+/// are skipped: they are not written to the request log and not fed into
+/// the dashboard's aggregates, so the page's polling never inflates the
+/// statistics.
 async fn request_log_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(logger) = state.request_log.clone() else {
+    let logger = state.request_log.clone();
+    let dashboard = state.dashboard.clone();
+    if logger.is_none() && dashboard.is_none() {
         return next.run(req).await;
-    };
+    }
+    // The dashboard's own routes (the page + the stats API) are its
+    // internal polling, not proxy traffic: skip them entirely so they
+    // are neither logged nor counted in the dashboard's own statistics.
+    if dashboard
+        .as_deref()
+        .is_some_and(|d| is_dashboard_own_route(req.uri().path(), d))
+    {
+        return next.run(req).await;
+    }
     let t0 = Instant::now();
     let method = req.method().to_string();
     let uri = req.uri().path_and_query().map(|pq| pq.as_str().to_string());
@@ -387,6 +534,7 @@ async fn request_log_middleware(
     let counter = Arc::clone(&delivered);
     let pending = PendingRequestLog {
         logger,
+        dashboard,
         method,
         uri,
         client_ip,

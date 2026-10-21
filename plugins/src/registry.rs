@@ -29,7 +29,7 @@
 //! assert_eq!(prefilter.name(), "keyword");
 //! ```
 
-use crate::api::{LlamaBackend, Prefilter, RequestLogger};
+use crate::api::{Dashboard, LlamaBackend, Prefilter, RequestLogger};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -131,6 +131,13 @@ pub trait PluginFactory: Send + Sync {
         &self,
         params: &Value,
     ) -> Result<Option<Arc<dyn RequestLogger>>, PluginError> {
+        let _ = params;
+        Ok(None)
+    }
+
+    /// Build a dashboard adapter, or `Ok(None)` when this plugin does not
+    /// provide one.
+    fn create_dashboard(&self, params: &Value) -> Result<Option<Arc<dyn Dashboard>>, PluginError> {
         let _ = params;
         Ok(None)
     }
@@ -256,6 +263,27 @@ impl Registry {
             .ok_or_else(|| PluginError::UnknownPlugin(spec.name.clone()))?;
         factory.create_request_logger(&spec.params)
     }
+
+    /// Instantiate the spec's plugin as a dashboard adapter.
+    ///
+    /// Returns `Ok(None)` when the plugin is registered but does not
+    /// provide a dashboard (a dashboard spec mixed into a prefilter list,
+    /// or vice versa — the loaders skip such specs);
+    /// `Err(PluginError::UnknownPlugin)` when no plugin is registered
+    /// under the spec's name at all.
+    pub fn create_dashboard(
+        &self,
+        spec: &PluginSpec,
+    ) -> Result<Option<Arc<dyn Dashboard>>, PluginError> {
+        let factory = self
+            .factories
+            .lock()
+            .expect("plugin registry poisoned")
+            .get(&spec.name)
+            .cloned()
+            .ok_or_else(|| PluginError::UnknownPlugin(spec.name.clone()))?;
+        factory.create_dashboard(&spec.params)
+    }
 }
 
 /// The process-wide registry (the `lpcache` binary loads plugins from it).
@@ -340,6 +368,35 @@ pub fn load_request_loggers(
     Ok(logger)
 }
 
+/// Load the dashboard plugin from `specs`: the first spec whose plugin
+/// provides a dashboard (zero specs of that kind → `Ok(None)` = the
+/// dashboard is disabled). Specs for other adapter kinds are skipped; an
+/// unknown plugin name is an error, as is a second dashboard spec.
+pub fn load_dashboard(
+    registry: &Registry,
+    specs: &[PluginSpec],
+) -> Result<Option<Arc<dyn Dashboard>>, PluginError> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut dashboard: Option<Arc<dyn Dashboard>> = None;
+    for spec in specs {
+        // Specs for other adapter kinds (e.g. a prefilter) return None —
+        // skip.
+        let Some(d) = registry.create_dashboard(spec)? else {
+            continue;
+        };
+        if dashboard.is_some() {
+            return Err(PluginError::BadParams {
+                name: spec.name.clone(),
+                message: "only one dashboard plugin is supported".to_string(),
+            });
+        }
+        dashboard = Some(d);
+    }
+    Ok(dashboard)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +427,7 @@ mod tests {
             reg.names(),
             vec![
                 "chain".to_string(),
+                "dashboard".to_string(),
                 "keyword".to_string(),
                 "llama".to_string(),
                 "request_log".to_string(),
@@ -549,5 +607,41 @@ mod tests {
         assert!(reg.is_registered("keyword"));
         assert!(reg.is_registered("llama"));
         assert_eq!(reg.names(), Registry::with_builtins().names());
+    }
+
+    fn dashboard_spec() -> PluginSpec {
+        PluginSpec::new("dashboard", json!({ "path": "/stats" }))
+    }
+
+    #[test]
+    fn load_dashboard_zero_one_many() {
+        let reg = Registry::with_builtins();
+        // zero specs -> no dashboard (the default)
+        assert!(load_dashboard(&reg, &[]).unwrap().is_none());
+        // one spec -> that adapter; prefilter specs in the list are skipped
+        let specs = vec![keyword_spec("a"), dashboard_spec()];
+        let Some(d) = load_dashboard(&reg, &specs).unwrap() else {
+            panic!("expected a dashboard");
+        };
+        assert_eq!(d.name(), "dashboard");
+        assert_eq!(d.path(), "/stats");
+        // a second dashboard spec is an error
+        let err = match load_dashboard(&reg, &[dashboard_spec(), dashboard_spec()]) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, PluginError::BadParams { ref name, .. } if name == "dashboard"));
+        // an unknown plugin name is an error
+        let err = match load_dashboard(
+            &reg,
+            &[PluginSpec {
+                name: "missing".to_string(),
+                params: Value::Object(Default::default()),
+            }],
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, PluginError::UnknownPlugin(_)));
     }
 }

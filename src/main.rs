@@ -13,8 +13,8 @@ use lpcache::app::{AppState, router};
 use lpcache::coalesce::SingleFlight;
 use lpcache::config::{Cli, Config};
 use lpcache::plugins::{
-    LlamaBackend, PluginSpec, Prefilter, RequestLogger, ResultStore, ensure_builtin, global,
-    load_prefilters, load_request_loggers,
+    Dashboard, LlamaBackend, PluginSpec, Prefilter, RequestLogger, ResultStore, ensure_builtin,
+    global, load_dashboard, load_prefilters, load_request_loggers,
 };
 use lpcache::slot_manager::SlotManager;
 use serde_json::json;
@@ -124,6 +124,28 @@ async fn main() {
         tracing::info!("request logging enabled: {}", rlog.name());
     }
 
+    // The optional dashboard plugin (a `dashboard` spec in `PLUGINS`): when
+    // present it serves the real-time statistics web page at its configured
+    // `path` (default `/dashboard`) and its stats API at
+    // `{path}/api/stats`, and receives one record per finished request
+    // (its own page/stats routes are excluded).
+    // A bad spec is a startup error.
+    let dashboard: Option<Arc<dyn Dashboard>> = match load_dashboard(registry, &specs) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("lpcache: failed to load dashboard plugin: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(d) = &dashboard {
+        tracing::info!(
+            "dashboard enabled: {} at {} (stats at {})",
+            d.name(),
+            d.path(),
+            d.stats_path()
+        );
+    }
+
     let port = config.port;
     // One backend client per `BACKENDS` entry, instantiated through the
     // plugin registry by the built-in `llama` plugin with the per-backend
@@ -158,6 +180,7 @@ async fn main() {
         prefilter,
         result_store,
         request_log,
+        dashboard,
     };
 
     // Warn early if a configured --slot-save-path dir is missing: pruning

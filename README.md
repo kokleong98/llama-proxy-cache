@@ -95,7 +95,7 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `LOG_LEVEL`         | `INFO`              | log level (`RUST_LOG` overrides it)            |
 | `STREAM_QUEUE_SIZE` | `16`                | per-request SSE channel capacity (must be >= 1) |
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
-| `PLUGINS` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter) and `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables below); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent prefilter specs (when set, `PLUGINS` takes precedence over them) |
+| `PLUGINS` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables below) and `dashboard` (the real-time statistics web page, at most one); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent prefilter specs (when set, `PLUGINS` takes precedence over them) |
 | `REQUEST_LOG` | `false` | when true, one W3C-XLF record per finished request is appended to the request-log file (the built-in `request_log` plugin) |
 | `REQUEST_LOG_PATH` | `lpcache-request.log` | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
 | `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB) | rotation threshold in bytes; the file is rotated when exceeded (`<path>.1`, `<path>.2`, …); `0` = no rotation |
@@ -198,6 +198,57 @@ BACKENDS='[{"url":"http://127.0.0.1:8000","n_slots":4}]' \
   REQUEST_LOG_MAX_BYTES=10485760 REQUEST_LOG_KEEP=5 ./target/release/lpcache
 ```
 
+## Dashboard
+
+Add a `dashboard` spec to `PLUGINS` (at most one) to enable the built-in
+`dashboard` plugin: a **self-contained** real-time statistics web page
+(inline CSS + JS, no external assets — safe for the air-gapped boxes this
+usually runs on). The proxy mounts two routes from the plugin:
+
+- `GET {path}` (default `GET /dashboard`) — the HTML page
+- `GET {path}/api/stats` — the JSON payload the page polls: the proxy's
+  live state (slot occupancy per backend/slot, circuit-breaker state,
+  in-flight count, active coalesced groups, KV meta cache size, uptime)
+  merged with the plugin's per-request aggregates (lifetime counters,
+  success rate, a per-bucket time series, and the recent-requests ring).
+  The endpoint accepts an optional `?since=<unix seconds>` query
+  parameter that scopes the aggregates to `[since, now]` (served as
+  `range.counters` plus the range's time series, coarsened to at most
+  360 points so long ranges stay cheap); without it the payload is the
+  lifetime counters plus the trailing `window_secs` series
+
+The page polls the stats endpoint and renders KPI cards, bar charts
+(requests/s and completion tokens/s) and the backend/slot/recent tables.
+A time-filter dropdown, grouped into presets (30 seconds, 1 minute,
+5 minutes, 15 minutes) and other (custom time, all time), scopes the
+cards, charts and recent table to the selected range by polling with
+`?since=<unix seconds>`.
+
+Plugin params (all optional):
+
+| Param | Default | Meaning |
+|---|---|---|
+| `path` | `/dashboard` | page URL path (must start with `/`); the stats API is `{path}/api/stats` |
+| `refresh_ms` | `2000` | the page's poll interval in ms (100..=3600000) |
+| `window_secs` | `300` | trailing window for a stats poll without `?since` (10..=86400) |
+| `bucket_secs` | `5` | time-series bucket size in seconds (1..=3600) |
+| `max_recent` | `100` | recent-requests ring size (0 disables the table; ≤ 10000) |
+
+Every **finished** request — success, error, rejection or client
+disconnect — is fed to the dashboard through the same middleware that
+feeds the request log, so the aggregates cover non-chat routes as well.
+The dashboard's own routes (the page and the stats API) are excluded
+from both the aggregates and the request log, so the page's polling
+never inflates the statistics.
+
+![lpcache dashboard](docs/dashboard.png)
+
+```bash
+PLUGINS='[{"name":"dashboard","params":{"path":"/dashboard","refresh_ms":1000}}]' \
+  ./target/release/lpcache
+# → open http://<proxy-host>:<port>/dashboard
+```
+
 ## Build & run
 
 > 📖 **New here?** Start with the full [Setup Guide](docs/setup-guide.md) —
@@ -250,17 +301,18 @@ cargo test --workspace
   ordering, idle-aware, multi-backend, circuit breaker, escalating
   backoff, success/probe recovery, retry slot exclusion), per-slot locking,
   acquire timeout, save semantics (incl. save auto-retry).
-- **Plugin library tests** (55 + 3 doctests, 2 ignored): the
+- **Plugin library tests** (61 + 3 doctests, 2 ignored): the
   `lpcache-plugins` trait objects and built-ins — keyword matching, case
   sensitivity, content-part arrays, result-cache put/get/expire,
   `RemoveAfterServe` one-shot cleanup, store-trait dispatch,
   `LlamaClient` against a mock server (slot pin in body/options/query,
   JSON/non-JSON answers), the `request_log` plugin (XLF header, field
-  rendering/escaping, field selection, size rotation with `keep`), and the
-  plugin registry (`PluginSpec` parsing, builtin registration, unknown
-  plugin error, zero/one/many `load_prefilters` chaining, loader kind
-  filtering).
-- **Integration tests** (62): the built-in `llama` plugin's `LlamaClient`
+  rendering/escaping, field selection, size rotation with `keep`), the
+  `dashboard` plugin (params validation, counters, bucket pruning, recent
+  ring, self-contained HTML) and the plugin registry (`PluginSpec`
+  parsing, builtin registration, unknown plugin error, zero/one/many
+  `load_prefilters` chaining, loader kind filtering).
+- **Integration tests** (65): the built-in `llama` plugin's `LlamaClient`
   against the mock backend
   (slot pinning in body/options/query, save/restore status codes, JSON vs
   non-JSON provider answers, streaming), and end-to-end proxy behaviour
@@ -282,7 +334,8 @@ cargo test --workspace
   through plugin specs, legacy `PREFILTER_*` env behaviour, W3C-XLF
   request log (record per finished request, delivered stream bytes,
   failed requests without pipeline fields, size rotation + `keep` bound,
-  backend performance fields)).
+  backend performance fields), dashboard (page and stats JSON reachable,
+  counters/time-series/recent updated after requests, custom page path)).
 
 `cargo clippy --all-targets` and `cargo fmt --check` are clean.
 
