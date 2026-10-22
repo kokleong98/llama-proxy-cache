@@ -2619,6 +2619,49 @@ async fn dashboard_page_and_stats_reachable() {
     drain(resp).await;
 }
 
+/// Regression: the page served over HTTP must ship the throughput bar
+/// charts that draw the figure of each bar (adaptive stride, figures
+/// above the bars) and the axis line under the charts — the browser
+/// renders the canvas, so this guards the embedded script.
+#[tokio::test]
+async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
+    let (state, _mock, _td) = make_state_dashboard(json!({})).await;
+    let app = router(state);
+
+    let resp = app.oneshot(get_req("/dashboard")).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let html = String::from_utf8(bytes.to_vec()).expect("utf8");
+
+    // one canvas per throughput series
+    for id in ["chart-req", "chart-tok", "chart-cached"] {
+        assert!(html.contains(&format!("canvas id=\"{id}\"")), "canvas {id}");
+    }
+    // per-bar figure with adaptive stride, drawn above each bar
+    assert!(
+        html.contains("const stride = Math.max(1, Math.ceil((String(max).length*charW + 6) / bw));"),
+        "adaptive stride for the on-bar figures"
+    );
+    assert!(
+        html.contains("if((i % stride === 0 && v>0) || hov)"),
+        "figure drawn for each (stride-selected, non-zero) bar or the hovered bar"
+    );
+    assert!(
+        html.contains("ctx.fillText(txt, lx, baseY-bh-4)"),
+        "figure above the bar"
+    );
+    // the axis line under the throughput charts
+    assert!(
+        html.contains("ctx.moveTo(0,h-3.5); ctx.lineTo(w,h-3.5); ctx.stroke();"),
+        "baseline under the bars"
+    );
+    // hover handlers attached to every chart canvas
+    assert!(
+        html.contains("[\"chart-req\",\"chart-tok\",\"chart-cached\"].forEach(id=>attachChart($(id)));"),
+        "hover handlers attached to all three charts"
+    );
+}
+
 #[tokio::test]
 async fn dashboard_counters_update_after_requests() {
     let (state, _mock, _td) = make_state_dashboard(json!({ "refresh_ms": 750 })).await;
