@@ -149,6 +149,7 @@ async fn make_state_inner(
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     (state, mock, td)
 }
@@ -656,6 +657,7 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     let app = router(state);
 
@@ -732,6 +734,7 @@ async fn connection_failure_retries_on_other_backend() {
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     let app = router(state);
 
@@ -804,6 +807,7 @@ async fn probe_recovers_cooled_down_backend() {
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     let app = router(state);
 
@@ -889,6 +893,7 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     let app = router(state);
 
@@ -948,6 +953,7 @@ async fn prune_removes_oldest_meta_and_kv_files() {
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     let app = router(state);
 
@@ -1025,6 +1031,7 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     let app = router(state);
 
@@ -1146,6 +1153,7 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     let app = router(state);
 
@@ -1749,6 +1757,7 @@ async fn make_state_result_cache(
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     (state, mock, td, td_rc)
 }
@@ -1946,6 +1955,7 @@ async fn keyword_blocklist_rejects_before_result_cache_serves() {
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     // Pre-populate the cache for the blocked prompt's key (a blocked
     // request can never store a result itself).
@@ -2011,6 +2021,7 @@ async fn make_state_with_save_dir(
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     (state, mock, td)
 }
@@ -2126,6 +2137,7 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
         prefilter,
         result_store,
         request_log: None,
+        dashboard: None,
     };
     let app = router(state);
 
@@ -2208,6 +2220,7 @@ async fn make_state_request_log(
         prefilter,
         result_store,
         request_log: Some(request_log),
+        dashboard: None,
     };
     (state, mock, td, log_path)
 }
@@ -2481,4 +2494,451 @@ async fn request_log_rotates_and_bounds_keep() {
         let records = parse_xlf(&std::fs::read_to_string(&p).expect("read")).1;
         assert!(!records.is_empty(), "{p:?} must hold rotated records");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard plugin (built-in `dashboard`, loaded through the plugin
+// registry like every other adapter).
+// ---------------------------------------------------------------------------
+
+/// A state with the built-in `dashboard` plugin loaded from a `dashboard`
+/// plugin spec with `params` — the same dynamic loading path the `lpcache`
+/// binary uses (`load_dashboard`).
+async fn make_state_dashboard(params: Value) -> (AppState, MockLlama, tempfile::TempDir) {
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("tempdir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    );
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let spec = lpcache::plugins::PluginSpec::new("dashboard", params);
+    let dashboard = lpcache::plugins::load_dashboard(
+        &lpcache::plugins::Registry::with_builtins(),
+        std::slice::from_ref(&spec),
+    )
+    .expect("load dashboard")
+    .expect("dashboard spec present");
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter: None,
+        result_store: None,
+        request_log: None,
+        dashboard: Some(dashboard),
+    };
+    (state, mock, td)
+}
+
+/// Drain a response body without parsing it (error responses are not JSON).
+async fn drain(resp: axum::http::Response<Body>) {
+    let _ = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+}
+
+#[tokio::test]
+async fn dashboard_page_and_stats_reachable() {
+    let (state, mock, _td) = make_state_dashboard(json!({})).await;
+    let app = router(state);
+
+    // The stats API first (its polling never inflates the aggregates —
+    // the dashboard's own routes are excluded): the proxy snapshot
+    // (under `proxy`) + the plugin aggregates, as JSON.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert!(v["version"].is_string());
+    assert!(v["uptime_secs"].as_f64().unwrap() >= 0.0);
+    assert_eq!(v["model"], "llama.cpp");
+    assert!(v["refresh_ms"].is_number());
+    let p = &v["proxy"];
+    assert_eq!(p["model_id"], "llama.cpp");
+    assert_eq!(p["meta_files"], 0);
+    assert_eq!(p["total_slots"], 2);
+    assert_eq!(p["in_flight"], 0);
+    assert_eq!(p["active_groups"], 0);
+    assert_eq!(p["backends"][0]["url"], mock.url());
+    assert_eq!(p["backends"][0]["n_slots"], 2);
+    assert_eq!(p["backends"][0]["down"], false);
+    assert_eq!(p["backends"][0]["busy_slots"], 0);
+    assert_eq!(p["slots"][0]["be"], 0);
+    assert_eq!(p["slots"][0]["slot"], 0);
+    assert_eq!(p["slots"][0]["busy"], false);
+    // The plugin aggregates are empty until the first request.
+    assert_eq!(v["counters"]["total"], 0);
+    assert!(v["counters"]["success_rate"].is_null());
+    assert!(v["series"]["buckets"].as_array().unwrap().is_empty());
+    assert!(v["recent"].as_array().unwrap().is_empty());
+
+    // The page: self-contained HTML at the configured path.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap()),
+        Some("text/html; charset=utf-8")
+    );
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let html = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(html.contains("lpcache"), "page title");
+    assert!(
+        html.contains("/dashboard/api/stats"),
+        "stats endpoint wired into the page"
+    );
+    // No external assets: no CDN links or scripts.
+    assert!(!html.contains("https://"), "self-contained page");
+
+    // Anything else under the dashboard path is a 404.
+    let resp = app.oneshot(get_req("/dashboard/nope")).await.expect("resp");
+    assert_eq!(resp.status(), 404);
+    drain(resp).await;
+}
+
+/// Regression: the page served over HTTP must ship the throughput bar
+/// charts that draw the figure of each bar (adaptive stride, figures
+/// above the bars) and the axis line under the charts — the browser
+/// renders the canvas, so this guards the embedded script.
+#[tokio::test]
+async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
+    let (state, _mock, _td) = make_state_dashboard(json!({})).await;
+    let app = router(state);
+
+    let resp = app.oneshot(get_req("/dashboard")).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let html = String::from_utf8(bytes.to_vec()).expect("utf8");
+
+    // one canvas per throughput series
+    for id in ["chart-req", "chart-tok", "chart-cached"] {
+        assert!(html.contains(&format!("canvas id=\"{id}\"")), "canvas {id}");
+    }
+    // per-bar figure with adaptive stride, drawn above each bar
+    assert!(
+        html.contains("const stride = Math.max(1, Math.ceil((String(max).length*charW + 6) / bw));"),
+        "adaptive stride for the on-bar figures"
+    );
+    assert!(
+        html.contains("if((i % stride === 0 && v>0) || hov)"),
+        "figure drawn for each (stride-selected, non-zero) bar or the hovered bar"
+    );
+    assert!(
+        html.contains("ctx.fillText(txt, lx, baseY-bh-4)"),
+        "figure above the bar"
+    );
+    // the axis line under the throughput charts
+    assert!(
+        html.contains("ctx.moveTo(0,h-3.5); ctx.lineTo(w,h-3.5); ctx.stroke();"),
+        "baseline under the bars"
+    );
+    // hover handlers attached to every chart canvas
+    assert!(
+        html.contains("[\"chart-req\",\"chart-tok\",\"chart-cached\"].forEach(id=>attachChart($(id)));"),
+        "hover handlers attached to all three charts"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_counters_update_after_requests() {
+    let (state, _mock, _td) = make_state_dashboard(json!({ "refresh_ms": 750 })).await;
+    let app = router(state);
+
+    // A successful chat request.
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await; // dropping the body records the request
+
+    // A failing request (unknown route → 404).
+    let resp = app.clone().oneshot(get_req("/nope")).await.expect("resp");
+    assert_eq!(resp.status(), 404);
+    drain(resp).await;
+
+    // The dashboard aggregates see both.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["counters"]["total"], 2);
+    assert_eq!(v["counters"]["ok"], 1);
+    assert_eq!(v["counters"]["client_errors"], 1);
+    assert_eq!(v["counters"]["server_errors"], 0);
+    assert_eq!(v["counters"]["success_rate"], 0.5);
+    assert_eq!(v["counters"]["big_requests"], 0);
+    assert_eq!(v["counters"]["streamed"], 0);
+    // The time series holds the bucket both requests fell in.
+    let buckets = v["series"]["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0]["reqs"], 2);
+    assert_eq!(v["series"]["window_reqs"], 2);
+    assert!(v["series"]["req_per_sec"].as_f64().unwrap() > 0.0);
+    // Recent requests, oldest first (the page reverses them for display);
+    // no `path` column: the 404 has no model, the chat request does.
+    let recent = v["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0]["status"], 200);
+    assert_eq!(recent[0]["model"], "m1");
+    assert_eq!(recent[0]["stream"], false);
+    assert!(recent[0]["duration_secs"].as_f64().unwrap() >= 0.0);
+    assert_eq!(recent[1]["status"], 404);
+    assert!(recent[1]["model"].is_null());
+
+    // The configured refresh interval reached the rendered page.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard"))
+        .await
+        .expect("resp");
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let html = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert!(html.contains("const REFRESH = 750;"), "refresh_ms in page");
+
+    // The dashboard's own requests (the stats polls and the page fetch
+    // above) are excluded from the aggregates: a final poll still sees
+    // only the chat request and the 404.
+    let resp = app
+        .oneshot(get_req("/dashboard/api/stats"))
+        .await
+        .expect("resp");
+    let v = read_body(resp).await;
+    assert_eq!(v["counters"]["total"], 2);
+    assert_eq!(v["counters"]["ok"], 1);
+    assert_eq!(v["counters"]["client_errors"], 1);
+    assert_eq!(v["series"]["window_reqs"], 2);
+    let recent = v["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+}
+
+#[tokio::test]
+async fn dashboard_stats_since_scopes_the_range() {
+    let (state, _mock, _td) = make_state_dashboard(json!({})).await;
+    let app = router(state);
+
+    // Two finished requests (a successful chat + a 404).
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await; // dropping the body records the request
+    let resp = app.clone().oneshot(get_req("/nope")).await.expect("resp");
+    assert_eq!(resp.status(), 404);
+    drain(resp).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // `?since=0` = all time: the range holds both requests, and so do
+    // the lifetime counters; the series points sum to the range.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats?since=0"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["range"]["since"], 0);
+    assert_eq!(v["range"]["counters"]["total"], 2);
+    assert_eq!(v["range"]["counters"]["ok"], 1);
+    assert_eq!(v["range"]["counters"]["client_errors"], 1);
+    assert_eq!(v["counters"]["total"], 2);
+    let buckets = v["series"]["buckets"].as_array().unwrap();
+    assert!(!buckets.is_empty());
+    let reqs: u64 = buckets.iter().map(|b| b["reqs"].as_u64().unwrap()).sum();
+    assert_eq!(reqs, 2);
+    // the recent ring is sent whole (the page filters it client-side)
+    assert_eq!(v["recent"].as_array().unwrap().len(), 2);
+
+    // A future `since` is an empty range; the lifetime counters and the
+    // recent ring are unaffected by the filter.
+    let resp = app
+        .clone()
+        .oneshot(get_req(&format!(
+            "/dashboard/api/stats?since={}",
+            now + 3600
+        )))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["range"]["counters"]["total"], 0);
+    assert!(v["range"]["counters"]["success_rate"].is_null());
+    assert!(v["series"]["buckets"].as_array().unwrap().is_empty());
+    assert_eq!(v["counters"]["total"], 2);
+    assert_eq!(v["recent"].as_array().unwrap().len(), 2);
+
+    // A bad `since` value is rejected with a 400.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats?since=abc"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 400);
+    drain(resp).await;
+}
+
+#[tokio::test]
+async fn dashboard_routes_excluded_from_request_log_and_aggregates() {
+    // State with both the request log and the dashboard enabled.
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("tempdir");
+    let log_path = td.path().join("req.log");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_request_log(log_path.clone(), 0, 5, None);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let specs = cfg.plugin_specs().expect("plugin specs");
+    let request_log = lpcache::plugins::load_request_loggers(
+        &lpcache::plugins::Registry::with_builtins(),
+        &specs,
+    )
+    .expect("load request log")
+    .expect("request log spec present");
+    request_log.prepare().expect("prepare request log");
+    let spec = lpcache::plugins::PluginSpec::new("dashboard", json!({}));
+    let dashboard = lpcache::plugins::load_dashboard(
+        &lpcache::plugins::Registry::with_builtins(),
+        std::slice::from_ref(&spec),
+    )
+    .expect("load dashboard")
+    .expect("dashboard spec present");
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter: None,
+        result_store: None,
+        request_log: Some(request_log),
+        dashboard: Some(dashboard),
+    };
+    let app = router(state);
+
+    // The dashboard's own routes, polled the way the page would.
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(get_req("/dashboard/api/stats"))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), 200);
+        drain(resp).await;
+    }
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    drain(resp).await;
+
+    // One real request.
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await; // dropping the body records the request
+
+    // The aggregates see only the chat request.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats"))
+        .await
+        .expect("resp");
+    let v = read_body(resp).await;
+    assert_eq!(v["counters"]["total"], 1);
+    assert_eq!(v["counters"]["ok"], 1);
+    assert_eq!(v["recent"].as_array().unwrap().len(), 1);
+
+    // The request log holds exactly one record (the chat request) — the
+    // dashboard's page/stats requests were never logged.
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    let (_, records) = parse_xlf(&content);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].get("cs-uri"),
+        Some(&"/v1/chat/completions".to_string())
+    );
+}
+
+#[tokio::test]
+async fn dashboard_custom_path() {
+    let (state, _mock, _td) = make_state_dashboard(json!({ "path": "/stats" })).await;
+    let app = router(state);
+
+    let resp = app.clone().oneshot(get_req("/stats")).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let html = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert!(
+        html.contains("/stats/api/stats"),
+        "custom stats path in page"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(get_req("/stats/api/stats"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert!(read_body(resp).await["counters"]["total"].is_number());
+
+    // The default path is not mounted.
+    let resp = app.oneshot(get_req("/dashboard")).await.expect("resp");
+    assert_eq!(resp.status(), 404);
+    drain(resp).await;
 }

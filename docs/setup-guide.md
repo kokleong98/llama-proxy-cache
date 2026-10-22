@@ -180,7 +180,7 @@ listening on 0.0.0.0:8081
 | `STREAM_QUEUE_SIZE`   | `16`                       | capacity of the per-request SSE channel that buffers streamed bytes between the background reader and the HTTP response (must be >= 1; smaller values backpressure the backend faster) |
 | `COALESCE_REQUESTS`   | `false`                    | group concurrent same-cache-key requests into one backend call (Rust-only) |
 | `LLAMA_API_KEY`       | —                          | sent to the backend as `Authorization: Bearer <key>` (llama-server `--api-key`); unset = no auth |
-| `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter) and `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
+| `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables) and `dashboard` (the real-time statistics web page, at most one). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
 | `PREFILTER_BLOCKLIST` | —                          | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
 | `PREFILTER_CASE_INSENSITIVE` | `true`              | **legacy**: keyword matching is case-insensitive (set `false` for exact-case) |
 | `PREFILTER_RESULT_CACHE_DIR` | —                   | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): the **cache-result path**; when set, fresh same-key non-streaming requests are answered from a cached backend result (`{dir}/{key}.json`) before any slot/backend work — streaming requests always bypass the cache; unset/blank = disabled |
@@ -319,6 +319,45 @@ token). Missing values render as `-`.
 
 ```bash
 REQUEST_LOG=true REQUEST_LOG_PATH=/var/log/lpcache/req.log ./target/release/lpcache
+```
+
+### 4.6 Dashboard (optional)
+
+Add a `dashboard` spec to `PLUGINS` (at most one) to serve a
+**self-contained** real-time statistics web page (inline CSS + JS, no
+external assets — nothing to fetch from a CDN, so it works on
+air-gapped boxes). The proxy mounts the page at the plugin's `path`
+(default `/dashboard`) and its JSON stats endpoint at
+`{path}/api/stats` (optionally `?since=<unix seconds>` to scope the
+aggregates to a time range); the page polls it every `refresh_ms`
+(default 2000) and shows:
+
+- **Time filter**: a dropdown of ranges, grouped into *presets* (30
+  seconds, 1 minute, 5 minutes, 15 minutes) and *other* (custom time —
+  a number of seconds — and all time) — that scopes the KPIs, charts
+  and recent table to the selected range (default 5 minutes).
+- **KPIs**: total requests and success rate, cache-hit and KV-restore
+  counts, slots in flight, active coalesced groups, request rate and
+  completion token rate over the selected time range, KV meta files on
+  disk, and average duration / TTFT / backend generation rate.
+- **Charts**: bar charts of requests, completion tokens and cached
+  (restored) prompt tokens per `bucket_secs` bucket (default 5 s; long
+  ranges are coarsened to at most 360 points automatically).
+- **Tables**: per-backend status (URL, slots, busy slots, circuit
+  breaker state), per-slot occupancy grid, and the recent-requests ring
+  (`max_recent`, default 100: status, model, stream, tokens, timing,
+  pipeline outcome), filtered to the selected time range.
+
+Every finished request (success, error, rejection, disconnect — the same
+records the request log gets) feeds the aggregates; the live
+proxy/slot/backend state is snapshotted by the proxy on each stats poll.
+The dashboard's own page/stats requests are excluded from both the
+aggregates and the request log. All params are optional:
+
+```bash
+PLUGINS='[{"name":"dashboard","params":{"path":"/dashboard","refresh_ms":1000}}]' \
+  ./target/release/lpcache
+# → open http://<proxy-host>:8081/dashboard
 ```
 
 ---
@@ -472,11 +511,12 @@ journalctl -u lpcache -f
   filter skips mismatching `wpb`); only change it before caches are needed.
 - **`PLUGINS`** — the general extension point: select and chain
   prefilter plugins (`keyword`, `result_cache`, `chain`) by name with
-  per-plugin `params` (see 4.4). The llama.cpp backend client is always
-  the built-in `llama` plugin, instantiated once per backend (each
-  `BACKENDS` entry or the fallback backend). Takes precedence over the
-  legacy `PREFILTER_*` variables below, which keep working when
-  `PLUGINS` is unset.
+  per-plugin `params` (see 4.4), and optionally enable the
+  `request_log` plugin (4.5) and the `dashboard` plugin (4.6). The
+  llama.cpp backend client is always the built-in `llama` plugin,
+  instantiated once per backend (each `BACKENDS` entry or the fallback
+  backend). Takes precedence over the legacy `PREFILTER_*` variables
+  below, which keep working when `PLUGINS` is unset.
 - **`PREFILTER_BLOCKLIST`** (legacy) — optional comma-separated keyword
   blocklist;
   matching requests are rejected with `400` before any slot/backend work
