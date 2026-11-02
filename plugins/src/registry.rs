@@ -8,8 +8,8 @@
 //! by compile-time wiring in the main module.
 //!
 //! A registry maps plugin names to [`PluginFactory`]s. The built-in
-//! plugins (`keyword`, `chain`, `result_cache`, `llama`, `request_log`)
-//! are registered by
+//! plugins (`keyword`, `qwen_guard`, `chain`, `result_cache`, `llama`,
+//! `request_log`) are registered by
 //! [`ensure_builtin`] (process-wide [`global`] registry) or
 //! [`Registry::with_builtins`] (private registry). Custom plugin crates
 //! register their own factories under new names — in the global registry
@@ -430,6 +430,7 @@ mod tests {
                 "dashboard".to_string(),
                 "keyword".to_string(),
                 "llama".to_string(),
+                "qwen_guard".to_string(),
                 "request_log".to_string(),
                 "result_cache".to_string()
             ]
