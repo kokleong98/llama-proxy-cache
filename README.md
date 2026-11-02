@@ -21,10 +21,15 @@ full prefill cost every time.
    likewise a plugin (the built-in `llama`) and is instantiated per
    `BACKENDS` entry with its URL, API key and timeout from the standard
    config.
-   Two built-in prefilter plugins: the **keyword blocklist** (`keyword`)
-   rejects requests whose message contents contain a blocked keyword
-   (plain substring match, case-insensitive by default) with a `400`
-   JSON error, and the **result cache** (`result_cache`) answers fresh
+   Three built-in prefilter plugins: the **keyword blocklist**
+   (`keyword`) rejects requests whose message contents contain a blocked
+   keyword (plain substring match, case-insensitive by default) with a
+   `400` JSON error; the **Qwen guard** (`qwen_guard`) classifies the
+   request's combined message text with a separate **Qwen3Guard-Gen**
+   llama-server (OpenAI-compatible `/v1/chat/completions`) and rejects
+   with `400` when the verdict hits the configured `reject_levels`
+   (default `["Unsafe"]`) or `reject_categories` (default none); and the
+   **result cache** (`result_cache`) answers fresh
    (non-expired) same-key requests with a previously cached backend
    result stored at `{dir}/{key}.json` — fresh non-streaming results are
    stored there after the backend call; streaming requests are never
@@ -95,7 +100,7 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `LOG_LEVEL`         | `INFO`              | log level (`RUST_LOG` overrides it)            |
 | `STREAM_QUEUE_SIZE` | `16`                | per-request SSE channel capacity (must be >= 1) |
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
-| `PLUGINS` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables below) and `dashboard` (the real-time statistics web page, at most one); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent prefilter specs (when set, `PLUGINS` takes precedence over them) |
+| `PLUGINS` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables below) and `dashboard` (the real-time statistics web page, at most one); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent prefilter specs (when set, `PLUGINS` takes precedence over them) |
 | `REQUEST_LOG` | `false` | when true, one W3C-XLF record per finished request is appended to the request-log file (the built-in `request_log` plugin) |
 | `REQUEST_LOG_PATH` | `lpcache-request.log` | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
 | `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB) | rotation threshold in bytes; the file is rotated when exceeded (`<path>.1`, `<path>.2`, …); `0` = no rotation |
@@ -301,9 +306,12 @@ cargo test --workspace
   ordering, idle-aware, multi-backend, circuit breaker, escalating
   backoff, success/probe recovery, retry slot exclusion), per-slot locking,
   acquire timeout, save semantics (incl. save auto-retry).
-- **Plugin library tests** (61 + 3 doctests, 2 ignored): the
+- **Plugin library tests** (77 + 3 doctests, 2 ignored): the
   `lpcache-plugins` trait objects and built-ins — keyword matching, case
-  sensitivity, content-part arrays, result-cache put/get/expire,
+  sensitivity, content-part arrays, Qwen3Guard-Gen prefilter (output
+  parsing, level/category decision policy, fail-open/fail-closed,
+  verdict LRU, HTTP round-trip against a mock guard server, factory
+  validation), result-cache put/get/expire,
   `RemoveAfterServe` one-shot cleanup, store-trait dispatch,
   `LlamaClient` against a mock server (slot pin in body/options/query,
   JSON/non-JSON answers), the `request_log` plugin (XLF header, field

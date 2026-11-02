@@ -30,7 +30,7 @@ into `cargo test` as shown above.
 
 | # | Test case (exact filter) | Kind | Source | What it verifies | Expected result |
 |---|--------------------------|------|--------|------------------|-----------------|
-| 1 | `registry::tests::with_builtins_registers_all_builtin_plugins` | sync | [L367](../plugins/src/registry.rs#L367) | `Registry::with_builtins()` | `chain`, `keyword`, `llama`, `request_log`, `result_cache` registered; unknown names not |
+| 1 | `registry::tests::with_builtins_registers_all_builtin_plugins` | sync | [L424](../plugins/src/registry.rs#L424) | `Registry::with_builtins()` | `chain`, `dashboard`, `keyword`, `llama`, `qwen_guard`, `request_log`, `result_cache` registered; unknown names not |
 | 2 | `registry::tests::global_registry_and_ensure_builtin_are_idempotent` | sync | [L545](../plugins/src/registry.rs#L545) | `global()` + repeated `ensure_builtin()` | same registry; built-ins registered exactly once |
 | 3 | `registry::tests::register_custom_plugin_and_create_it` | sync | [L425](../plugins/src/registry.rs#L425) | custom factory registered at runtime | created by name; `name()` = custom plugin |
 | 4 | `registry::tests::unknown_plugin_is_an_error` | sync | [L466](../plugins/src/registry.rs#L466) | spec naming an unregistered plugin | `PluginError::UnknownPlugin` naming it |

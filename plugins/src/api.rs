@@ -4,7 +4,8 @@
 //!
 //! - [`Prefilter`] — request prefilter, consulted **before** any slot
 //!   acquisition, KV-cache restore/save, or backend dispatch. Built-ins:
-//!   `keyword`, `chain`, `result_cache` (see the `builtin` module).
+//!   `keyword`, `qwen_guard`, `chain`, `result_cache` (see the `builtin`
+//!   module).
 //! - [`ResultStore`] — stores fresh non-streaming backend results (the
 //!   `result_cache` plugin's backing cache implements it; the proxy stores
 //!   a result after every successful non-streaming backend call).

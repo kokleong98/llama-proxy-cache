@@ -8,6 +8,7 @@
 //! | name             | adapters provided                    | params |
 //! |------------------|--------------------------------------|--------|
 //! | `keyword`        | prefilter                            | `keywords` (array or comma string), `case_insensitive` (default `true`) |
+//! | `qwen_guard`     | prefilter (Qwen3Guard-Gen safety check over a separate llama-server) | `url` (required), `api_key`, `model`, `timeout_secs` (default `30`), `max_input_chars` (default `0` = none), `reject_levels` (default `["Unsafe"]`), `reject_categories` (default `[]`), `on_error` / `on_unparseable` (`"accept"`, default, or `"reject"`), `cache_max` (default `0` = off) |
 //! | `chain`          | prefilter (runs nested plugins in order) | `filters`: array of plugin specs |
 //! | `result_cache`   | prefilter + result store             | `dir`, `ttl_secs` (default `300`), `cleanup` (`"remove_after_serve"` or omitted) |
 //! | `llama`          | llama.cpp backend client             | `url`, `api_key` (optional), `timeout_secs` (default `600`) |
@@ -18,6 +19,7 @@ pub mod chain;
 pub mod dashboard;
 pub mod keyword;
 pub mod llama;
+pub mod qwen_guard;
 pub mod request_log;
 pub mod result_cache;
 
@@ -28,6 +30,7 @@ use std::sync::Arc;
 /// Existing entries under those names are replaced.
 pub fn register(registry: &Registry) {
     registry.register("keyword", Arc::new(keyword::KeywordPluginFactory));
+    registry.register("qwen_guard", Arc::new(qwen_guard::QwenGuardPluginFactory));
     registry.register(
         "chain",
         Arc::new(chain::ChainPluginFactory::new(registry.clone())),

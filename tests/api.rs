@@ -2639,7 +2639,9 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
     }
     // per-bar figure with adaptive stride, drawn above each bar
     assert!(
-        html.contains("const stride = Math.max(1, Math.ceil((String(max).length*charW + 6) / bw));"),
+        html.contains(
+            "const stride = Math.max(1, Math.ceil((String(max).length*charW + 6) / bw));"
+        ),
         "adaptive stride for the on-bar figures"
     );
     assert!(
@@ -2657,7 +2659,9 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
     );
     // hover handlers attached to every chart canvas
     assert!(
-        html.contains("[\"chart-req\",\"chart-tok\",\"chart-cached\"].forEach(id=>attachChart($(id)));"),
+        html.contains(
+            "[\"chart-req\",\"chart-tok\",\"chart-cached\"].forEach(id=>attachChart($(id)));"
+        ),
         "hover handlers attached to all three charts"
     );
 }

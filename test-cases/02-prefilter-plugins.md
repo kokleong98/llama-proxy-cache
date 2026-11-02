@@ -9,7 +9,8 @@ Part of the [lpcache regression test cases](README.md): every entry maps
 The `Prefilter` trait implementations from the `lpcache-plugins`
 library — loaded by the proxy from `PLUGINS` specs (or specs synthesized
 from the legacy `PREFILTER_*` variables) and consulted before any
-slot/backend work.
+slot/backend work. The Qwen3Guard-Gen safety prefilter (`qwen_guard`)
+has its own module page: [12. Qwen guard prefilter](12-qwen-guard-plugin.md).
 
 ## Module overview
 

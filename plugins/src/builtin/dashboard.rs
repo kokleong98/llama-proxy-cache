@@ -1255,7 +1255,11 @@ mod tests {
         assert!(page.contains("id=\"custom-secs\""));
         // no external assets (the inline SVG's `xmlns` namespace is not a
         // load — strip it before checking)
-        assert!(!page.replace("http://www.w3.org/2000/svg", "").contains("http://"));
+        assert!(
+            !page
+                .replace("http://www.w3.org/2000/svg", "")
+                .contains("http://")
+        );
         assert!(!page.contains("__REFRESH_MS__"));
         assert!(!page.contains("__STATS_PATH__"));
     }
@@ -1273,7 +1277,9 @@ mod tests {
         }
         // per-bar figure with adaptive stride, drawn above each bar
         assert!(
-            page.contains("const stride = Math.max(1, Math.ceil((String(max).length*charW + 6) / bw));"),
+            page.contains(
+                "const stride = Math.max(1, Math.ceil((String(max).length*charW + 6) / bw));"
+            ),
             "adaptive stride for the on-bar figures"
         );
         assert!(
@@ -1294,7 +1300,9 @@ mod tests {
         // hover highlight + tooltip wired to every chart canvas
         assert!(page.contains("function attachChart(cv)"));
         assert!(
-            page.contains("[\"chart-req\",\"chart-tok\",\"chart-cached\"].forEach(id=>attachChart($(id)));"),
+            page.contains(
+                "[\"chart-req\",\"chart-tok\",\"chart-cached\"].forEach(id=>attachChart($(id)));"
+            ),
             "hover handlers attached to all three charts"
         );
     }

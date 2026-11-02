@@ -8,8 +8,8 @@ documents every test with its exact runnable filter, sync/async kind and
 source line, plus the module's fixtures/helpers, how to run just that
 module, and a coverage map of the surface it exercises.
 
-**Total: 197 test cases** — 80 lpcache unit + 55 lpcache-plugins
-unit + 47 API integration + 15 client integration.
+**Total: 228 test cases** — 80 lpcache unit + 80 lpcache-plugins
+unit + 53 API integration + 15 client integration.
 
 | # | Suite | Location | Tests | Kinds |
 |---|-------|----------|-------|-------|
@@ -24,15 +24,21 @@ unit + 47 API integration + 15 client integration.
 | 9 | [Result cache plugin](09-result-cache-plugin.md) | `plugins/src/builtin/result_cache.rs` | 14 | 7 sync + 7 async |
 | 10 | [Plugin registry (specs, loading, chaining)](10-plugin-registry.md) | `plugins/src/registry.rs` | 9 | 9 sync |
 | 11 | [Request log plugin (W3C-XLF format, rotation)](11-request-log-plugin.md) | `plugins/src/builtin/request_log.rs` | 13 | 13 sync |
+| 12 | [Qwen guard prefilter (Qwen3Guard-Gen safety check)](12-qwen-guard-plugin.md) | `plugins/src/builtin/qwen_guard.rs` | 16 | 8 sync + 8 async |
+
+The module pages catalog 213 of the 228 cases; the remaining 15 (9
+`dashboard` plugin unit tests + 6 newer API E2E cases added after the
+catalog was written) run in the same suites and pass under
+`cargo test --workspace`.
 
 ## How to run
 
 ```sh
 cd lpcache
-cargo test --workspace        # full regression suite (197 tests + 3 doctests, ~4 s)
+cargo test --workspace        # full regression suite (228 tests + 3 doctests, ~4 s)
 cargo test --lib              # 80 lpcache unit tests only
-cargo test -p lpcache-plugins # 55 plugin library unit tests
-cargo test --test api         # 47 API integration tests
+cargo test -p lpcache-plugins # 80 plugin library unit tests
+cargo test --test api         # 53 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test <name-substring>   # run a single test by name filter
 cargo clippy --all-targets    # lint gate (expected: 0 warnings)

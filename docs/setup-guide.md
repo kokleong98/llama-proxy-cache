@@ -12,7 +12,7 @@ client (OpenAI API)                llama.cpp backend(s)
 │ lpcache (this project)                              │
 │  • prefix hashing  • big/small  • LCP restore lookup   │
 │  • slot locks (free-first, then LRU)  • SSE passthrough│
-│  • prefilter: keyword reject + result-cache serve (opt.)   │
+│  • prefilter: keyword/guard reject + result-cache serve (opt.) │
 │  • saves KV cache + writes <key>.meta.json            │
 └────────────────────────────────────────────────────────┘
 ```
@@ -180,7 +180,7 @@ listening on 0.0.0.0:8081
 | `STREAM_QUEUE_SIZE`   | `16`                       | capacity of the per-request SSE channel that buffers streamed bytes between the background reader and the HTTP response (must be >= 1; smaller values backpressure the backend faster) |
 | `COALESCE_REQUESTS`   | `false`                    | group concurrent same-cache-key requests into one backend call (Rust-only) |
 | `LLAMA_API_KEY`       | —                          | sent to the backend as `Authorization: Bearer <key>` (llama-server `--api-key`); unset = no auth |
-| `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables) and `dashboard` (the real-time statistics web page, at most one). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
+| `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables) and `dashboard` (the real-time statistics web page, at most one). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
 | `PREFILTER_BLOCKLIST` | —                          | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
 | `PREFILTER_CASE_INSENSITIVE` | `true`              | **legacy**: keyword matching is case-insensitive (set `false` for exact-case) |
 | `PREFILTER_RESULT_CACHE_DIR` | —                   | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): the **cache-result path**; when set, fresh same-key non-streaming requests are answered from a cached backend result (`{dir}/{key}.json`) before any slot/backend work — streaming requests always bypass the cache; unset/blank = disabled |
@@ -251,14 +251,26 @@ PLUGINS='[
 ]'
 ```
 
-Two functional prefilter plugins are built in (enable either or both; the
-`chain` plugin additionally composes nested plugin specs under a single
-entry via its `filters` param):
+Three functional prefilter plugins are built in (enable any combination;
+the `chain` plugin additionally composes nested plugin specs under a
+single entry via its `filters` param):
 
 - **Keyword blocklist** (`keyword`) — rejects a request whose message
   contents contain a blocked keyword with a `400` JSON error. Matching is
   a plain substring, case-insensitive by default
   (`case_insensitive` param). Logs `prefilter_reject filter=keyword`.
+- **Qwen guard** (`qwen_guard`) — classifies the request's combined
+  message text with a **Qwen3Guard-Gen** model served by a separate
+  llama-server (or any OpenAI-compatible `/v1/chat/completions`
+  endpoint) and rejects with a `400` JSON error when the verdict's
+  severity level is in `reject_levels` (default `["Unsafe"]`) or any of
+  its categories is in `reject_categories` (default none). Params:
+  `url` (required, the guard server base URL), `api_key`, `model`,
+  `timeout_secs` (default `30`), `max_input_chars` (default `0` = no
+  truncation), `on_error` / `on_unparseable` (`"accept"` default — fail
+  open; `"reject"` fails closed with `503`/`400`), and `cache_max`
+  (default `0` = off; bounded LRU of verdicts keyed by request KV cache
+  key). Logs `prefilter_reject filter=qwen_guard`.
 - **Result cache** (`result_cache`) — answers a fresh (non-expired)
   same-key request with a previously cached backend result (the original
   JSON body and status code), read from `{dir}/{key}.json`. Fresh
@@ -271,7 +283,7 @@ entry via its `filters` param):
   `cleanup: "remove_after_serve"` param turns it into a one-shot cache
   (the entry is deleted after it is served once).
 
-When **both** are enabled they are chained in config order — put
+When **several** are enabled they are chained in config order — put
 `keyword` first so a blocked request is rejected with `400` before a cache
 hit could serve it.
 
