@@ -30,8 +30,9 @@
 //!   the request outright.
 //! - `reject_categories` (default `[]`): categories that reject the
 //!   request when present in the verdict (independent of the level).
-//! - `on_error` (default `"accept"`): `"accept"` or `"reject"` — what to
-//!   do when the guard call fails (transport/HTTP/timeout).
+//! - `on_error` (default `"accept"`): `"accept"` or `"reject"` (aliases
+//!   `"allow"`/`"block"`) — what to do when the guard call fails
+//!   (transport/HTTP/timeout).
 //! - `on_unparseable` (default `"accept"`): `"accept"` or `"reject"` —
 //!   what to do when the guard responds but its output cannot be parsed
 //!   into a safety level / categories.
@@ -44,6 +45,13 @@
 //! `Violent`, `Non-violent Illegal Acts`, `Sexual Content or Sexual
 //! Acts`, `PII`, `Suicide & Self-Harm`, `Unethical Acts`, `Politically
 //! Sensitive Topics`, `Copyright Violation`, `Jailbreak` (input only).
+//!
+//! A non-2xx response from the guard server (llama-server answers
+//! `503 {"error":{"message":"Loading model"}}` while the model is still
+//! loading) is a *failed check* — it follows `on_error`, never
+//! `on_unparseable`, so a fail-closed deployment cannot fail open just
+//! because the error body happened to be valid JSON without a
+//! `choices` array.
 //!
 //! Rejections are `400` with a message naming the level/categories that
 //! tripped; a rejected request never reaches the chat backend — no slot

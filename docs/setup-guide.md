@@ -267,10 +267,13 @@ single entry via its `filters` param):
   its categories is in `reject_categories` (default none). Params:
   `url` (required, the guard server base URL), `api_key`, `model`,
   `timeout_secs` (default `30`), `max_input_chars` (default `0` = no
-  truncation), `on_error` / `on_unparseable` (`"accept"` default — fail
-  open; `"reject"` fails closed with `503`/`400`), and `cache_max`
-  (default `0` = off; bounded LRU of verdicts keyed by request KV cache
-  key). Logs `prefilter_reject filter=qwen_guard`.
+  truncation), `on_error` / `on_unparseable` (`"accept"` default, aliases
+  `"allow"`/`"block"` — fail open; `"reject"` fails closed with
+  `503`/`400`), and `cache_max` (default `0` = off; bounded LRU of
+  verdicts keyed by request KV cache key). Non-2xx guard responses
+  (llama-server answers `503` while the model is still loading) follow
+  `on_error` — warm up the guard before routing traffic when failing
+  closed. Logs `prefilter_reject filter=qwen_guard`.
 - **Result cache** (`result_cache`) — answers a fresh (non-expired)
   same-key request with a previously cached backend result (the original
   JSON body and status code), read from `{dir}/{key}.json`. Fresh

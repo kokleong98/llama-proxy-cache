@@ -306,11 +306,11 @@ cargo test --workspace
   ordering, idle-aware, multi-backend, circuit breaker, escalating
   backoff, success/probe recovery, retry slot exclusion), per-slot locking,
   acquire timeout, save semantics (incl. save auto-retry).
-- **Plugin library tests** (77 + 3 doctests, 2 ignored): the
+- **Plugin library tests** (81 + 3 doctests, 2 ignored): the
   `lpcache-plugins` trait objects and built-ins — keyword matching, case
   sensitivity, content-part arrays, Qwen3Guard-Gen prefilter (output
   parsing, level/category decision policy, fail-open/fail-closed,
-  verdict LRU, HTTP round-trip against a mock guard server, factory
+  HTTP-error routing to `on_error`, verdict LRU, HTTP round-trip against a mock guard server, factory
   validation), result-cache put/get/expire,
   `RemoveAfterServe` one-shot cleanup, store-trait dispatch,
   `LlamaClient` against a mock server (slot pin in body/options/query,
