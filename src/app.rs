@@ -656,11 +656,11 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
             }
             PrefilterDecision::Serve { status, body } => {
                 tracing::info!(
-                    "prefilter_serve filter={} key={} status={status} n_words={n_words}",
+                    "prefilter_serve filter={} key={} status={status} stream={} n_words={n_words}",
                     pf.name(),
-                    short16(&key)
+                    short16(&key),
+                    stream
                 );
-                let st = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
                 pl.cache_hit = Some(true);
                 // The cached backend result carries the original
                 // `usage`/`timings` — log them as this request's
@@ -668,6 +668,15 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
                 if let Some(perf) = &pl.perf {
                     fill_perf_from_value(perf, &body);
                 }
+                // A streaming client expects SSE, not a JSON blob: convert
+                // the cached completion to a `text/event-stream` body. A
+                // non-2xx cached result is served as JSON (an error), since
+                // only a successful completion can be turned into a stream.
+                if stream && status == 200 {
+                    let sse = sse_from_completion(&body, &client_model);
+                    return with_pipeline_log(sse_response_bytes(&sse), pl);
+                }
+                let st = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
                 return with_pipeline_log((st, axum::Json(body)).into_response(), pl);
             }
         }
@@ -971,6 +980,11 @@ async fn run_pipeline(
             let prefix2 = prefix.to_string();
             let blocks2: Vec<String> = blocks.to_vec();
             let model_id2 = backend_model_id.to_string();
+            // Result cache: aggregate the completed stream into a
+            // non-streaming completion and store it (only when the store
+            // opts into caching streaming results).
+            let client_model2 = client_model.to_string();
+            let result_store2: Option<Arc<dyn ResultStore>> = state.result_store.clone();
             // Coalescing: share every SSE chunk with the group's followers
             // and finish their flight when the stream ends.
             let flight: Option<(String, Arc<Flight>)> = grouped.clone();
@@ -987,6 +1001,8 @@ async fn run_pipeline(
             tokio::spawn(async move {
                 let mut s = sc.stream;
                 let mut client_gone = false;
+                // Full SSE bytes (for the result cache when enabled).
+                let mut sse_all: Vec<u8> = Vec::new();
                 let stream_t0 = Instant::now();
                 let mut ttft_ms: Option<f64> = None;
                 // Line buffer for SSE perf extraction (a chunk may split a
@@ -1007,6 +1023,7 @@ async fn run_pipeline(
                         chunk = s.next() => match chunk {
                             None => break,
                             Some(Ok(bytes)) if !bytes.is_empty() => {
+                                sse_all.extend_from_slice(&bytes);
                                 if let Some((_, f)) = &flight {
                                     f.append_sse(&bytes);
                                 }
@@ -1079,6 +1096,19 @@ async fn run_pipeline(
                 }
                 sm.release(guard);
                 tracing::info!("stream_reader_done g={g} key={} saved={ok}", short16(&key2));
+                // Result cache: a fully-streamed (not client-aborted) result
+                // is aggregated into a non-streaming completion and stored,
+                // so a later same-key request — streaming or not — can be
+                // served from the cache.
+                if !client_gone
+                    && let Some(store) = &result_store2
+                    && store.caches_streaming()
+                {
+                    let completion = sse_to_completion(&sse_all, &client_model2);
+                    if let Err(e) = store.store(&key2, 200, &completion) {
+                        tracing::warn!("result_cache_store_fail key={}: {e}", short16(&key2));
+                    }
+                }
                 // Finish the coalesced group: followers receive the full
                 // stream (whatever was produced before the client went away
                 // or the upstream ended).

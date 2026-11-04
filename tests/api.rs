@@ -1871,6 +1871,130 @@ async fn result_cache_stream_requests_bypass_cache() {
     assert_eq!(mock.state.chat_bodies().await.len(), 2);
 }
 
+/// Like [`make_state_result_cache`], but the `result_cache` plugin is loaded
+/// from a `PLUGINS` spec with `cache_streaming: true`, so completed
+/// streaming results are aggregated to a non-streaming completion and
+/// cached, and cached entries are served to streaming clients (as SSE).
+async fn make_state_result_cache_streaming(
+    ttl_secs: f64,
+) -> (AppState, MockLlama, tempfile::TempDir, tempfile::TempDir) {
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let td_rc = tempfile::tempdir().expect("result cache dir");
+    let plugins = json!([{
+        "name": "result_cache",
+        "params": {
+            "dir": td_rc.path().to_string_lossy(),
+            "ttl_secs": ttl_secs,
+            "cache_streaming": true,
+        },
+    }]);
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_plugins(Some(plugins.to_string()));
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        dashboard: None,
+    };
+    (state, mock, td, td_rc)
+}
+
+#[tokio::test]
+async fn result_cache_caches_streaming_result_and_serves_streaming_client() {
+    let (state, mock, _td, td_rc) = make_state_result_cache_streaming(300.0).await;
+    let app = router(state);
+    let msgs = json!([{ "role": "user", "content": "stream cache" }]);
+    let stream = json!({ "model": "m1", "stream": true, "messages": msgs });
+    // 1) A streaming request reaches the backend and streams; when the
+    //    stream completes, it is aggregated into a non-streaming completion
+    //    and stored under the key.
+    let r1 = app.clone().oneshot(post_json(&stream)).await.expect("resp");
+    assert_eq!(r1.status(), 200);
+    assert_eq!(
+        r1.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+    let b1 = to_bytes(r1.into_body(), usize::MAX).await.expect("body");
+    assert!(String::from_utf8_lossy(&b1).contains("[DONE]"));
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    let entries: Vec<_> = std::fs::read_dir(td_rc.path())
+        .expect("read cache dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let stored: Value =
+        serde_json::from_slice(&std::fs::read(&entries[0]).expect("read entry")).expect("entry");
+    // the mock streams "Hello" + " world"; the aggregated content joins them.
+    assert_eq!(
+        stored
+            .pointer("/body/choices/0/message/content")
+            .and_then(Value::as_str),
+        Some("Hello world")
+    );
+    // 2) Same key, stream=true: served from the cache (converted to SSE) —
+    //    no new backend call.
+    let r2 = app.clone().oneshot(post_json(&stream)).await.expect("resp");
+    assert_eq!(r2.status(), 200);
+    assert_eq!(
+        r2.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+    let b2 = to_bytes(r2.into_body(), usize::MAX).await.expect("body");
+    let s2 = String::from_utf8_lossy(&b2);
+    assert!(s2.contains("Hello world"));
+    assert!(s2.contains("[DONE]"));
+    assert_eq!(mock.state.chat_bodies().await.len(), 1); // no backend call
+    // 3) Same key, stream=false: also served from the cache (as JSON) — the
+    //    aggregated result is usable for non-streaming clients too.
+    let non_stream = json!({ "model": "m1", "stream": false, "messages": msgs });
+    let r3 = app
+        .clone()
+        .oneshot(post_json(&non_stream))
+        .await
+        .expect("resp");
+    assert_eq!(r3.status(), 200);
+    let v3 = read_body(r3).await;
+    assert_eq!(
+        v3.pointer("/choices/0/message/content")
+            .and_then(Value::as_str),
+        Some("Hello world")
+    );
+    assert_eq!(mock.state.chat_bodies().await.len(), 1); // no backend call
+}
+
 #[tokio::test]
 async fn result_cache_remove_after_serve_cleanup() {
     let (mut state, mock, _td, td_rc) = make_state_result_cache(300.0).await;

@@ -13,11 +13,15 @@
 //! client with the cached backend result (`PrefilterDecision::Serve`) —
 //! **no slot is acquired, no backend is called, no KV cache is
 //! restored/saved, no meta file is written, and the request never leads or
-//! joins a coalescing group**. Streaming requests always pass through
-//! (`Accept`): only non-streaming JSON results are cached, so a
-//! `stream: true` request can never be answered from the cache. The proxy
-//! obtains the same cache from `Prefilter::result_store` and stores fresh
-//! non-streaming backend results in it after the backend call.
+//! joins a coalescing group**. By default streaming requests always pass
+//! through (`Accept`): only non-streaming JSON results are cached, so a
+//! `stream: true` request can never be answered from the cache. With
+//! `cache_streaming` enabled, the plugin also (a) serves fresh entries to
+//! streaming clients — the proxy converts the cached completion to SSE —
+//! and (b) accepts aggregated streaming backend results (the proxy turns a
+//! completed SSE stream into a non-streaming completion before storing it).
+//! The proxy obtains the same cache from `Prefilter::result_store` and
+//! stores fresh backend results in it after the backend call.
 //!
 //! Post-serve cleanup: an optional [`PostCleanup`] adapter runs after a
 //! cached result has been read for the client (before the response is
@@ -31,6 +35,9 @@
 //!   never expire.
 //! - `cleanup` (optional): `"remove_after_serve"` attaches the built-in
 //!   one-shot cleanup adapter; omitted/`null` = no cleanup.
+//! - `cache_streaming` (default `false`): also cache streaming results
+//!   (aggregated to a non-streaming completion) and serve cached results to
+//!   streaming clients (converted to SSE).
 
 use crate::api::{PostCleanup, Prefilter, PrefilterDecision, PrefilterRequest, ResultStore};
 use crate::registry::{PluginError, PluginFactory};
@@ -68,13 +75,34 @@ pub struct ResultCache {
     dir: PathBuf,
     /// Per-entry expiry; zero = entries never expire.
     ttl: Duration,
+    /// When true, streaming backend results are also aggregated into a
+    /// non-streaming completion and cached, and fresh entries are served to
+    /// streaming clients (converted to SSE by the proxy).
+    cache_streaming: bool,
 }
 
 impl ResultCache {
     /// Build a cache over `dir` with per-entry expiry `ttl`
-    /// (zero = never expires). The directory is created on first write.
+    /// (zero = never expires) and streaming support `cache_streaming`. The
+    /// directory is created on first write.
     pub fn new(dir: PathBuf, ttl: Duration) -> Self {
-        Self { dir, ttl }
+        Self {
+            dir,
+            ttl,
+            cache_streaming: false,
+        }
+    }
+
+    /// Enable (or disable) caching of streaming results and serving cached
+    /// results to streaming clients. See the module docs.
+    pub fn with_cache_streaming(mut self, cache_streaming: bool) -> Self {
+        self.cache_streaming = cache_streaming;
+        self
+    }
+
+    /// Whether this cache also handles streaming results (see the field).
+    pub fn cache_streaming(&self) -> bool {
+        self.cache_streaming
     }
 
     /// The cache-result path (directory holding the `{key}.json` entries).
@@ -159,6 +187,10 @@ impl ResultStore for ResultCache {
         self.put(key, status, body)
             .map_err(|e| format!("write {}: {e}", self.path_for(key).display()))
     }
+
+    fn caches_streaming(&self) -> bool {
+        self.cache_streaming
+    }
 }
 
 /// Built-in cleanup: deletes the cached entry file after it has been
@@ -190,8 +222,9 @@ impl PostCleanup for RemoveAfterServe {
 /// result, the client receives that result directly
 /// ([`PrefilterDecision::Serve`]) before any slot/backend work.
 ///
-/// - Streaming requests always return [`PrefilterDecision::Accept`]: only
-///   non-streaming JSON results are cached.
+/// - Streaming requests return [`PrefilterDecision::Accept`] unless the
+///   cache has streaming support enabled (`cache_streaming`); when enabled,
+///   a fresh hit is served and the proxy converts it to SSE.
 /// - A cache miss returns [`PrefilterDecision::Accept`]; the normal
 ///   pipeline runs and stores a fresh result (see the `lpcache` app).
 /// - An optional [`PostCleanup`] adapter runs after a hit is read.
@@ -241,17 +274,21 @@ impl Prefilter for CachedResultPrefilter {
     }
 
     async fn check(&self, req: &PrefilterRequest) -> PrefilterDecision {
-        // Streaming requests are never served from the cache: a cached
-        // JSON answer would not match the client's SSE expectation.
-        if req.stream {
+        // Streaming requests are served from the cache only when streaming
+        // support is enabled: the proxy converts the cached completion to
+        // SSE (`text/event-stream`) before sending it, so the client still
+        // receives a stream. By default streaming requests always pass
+        // through, because only non-streaming JSON results are cached.
+        if req.stream && !self.cache.cache_streaming() {
             return PrefilterDecision::Accept;
         }
         let Some((status, body)) = self.cache.get(&req.key) else {
             return PrefilterDecision::Accept;
         };
         tracing::info!(
-            "result_cache_hit key={} status={status} cleanup={}",
+            "result_cache_hit key={} status={status} stream={} cleanup={}",
             req.key.chars().take(16).collect::<String>(),
+            req.stream,
             self.cleanup.as_ref().map(|c| c.name()).unwrap_or("none")
         );
         if let Some(c) = &self.cleanup {
@@ -280,6 +317,10 @@ struct ResultCacheParams {
     ttl_secs: f64,
     #[serde(default)]
     cleanup: Option<String>,
+    /// Also cache streaming results (aggregated to a non-streaming
+    /// completion) and serve cached results to streaming clients.
+    #[serde(default)]
+    cache_streaming: bool,
 }
 
 fn default_ttl_secs() -> f64 {
@@ -296,6 +337,7 @@ impl PluginFactory for ResultCachePluginFactory {
             dir,
             ttl_secs,
             cleanup,
+            cache_streaming,
         } = ResultCacheParams::deserialize(params).map_err(|e| PluginError::BadParams {
             name: NAME.to_string(),
             message: e.to_string(),
@@ -307,7 +349,9 @@ impl PluginFactory for ResultCachePluginFactory {
             });
         }
         let ttl = Duration::from_secs_f64(ttl_secs.max(0.0));
-        let cache = Arc::new(ResultCache::new(PathBuf::from(dir), ttl));
+        let cache = Arc::new(
+            ResultCache::new(PathBuf::from(dir), ttl).with_cache_streaming(cache_streaming),
+        );
         let pf = CachedResultPrefilter::new(Arc::clone(&cache));
         let pf = match cleanup {
             None => pf,
@@ -473,6 +517,52 @@ mod tests {
         let pf = CachedResultPrefilter::new(cache);
         // stream=true even with a fresh hit -> Accept (never served)
         assert_eq!(pf.check(&preq("k1", true)).await, PrefilterDecision::Accept);
+    }
+
+    #[tokio::test]
+    async fn prefilter_serves_streaming_when_enabled() {
+        let td = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            ResultCache::new(td.path().to_path_buf(), Duration::from_secs(60))
+                .with_cache_streaming(true),
+        );
+        cache
+            .put(
+                "k1",
+                200,
+                &json!({ "object": "chat.completion", "choices": [] }),
+            )
+            .unwrap();
+        let pf = CachedResultPrefilter::new(cache);
+        // stream=true with a fresh hit and cache_streaming on -> Serve
+        assert_eq!(
+            pf.check(&preq("k1", true)).await,
+            PrefilterDecision::Serve {
+                status: 200,
+                body: json!({ "object": "chat.completion", "choices": [] })
+            }
+        );
+    }
+
+    #[test]
+    fn factory_cache_streaming_param() {
+        let f = ResultCachePluginFactory;
+        let td = tempfile::tempdir().unwrap();
+        // default (omitted) -> caches_streaming false
+        let pf = f
+            .create_prefilter(&json!({ "dir": td.path().to_string_lossy().into_owned() }))
+            .unwrap()
+            .expect("prefilter");
+        assert!(!pf.result_store().unwrap().caches_streaming());
+        // explicit true -> caches_streaming true
+        let pf = f
+            .create_prefilter(&json!({
+                "dir": td.path().to_string_lossy().into_owned(),
+                "cache_streaming": true
+            }))
+            .unwrap()
+            .expect("prefilter");
+        assert!(pf.result_store().unwrap().caches_streaming());
     }
 
     #[tokio::test]

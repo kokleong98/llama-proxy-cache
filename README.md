@@ -33,7 +33,10 @@ full prefill cost every time.
    (non-expired) same-key requests with a previously cached backend
    result stored at `{dir}/{key}.json` — fresh non-streaming results are
    stored there after the backend call; streaming requests are never
-   served from the cache. In both cases the request never reaches
+   served from the cache by default (set the plugin's `cache_streaming`
+   param to `true` to also aggregate completed streaming results into a
+   non-streaming completion and serve cached entries to streaming clients
+   as SSE). In both cases the request never reaches
    llama-server — no slot is acquired, no KV cache is restored or saved,
    no meta file is written, and the request never leads or joins a
    coalescing group (several plugins are chained in config order, so the
