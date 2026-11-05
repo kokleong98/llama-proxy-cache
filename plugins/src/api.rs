@@ -60,6 +60,10 @@ pub struct PrefilterRequest {
     pub n_words: usize,
     /// `true` when `n_words > BIG_THRESHOLD_WORDS` (cache-eligible).
     pub is_big: bool,
+    /// The request's HTTP headers as `(lowercased name, value)` pairs
+    /// (empty when the proxy has none to share). Names are lowercased so
+    /// lookups are plain case-sensitive string compares.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Outcome of a prefilter check.
@@ -145,6 +149,16 @@ pub trait ResultStore: Send + Sync {
     /// Store (or refresh) the result for `key`. Failures are logged by the
     /// proxy; they never affect the in-flight response.
     fn store(&self, key: &str, status: u16, body: &Value) -> Result<(), String>;
+
+    /// Whether this store should also accept results produced by *streaming*
+    /// backend calls. When `true`, the proxy aggregates a completed SSE
+    /// stream into a non-streaming completion (see the `lpcache` app) and
+    /// stores it here, so a later same-key request — streaming or not — can
+    /// be served from the cache. The default is `false`: only non-streaming
+    /// backend results are stored.
+    fn caches_streaming(&self) -> bool {
+        false
+    }
 }
 
 /// Post-serve cleanup adapter: invoked after the proxy has read a cached

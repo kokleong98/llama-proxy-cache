@@ -133,6 +133,18 @@ pub struct BackendConf {
     /// this directory.
     #[serde(default)]
     pub slot_save_path: Option<String>,
+    /// Whether this backend supports KV cache save/restore (needs
+    /// llama-server >= 1.05.40 with `--slot-save-path`). When `false`,
+    /// the proxy never sends `restore_cache_slot` to this backend and
+    /// never runs the post-completion KV save / meta write for a request
+    /// served by it. Default: `true`.
+    #[serde(default = "default_true")]
+    pub kv_cache: bool,
+}
+
+/// Serde default for `BackendConf::kv_cache`: KV save/restore enabled.
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +512,7 @@ impl Config {
                     url,
                     n_slots,
                     slot_save_path: None,
+                    kv_cache: true,
                 }]
             }
         };
@@ -1042,6 +1055,19 @@ mod tests {
         assert_eq!(c.backends[0].slot_save_path.as_deref(), Some("/var/kv/a"));
         assert_eq!(c.backends[1].slot_save_path, None);
         assert_eq!(c.slot_save_dirs(), vec![std::path::Path::new("/var/kv/a")]);
+    }
+
+    #[test]
+    fn backends_kv_cache_flag() {
+        let c = Config::from_env_map(&vars(&[(
+            "BACKENDS",
+            r#"[{"url":"http://a:1","n_slots":2},{"url":"http://b:2","n_slots":1,"kv_cache":false}]"#,
+        )]));
+        assert!(c.backends[0].kv_cache, "omitted kv_cache defaults to true");
+        assert!(
+            !c.backends[1].kv_cache,
+            "explicit kv_cache=false is honored"
+        );
     }
 
     #[test]

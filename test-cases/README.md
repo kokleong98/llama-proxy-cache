@@ -19,15 +19,15 @@ unit + 53 API integration + 15 client integration.
 | 4 | [Request coalescing (`SingleFlight`)](04-coalescing.md) | `src/coalesce.rs` | 4 | 3 sync + 1 async |
 | 5 | [llama backend client plugin](05-llama-backend-plugin.md) | `plugins/src/builtin/llama.rs` | 5 | 4 sync + 1 async |
 | 6 | [Slot management (selection, locks, breaker)](06-slot-management.md) | `src/slot_manager.rs` | 21 | 21 async |
-| 7 | [API end-to-end (proxy ↔ mock llama.cpp)](07-api-e2e.md) | `tests/api.rs` | 47 | 47 async |
+| 7 | [API end-to-end (proxy ↔ mock llama.cpp)](07-api-e2e.md) | `tests/api.rs` | 48 | 48 async |
 | 8 | [Backend client — HTTP behavior](08-backend-client.md) | `tests/client.rs` | 15 | 15 async |
-| 9 | [Result cache plugin](09-result-cache-plugin.md) | `plugins/src/builtin/result_cache.rs` | 14 | 7 sync + 7 async |
+| 9 | [Result cache plugin](09-result-cache-plugin.md) | `plugins/src/builtin/result_cache.rs` | 18 | 8 sync + 10 async |
 | 10 | [Plugin registry (specs, loading, chaining)](10-plugin-registry.md) | `plugins/src/registry.rs` | 9 | 9 sync |
 | 11 | [Request log plugin (W3C-XLF format, rotation)](11-request-log-plugin.md) | `plugins/src/builtin/request_log.rs` | 13 | 13 sync |
 | 12 | [Qwen guard prefilter (Qwen3Guard-Gen safety check)](12-qwen-guard-plugin.md) | `plugins/src/builtin/qwen_guard.rs` | 17 | 8 sync + 9 async |
 
-The module pages catalog 214 of the 229 cases; the remaining 15 (9
-`dashboard` plugin unit tests + 6 newer API E2E cases added after the
+The module pages catalog 219 of the 237 cases; the remaining 18 (9
+`dashboard` plugin unit tests + other newer cases added after the
 catalog was written) run in the same suites and pass under
 `cargo test --workspace`.
 
@@ -35,9 +35,9 @@ catalog was written) run in the same suites and pass under
 
 ```sh
 cd lpcache
-cargo test --workspace        # full regression suite (229 tests + 3 doctests, ~4 s)
+cargo test --workspace        # full regression suite (237 tests + 3 doctests, ~4 s)
 cargo test --lib              # 80 lpcache unit tests only
-cargo test -p lpcache-plugins # 81 plugin library unit tests
+cargo test -p lpcache-plugins # 87 plugin library unit tests
 cargo test --test api         # 53 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test <name-substring>   # run a single test by name filter
@@ -71,12 +71,12 @@ client-disconnect behaviour.
 | Bounded cache pruning (`META_MAX`) | `prune_meta_*` (unit), `prune_removes_oldest_meta_and_kv_files` (E2E) |
 | Concurrent-request coalescing (Rust-only feature) | 4 unit + 6 E2E coalesce tests |
 | Prefilter plugins (Rust-only feature) | 14 plugin unit tests (keyword 11, chain 3) + 8 E2E prefilter tests |
-| Result cache plugin (Rust-only feature) | 14 plugin unit + 5 E2E tests (4 result-cache + 1 blocklist-over-cache chain) |
+| Result cache plugin (Rust-only feature) | 18 plugin unit + 6 E2E tests (5 result-cache + 1 blocklist-over-cache chain) |
 | Plugin system (`PLUGINS` env/flag, `lpcache-plugins` registry) | 5 `PLUGINS` config tests + 9 registry tests + 8 plugin `factory_*` tests; E2E state is built via `load_prefilters` / `load_request_loggers` |
 | Request log (`REQUEST_LOG*` env/flags or a `request_log` spec in `PLUGINS`, Rust-only feature) | 3 config tests + 13 plugin unit tests (section 11) + 5 E2E tests (`request_log_writes_xlf_record` — incl. the performance fields, `request_log_stream_request_counts_delivered_bytes`, `request_log_logs_failed_request_without_pipeline`, `request_log_rotates_and_bounds_keep`, `request_log_stream_writes_perf_fields`) |
 | KV cache save auto-retry (`SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS`, Rust-only feature) | `save_after_retries_until_success`, `save_after_retries_exhausted_propagates_error`, `save_after_retries_exhausted_500_returns_false`, `save_after_no_retry_when_retries_disabled` (unit), `save_retry_env_and_cli` (config) |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
-**Suite health (2026-10-19).** 197/197 passing, clippy clean, ~4 s wall
+**Suite health (2026-11-05).** 237/237 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
 On 2026-10-19 the request log gained 8 performance XLF fields
 (`lpcache-prompt-tokens`, `lpcache-completion-tokens`,

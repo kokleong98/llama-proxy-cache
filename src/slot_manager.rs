@@ -77,6 +77,10 @@ pub struct SlotManager {
     /// escalate the cooldown (5 s, 10 s, 20 s, 40 s, then capped at 60 s).
     /// Reset by any successful request or probe.
     failure_streak: Vec<AtomicU32>,
+    /// One entry per backend: whether that backend supports KV cache
+    /// save/restore (`BackendConf::kv_cache`). Restores are only ever
+    /// attempted on slots of enabled backends.
+    kv_enabled: Vec<bool>,
     /// `SAVE_RETRIES`: retries after a failed KV cache save (backend 500 or
     /// network/other error) before giving up (`0` = no retry).
     save_retries: usize,
@@ -106,10 +110,12 @@ impl SlotManager {
         let down_until: Vec<AtomicU64> = (0..backends.len()).map(|_| AtomicU64::new(0)).collect();
         let failure_streak: Vec<AtomicU32> =
             (0..backends.len()).map(|_| AtomicU32::new(0)).collect();
+        let kv_enabled: Vec<bool> = backends.iter().map(|b| b.kv_cache).collect();
         tracing::info!(
-            "slot_manager n_backends={} total_slots={}",
+            "slot_manager n_backends={} total_slots={} kv_cache={:?}",
             backends.len(),
-            all.len()
+            all.len(),
+            kv_enabled
         );
         Self {
             clients,
@@ -120,6 +126,7 @@ impl SlotManager {
             down_until,
             backend_cooldown: DEFAULT_BACKEND_COOLDOWN,
             failure_streak,
+            kv_enabled,
             save_retries: DEFAULT_SAVE_RETRIES,
             save_retry_delay: Duration::from_millis(DEFAULT_SAVE_RETRY_DELAY_MS),
         }
@@ -355,12 +362,32 @@ impl SlotManager {
         best.map(|(g, _, _)| g)
     }
 
+    /// Select the slot for an acquire that may carry a KV restore.
+    ///
+    /// When a restore key is given, slots of backends with `kv_cache`
+    /// enabled are preferred — the KV file can only be loaded there. If no
+    /// slot of an enabled backend is eligible, the restore key is dropped
+    /// (warned) and a plain pick is made: the request runs a full prefill
+    /// instead of failing.
+    fn pick_for_acquire<'a>(&self, restore_key: Option<&'a str>) -> (GSlot, Option<&'a str>) {
+        let Some(key) = restore_key else {
+            return (self.pick(), None);
+        };
+        match self.pick_filtered(|g| self.kv_enabled[g.be]) {
+            Some(g) => (g, Some(key)),
+            None => {
+                tracing::warn!("restore_skipped key={key} reason=no_kv_enabled_backend");
+                (self.pick(), None)
+            }
+        }
+    }
+
     /// Acquire a slot (waiting up to `acquire_timeout`) and, when
     /// `restore_key` is given, restore that KV cache into the slot first
     /// (port of `acquire_for_request`).
     pub async fn acquire(&self, restore_key: Option<&str>) -> Result<SlotGuard, AcquireTimeout> {
-        let g = self.pick();
-        self.acquire_slot(g, restore_key).await
+        let (g, restore) = self.pick_for_acquire(restore_key);
+        self.acquire_slot(g, restore).await
     }
 
     /// Like [`acquire`], but never picks a slot of backend `exclude_be`.
@@ -371,11 +398,31 @@ impl SlotManager {
         exclude_be: usize,
         restore_key: Option<&str>,
     ) -> Result<SlotGuard, AcquireTimeout> {
-        let Some(g) = self.pick_filtered(|c: &GSlot| c.be != exclude_be) else {
-            tracing::warn!("acquire_excluding be={exclude_be} no other backend available");
-            return Err(AcquireTimeout);
+        let (g, restore) = match restore_key {
+            Some(key) => {
+                match self.pick_filtered(|c: &GSlot| c.be != exclude_be && self.kv_enabled[c.be]) {
+                    Some(g) => (g, Some(key)),
+                    None => {
+                        let Some(g) = self.pick_filtered(|c: &GSlot| c.be != exclude_be) else {
+                            tracing::warn!(
+                                "acquire_excluding be={exclude_be} no other backend available"
+                            );
+                            return Err(AcquireTimeout);
+                        };
+                        tracing::warn!("restore_skipped key={key} reason=no_kv_enabled_backend");
+                        (g, None)
+                    }
+                }
+            }
+            None => {
+                let Some(g) = self.pick_filtered(|c: &GSlot| c.be != exclude_be) else {
+                    tracing::warn!("acquire_excluding be={exclude_be} no other backend available");
+                    return Err(AcquireTimeout);
+                };
+                (g, None)
+            }
         };
-        self.acquire_slot(g, restore_key).await
+        self.acquire_slot(g, restore).await
     }
 
     /// Wait for the picked slot's permit and optionally restore into it.
@@ -571,11 +618,22 @@ mod tests {
     }
 
     fn make(n_backends: usize, n_slots: usize) -> (Arc<SlotManager>, Vec<Arc<TestClient>>) {
+        make_kv(n_backends, n_slots, vec![])
+    }
+
+    /// Like [`make`], but `no_kv[i]` disables KV save/restore on backend
+    /// `i` (backends not listed keep the default `kv_cache: true`).
+    fn make_kv(
+        n_backends: usize,
+        n_slots: usize,
+        no_kv: Vec<usize>,
+    ) -> (Arc<SlotManager>, Vec<Arc<TestClient>>) {
         let backends: Vec<BackendConf> = (0..n_backends)
             .map(|i| BackendConf {
                 url: format!("http://b{i}"),
                 n_slots,
                 slot_save_path: None,
+                kv_cache: !no_kv.contains(&i),
             })
             .collect();
         let raw: Vec<Arc<TestClient>> = (0..n_backends).map(|_| TestClient::new()).collect();
@@ -654,6 +712,59 @@ mod tests {
         let g = sm.acquire(Some("k2")).await.unwrap();
         assert_eq!(g.restored, Some(RestoreOutcome::Failed));
         sm.release(g);
+    }
+
+    #[tokio::test]
+    async fn restore_prefers_kv_enabled_backend() {
+        // backend 0 has kv_cache disabled -> the restore must land on
+        // backend 1 even though backend 0's slots are "older"
+        let (sm, raw) = make_kv(2, 1, vec![0]);
+        sm.set_last_used_for_test(GSlot { be: 0, slot: 0 }, 1);
+        sm.set_last_used_for_test(GSlot { be: 1, slot: 0 }, 2);
+        let g = sm.acquire(Some("key-kv1234567890abcd")).await.unwrap();
+        assert_eq!(g.slot, GSlot { be: 1, slot: 0 });
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        sm.release(g);
+        assert!(raw[0].restores.lock().await.is_empty());
+        assert_eq!(
+            *raw[1].restores.lock().await,
+            vec![(0usize, "key-kv1234567890abcd".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_skipped_when_no_kv_enabled_backend() {
+        let (sm, raw) = make_kv(2, 1, vec![0, 1]);
+        let g = sm.acquire(Some("key-kv1234567890abcd")).await.unwrap();
+        // a slot is still acquired (full prefill), but no restore is issued
+        assert_eq!(g.restored, None);
+        sm.release(g);
+        assert!(raw[0].restores.lock().await.is_empty());
+        assert!(raw[1].restores.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acquire_excluding_respects_kv_flag() {
+        // both backends kv-enabled: excluding backend 0 restores on 1
+        let (sm, raw) = make_kv(2, 1, vec![]);
+        let g = sm.acquire_excluding(0, Some("k1")).await.unwrap();
+        assert_eq!(g.slot, GSlot { be: 1, slot: 0 });
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        sm.release(g);
+        assert!(raw[0].restores.lock().await.is_empty());
+        assert_eq!(
+            *raw[1].restores.lock().await,
+            vec![(0usize, "k1".to_string())]
+        );
+
+        // backend 1 kv-disabled: the exclusion still works, the restore is
+        // dropped (no other kv-enabled backend), and it is not an error
+        let (sm, raw) = make_kv(2, 1, vec![1]);
+        let g = sm.acquire_excluding(0, Some("k2")).await.unwrap();
+        assert_eq!(g.slot, GSlot { be: 1, slot: 0 });
+        assert_eq!(g.restored, None);
+        sm.release(g);
+        assert!(raw[1].restores.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -752,6 +863,7 @@ mod tests {
             url: "http://b0".to_string(),
             n_slots: 1,
             slot_save_path: None,
+            kv_cache: true,
         }];
         let client = TestClient::new();
         let clients: Vec<Arc<dyn LlamaBackend>> =
@@ -787,6 +899,7 @@ mod tests {
             url: "http://b0".to_string(),
             n_slots: 1,
             slot_save_path: None,
+            kv_cache: true,
         }];
         let client = TestClient::new();
         let clients: Vec<Arc<dyn LlamaBackend>> =
@@ -851,11 +964,13 @@ mod tests {
                 url: "http://b0".to_string(),
                 n_slots: 1,
                 slot_save_path: None,
+                kv_cache: true,
             },
             BackendConf {
                 url: "http://b1".to_string(),
                 n_slots: 1,
                 slot_save_path: None,
+                kv_cache: true,
             },
         ];
         let raw: Vec<Arc<TestClient>> = vec![TestClient::new(), TestClient::new()];

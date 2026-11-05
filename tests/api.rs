@@ -114,6 +114,7 @@ async fn make_state_inner(
             url: mock.url(),
             n_slots,
             slot_save_path: None,
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words
@@ -621,11 +622,13 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
                 url: mock.url(),
                 n_slots: 1,
                 slot_save_path: None,
+                kv_cache: true,
             },
             BackendConf {
                 url: "http://127.0.0.1:9".to_string(),
                 n_slots: 1,
                 slot_save_path: None,
+                kv_cache: true,
             },
         ],
         100,
@@ -701,11 +704,13 @@ async fn connection_failure_retries_on_other_backend() {
                 url: dead_url,
                 n_slots: 1,
                 slot_save_path: None,
+                kv_cache: true,
             },
             BackendConf {
                 url: live.url(),
                 n_slots: 1,
                 slot_save_path: None,
+                kv_cache: true,
             },
         ],
         100,
@@ -771,11 +776,13 @@ async fn probe_recovers_cooled_down_backend() {
                 url: dead_url,
                 n_slots: 1,
                 slot_save_path: None,
+                kv_cache: true,
             },
             BackendConf {
                 url: live.url(),
                 n_slots: 1,
                 slot_save_path: None,
+                kv_cache: true,
             },
         ],
         100,
@@ -860,11 +867,13 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
                 url: mock0.url(),
                 n_slots: 2,
                 slot_save_path: None,
+                kv_cache: true,
             },
             BackendConf {
                 url: mock1.url(),
                 n_slots: 2,
                 slot_save_path: None,
+                kv_cache: true,
             },
         ],
         100,
@@ -929,6 +938,7 @@ async fn prune_removes_oldest_meta_and_kv_files() {
             url: mock.url(),
             n_slots: 2,
             slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words
@@ -992,6 +1002,261 @@ async fn prune_removes_oldest_meta_and_kv_files() {
 }
 
 #[tokio::test]
+async fn kv_cache_disabled_backend_never_saves_or_restores() {
+    // A backend with kv_cache=false must never be asked to save or restore
+    // the KV cache, and no meta file is written for requests it serves.
+    let kv = tempfile::tempdir().expect("kv dir");
+    let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv.path()).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+            kv_cache: false,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    );
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        dashboard: None,
+    };
+    let app = router(state);
+
+    let prefix = format!("promptA {}", words(518));
+    let key = expected_key(&prefix);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": prefix }]
+    });
+
+    // a "big" request: served fine, but nothing is saved or written
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert!(
+        mock.state.saves().await.is_empty(),
+        "no KV save on a kv_cache=false backend"
+    );
+    assert!(
+        !td.path().join(format!("{key}.meta.json")).exists(),
+        "no meta file written for a kv_cache=false backend"
+    );
+
+    // identical request again: no restore is attempted either
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert!(
+        mock.state.restores().await.is_empty(),
+        "no restore on a kv_cache=false backend"
+    );
+    assert!(mock.state.saves().await.is_empty());
+}
+
+#[tokio::test]
+async fn kv_cache_disabled_backend_skips_stream_save() {
+    // The streaming reader's cleanup must honor the per-backend `kv_cache`
+    // flag exactly like the non-streaming save sites: no save call, no meta
+    // file, no restore — even though the streaming path historically saved
+    // unconditionally (regression: the gate was first added only to the
+    // JSON save sites).
+    let kv = tempfile::tempdir().expect("kv dir");
+    let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv.path()).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+            kv_cache: false,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    );
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        dashboard: None,
+    };
+    let app = router(state);
+
+    let prefix = format!("promptA {}", words(518));
+    let key = expected_key(&prefix);
+    let body = json!({
+        "model": "m1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": prefix }]
+    });
+
+    // Stream a "big" request through the kv-disabled backend.
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .expect("content-type")
+        .to_str()
+        .expect("str")
+        .to_string();
+    assert!(
+        ctype.starts_with("text/event-stream"),
+        "content-type: {ctype}"
+    );
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("stream body");
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    assert!(text.contains("[DONE]"), "body: {text}");
+
+    // The reader task ran its cleanup before ending the body: it must not
+    // have saved or written a meta file.
+    assert!(
+        mock.state.saves().await.is_empty(),
+        "no KV save on a kv_cache=false backend (stream)"
+    );
+    assert!(
+        !td.path().join(format!("{key}.meta.json")).exists(),
+        "no meta file written for a kv_cache=false backend (stream)"
+    );
+
+    // And a repeat must not attempt a restore either.
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert!(
+        mock.state.restores().await.is_empty(),
+        "no restore on a kv_cache=false backend (stream)"
+    );
+    assert!(mock.state.saves().await.is_empty());
+}
+
+#[tokio::test]
+async fn kv_restore_prefers_kv_enabled_backend() {
+    // backend 0: kv_cache=true, backend 1: kv_cache=false. KV saves and
+    // restores must only ever hit backend 0.
+    let kv0 = tempfile::tempdir().expect("kv dir 0");
+    let kv1 = tempfile::tempdir().expect("kv dir 1");
+    let mock0 = MockLlama::start_with_save_dir(BACKEND_MODEL, kv0.path()).await;
+    let mock1 = MockLlama::start_with_save_dir(BACKEND_MODEL, kv1.path()).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![
+            BackendConf {
+                url: mock0.url(),
+                n_slots: 1,
+                slot_save_path: Some(kv0.path().to_string_lossy().into_owned()),
+                kv_cache: true,
+            },
+            BackendConf {
+                url: mock1.url(),
+                n_slots: 1,
+                slot_save_path: Some(kv1.path().to_string_lossy().into_owned()),
+                kv_cache: false,
+            },
+        ],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    );
+    let c0 = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let c1 = Arc::new(
+        LlamaClient::new(&cfg.backends[1].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![
+        Arc::clone(&c0) as Arc<dyn LlamaBackend>,
+        Arc::clone(&c1) as Arc<dyn LlamaBackend>,
+    ];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        dashboard: None,
+    };
+    let app = router(state);
+
+    let prefix = format!("promptA {}", words(518));
+    let key = expected_key(&prefix);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": prefix }]
+    });
+
+    // request 1: free-slot pick lands on backend 0 (insertion order); the
+    // KV save + meta write happen there, never on backend 1
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert_eq!(mock0.state.saves().await.len(), 1);
+    assert!(mock1.state.saves().await.is_empty());
+    assert!(td.path().join(format!("{key}.meta.json")).exists());
+
+    // request 2 (same key): the restore lookup finds the candidate and the
+    // restore must be issued on the kv-enabled backend only
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert_eq!(mock0.state.restores().await.len(), 1);
+    assert!(
+        mock1.state.restores().await.is_empty(),
+        "restore never targets a kv_cache=false backend"
+    );
+    assert!(mock1.state.saves().await.is_empty());
+    assert!(
+        !kv1.path().join(&key).exists(),
+        "no KV file on the disabled backend"
+    );
+}
+
+#[tokio::test]
 async fn restore_works_after_prune_and_pruned_key_falls_back() {
     // META_MAX=2: after three distinct saves the oldest entry (A) is
     // pruned (meta AND KV file). Then verify that:
@@ -1007,6 +1272,7 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
             url: mock.url(),
             n_slots: 2,
             slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words
@@ -1129,6 +1395,7 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
             url: mock.url(),
             n_slots: 2,
             slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words
@@ -1732,6 +1999,7 @@ async fn make_state_result_cache(
             url: mock.url(),
             n_slots: 2,
             slot_save_path: None,
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words
@@ -1871,6 +2139,242 @@ async fn result_cache_stream_requests_bypass_cache() {
     assert_eq!(mock.state.chat_bodies().await.len(), 2);
 }
 
+/// Like [`make_state_result_cache`], but the `result_cache` plugin is loaded
+/// from a `PLUGINS` spec with `cache_streaming: true`, so completed
+/// streaming results are aggregated to a non-streaming completion and
+/// cached, and cached entries are served to streaming clients (as SSE).
+async fn make_state_result_cache_streaming(
+    ttl_secs: f64,
+) -> (AppState, MockLlama, tempfile::TempDir, tempfile::TempDir) {
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let td_rc = tempfile::tempdir().expect("result cache dir");
+    let plugins = json!([{
+        "name": "result_cache",
+        "params": {
+            "dir": td_rc.path().to_string_lossy(),
+            "ttl_secs": ttl_secs,
+            "cache_streaming": true,
+        },
+    }]);
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+            kv_cache: true,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_plugins(Some(plugins.to_string()));
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        dashboard: None,
+    };
+    (state, mock, td, td_rc)
+}
+
+#[tokio::test]
+async fn result_cache_caches_streaming_result_and_serves_streaming_client() {
+    let (state, mock, _td, td_rc) = make_state_result_cache_streaming(300.0).await;
+    let app = router(state);
+    let msgs = json!([{ "role": "user", "content": "stream cache" }]);
+    let stream = json!({ "model": "m1", "stream": true, "messages": msgs });
+    // 1) A streaming request reaches the backend and streams; when the
+    //    stream completes, it is aggregated into a non-streaming completion
+    //    and stored under the key.
+    let r1 = app.clone().oneshot(post_json(&stream)).await.expect("resp");
+    assert_eq!(r1.status(), 200);
+    assert_eq!(
+        r1.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+    let b1 = to_bytes(r1.into_body(), usize::MAX).await.expect("body");
+    assert!(String::from_utf8_lossy(&b1).contains("[DONE]"));
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    let entries: Vec<_> = std::fs::read_dir(td_rc.path())
+        .expect("read cache dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let stored: Value =
+        serde_json::from_slice(&std::fs::read(&entries[0]).expect("read entry")).expect("entry");
+    // the mock streams "Hello" + " world"; the aggregated content joins them.
+    assert_eq!(
+        stored
+            .pointer("/body/choices/0/message/content")
+            .and_then(Value::as_str),
+        Some("Hello world")
+    );
+    // 2) Same key, stream=true: served from the cache (converted to SSE) —
+    //    no new backend call.
+    let r2 = app.clone().oneshot(post_json(&stream)).await.expect("resp");
+    assert_eq!(r2.status(), 200);
+    assert_eq!(
+        r2.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+    let b2 = to_bytes(r2.into_body(), usize::MAX).await.expect("body");
+    let s2 = String::from_utf8_lossy(&b2);
+    assert!(s2.contains("Hello world"));
+    assert!(s2.contains("[DONE]"));
+    assert_eq!(mock.state.chat_bodies().await.len(), 1); // no backend call
+    // 3) Same key, stream=false: also served from the cache (as JSON) — the
+    //    aggregated result is usable for non-streaming clients too.
+    let non_stream = json!({ "model": "m1", "stream": false, "messages": msgs });
+    let r3 = app
+        .clone()
+        .oneshot(post_json(&non_stream))
+        .await
+        .expect("resp");
+    assert_eq!(r3.status(), 200);
+    let v3 = read_body(r3).await;
+    assert_eq!(
+        v3.pointer("/choices/0/message/content")
+            .and_then(Value::as_str),
+        Some("Hello world")
+    );
+    assert_eq!(mock.state.chat_bodies().await.len(), 1); // no backend call
+}
+
+/// Like [`make_state_result_cache_streaming`], but the `result_cache` plugin
+/// is loaded from a `PLUGINS` spec with `cache_control: true`, so requests
+/// with a `Cache-Control` header carrying the `no-cache` directive bypass
+/// the cache and go to the backend.
+async fn make_state_result_cache_cache_control(
+    ttl_secs: f64,
+) -> (AppState, MockLlama, tempfile::TempDir, tempfile::TempDir) {
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let td_rc = tempfile::tempdir().expect("result cache dir");
+    let plugins = json!([
+        {
+            "name": "result_cache",
+            "params": {
+                "dir": td_rc.path().to_string_lossy(),
+                "ttl_secs": ttl_secs,
+                "cache_control": true,
+            },
+        }
+    ]);
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+            kv_cache: true,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_plugins(Some(plugins.to_string()));
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        dashboard: None,
+    };
+    (state, mock, td, td_rc)
+}
+
+/// A chat-completions POST with an explicit `Cache-Control` header.
+fn post_json_cache_control(body: &Value, cache_control: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("cache-control", cache_control)
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
+#[tokio::test]
+async fn result_cache_no_cache_header_bypasses_the_cache() {
+    let (state, mock, _td, _td_rc) = make_state_result_cache_cache_control(300.0).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "no-cache bypass" }]
+    });
+    // 1) First request reaches the backend and stores the result in the
+    //    cache.
+    let r1 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r1.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 1);
+    // 2) Same key, `Cache-Control: no-cache`: the cache is bypassed and the
+    //    request goes to the backend again.
+    let r2 = app
+        .clone()
+        .oneshot(post_json_cache_control(&body, "no-cache"))
+        .await
+        .expect("resp");
+    assert_eq!(r2.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 2);
+    // 3) `no-cache` inside a longer directive list also bypasses.
+    let r3 = app
+        .clone()
+        .oneshot(post_json_cache_control(&body, "no-cache, no-store"))
+        .await
+        .expect("resp");
+    assert_eq!(r3.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 3);
+    // 4) Other directives, and requests without the header, are still
+    //    served from the cache — no new backend call.
+    let r4 = app
+        .clone()
+        .oneshot(post_json_cache_control(&body, "max-age=60"))
+        .await
+        .expect("resp");
+    assert_eq!(r4.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 3);
+    let r5 = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r5.status(), 200);
+    assert_eq!(mock.state.chat_bodies().await.len(), 3);
+}
+
 #[tokio::test]
 async fn result_cache_remove_after_serve_cleanup() {
     let (mut state, mock, _td, td_rc) = make_state_result_cache(300.0).await;
@@ -1929,6 +2433,7 @@ async fn keyword_blocklist_rejects_before_result_cache_serves() {
             url: mock.url(),
             n_slots: 2,
             slot_save_path: None,
+            kv_cache: true,
         }],
         100,
         500,
@@ -1997,6 +2502,7 @@ async fn make_state_with_save_dir(
             url: mock.url(),
             n_slots: 2,
             slot_save_path: Some(kv.to_string_lossy().into_owned()),
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words
@@ -2113,6 +2619,7 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
             url: mock.url(),
             n_slots: 2,
             slot_save_path: Some("/nonexistent/lpcache-unvisible-dir".to_string()),
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words
@@ -2188,6 +2695,7 @@ async fn make_state_request_log(
             url: mock.url(),
             n_slots: 2,
             slot_save_path: None,
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words
@@ -2512,6 +3020,7 @@ async fn make_state_dashboard(params: Value) -> (AppState, MockLlama, tempfile::
             url: mock.url(),
             n_slots: 2,
             slot_save_path: None,
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words
@@ -2827,6 +3336,7 @@ async fn dashboard_routes_excluded_from_request_log_and_aggregates() {
             url: mock.url(),
             n_slots: 2,
             slot_save_path: None,
+            kv_cache: true,
         }],
         100, // words per block
         500, // big threshold words

@@ -566,6 +566,19 @@ async fn request_log_middleware(
 
 async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> Response {
     let t0 = Instant::now();
+    // The request's HTTP headers (names lowercased, values as strings) are
+    // shared with the prefilter so header-driven adapters (e.g. the
+    // `result_cache` plugin's `cache_control` no-cache bypass) can see them.
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect();
     let raw = match to_bytes(req.into_body(), usize::MAX).await {
         Ok(b) => b,
         Err(e) => return json_error(400, format!("reading body failed: {e}")),
@@ -634,6 +647,7 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
             key: key.clone(),
             n_words,
             is_big,
+            headers,
         };
         match pf.check(&preq).await {
             PrefilterDecision::Accept => {
@@ -656,11 +670,11 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
             }
             PrefilterDecision::Serve { status, body } => {
                 tracing::info!(
-                    "prefilter_serve filter={} key={} status={status} n_words={n_words}",
+                    "prefilter_serve filter={} key={} status={status} stream={} n_words={n_words}",
                     pf.name(),
-                    short16(&key)
+                    short16(&key),
+                    stream
                 );
-                let st = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
                 pl.cache_hit = Some(true);
                 // The cached backend result carries the original
                 // `usage`/`timings` — log them as this request's
@@ -668,6 +682,15 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
                 if let Some(perf) = &pl.perf {
                     fill_perf_from_value(perf, &body);
                 }
+                // A streaming client expects SSE, not a JSON blob: convert
+                // the cached completion to a `text/event-stream` body. A
+                // non-2xx cached result is served as JSON (an error), since
+                // only a successful completion can be turned into a stream.
+                if stream && status == 200 {
+                    let sse = sse_from_completion(&body, &client_model);
+                    return with_pipeline_log(sse_response_bytes(&sse), pl);
+                }
+                let st = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
                 return with_pipeline_log((st, axum::Json(body)).into_response(), pl);
             }
         }
@@ -807,21 +830,27 @@ async fn run_pipeline(
 ) -> (Response, Option<SharedOutcome>) {
     let mut restore_key: Option<String> = None;
     if is_big {
-        match hashing::find_best_restore_candidate(
-            &state.config.meta_dir,
-            blocks,
-            state.config.words_per_block,
-            state.config.lcp_th,
-            backend_model_id,
-        ) {
-            Some((k, ratio)) => {
-                tracing::info!(
-                    "restore_candidate basename={} ratio={ratio:.3}",
-                    short16(&k)
-                );
-                restore_key = Some(k);
+        if state.config.backends.iter().any(|b| b.kv_cache) {
+            match hashing::find_best_restore_candidate(
+                &state.config.meta_dir,
+                blocks,
+                state.config.words_per_block,
+                state.config.lcp_th,
+                backend_model_id,
+            ) {
+                Some((k, ratio)) => {
+                    tracing::info!(
+                        "restore_candidate basename={} ratio={ratio:.3}",
+                        short16(&k)
+                    );
+                    restore_key = Some(k);
+                }
+                None => tracing::info!("restore_candidate none"),
             }
-            None => tracing::info!("restore_candidate none"),
+        } else {
+            // No backend supports KV save/restore: skip the meta lookup
+            // entirely (a restore could never be issued).
+            tracing::info!("kv_restore_skipped reason=no_kv_enabled_backend");
         }
     } else {
         tracing::info!(
@@ -950,9 +979,10 @@ async fn run_pipeline(
             }
 
             // Reader task: pumps SSE chunks through a bounded channel. In its
-            // "finally" it always does save_after + write_meta + release (the
-            // same as the Python reader, including for small requests), then
-            // drops the sender so the response stream ends.
+            // "finally" it does save_after + write_meta + release when the
+            // serving backend has `kv_cache` enabled (the same as the Python
+            // reader, including for small requests); a `kv_cache: false`
+            // backend is never asked to save and gets no meta file.
             //
             // Client-disconnect handling: the response body carries a oneshot
             // sender; when the client drops its connection to the proxy,
@@ -971,6 +1001,11 @@ async fn run_pipeline(
             let prefix2 = prefix.to_string();
             let blocks2: Vec<String> = blocks.to_vec();
             let model_id2 = backend_model_id.to_string();
+            // Result cache: aggregate the completed stream into a
+            // non-streaming completion and store it (only when the store
+            // opts into caching streaming results).
+            let client_model2 = client_model.to_string();
+            let result_store2: Option<Arc<dyn ResultStore>> = state.result_store.clone();
             // Coalescing: share every SSE chunk with the group's followers
             // and finish their flight when the stream ends.
             let flight: Option<(String, Arc<Flight>)> = grouped.clone();
@@ -987,6 +1022,8 @@ async fn run_pipeline(
             tokio::spawn(async move {
                 let mut s = sc.stream;
                 let mut client_gone = false;
+                // Full SSE bytes (for the result cache when enabled).
+                let mut sse_all: Vec<u8> = Vec::new();
                 let stream_t0 = Instant::now();
                 let mut ttft_ms: Option<f64> = None;
                 // Line buffer for SSE perf extraction (a chunk may split a
@@ -1007,6 +1044,7 @@ async fn run_pipeline(
                         chunk = s.next() => match chunk {
                             None => break,
                             Some(Ok(bytes)) if !bytes.is_empty() => {
+                                sse_all.extend_from_slice(&bytes);
                                 if let Some((_, f)) = &flight {
                                     f.append_sse(&bytes);
                                 }
@@ -1051,34 +1089,65 @@ async fn run_pipeline(
                     // The cleanup below (save + meta + release) still runs.
                     drop(s);
                 }
-                let ok = match sm.save_after(g, &key2).await {
-                    Ok(ok) => {
-                        sm.report_success(g);
-                        ok
-                    }
-                    Err(e) => {
-                        tracing::warn!("save_after_exception g={g} key={}: {e}", short16(&key2));
-                        if matches!(e, BackendError::Other(_)) {
-                            sm.report_failure(g);
+                // Per-backend `kv_cache` flag: a backend without slot-save
+                // support must never be asked to save, and no meta file is
+                // written (it could not be loaded back by this backend
+                // anyway) — the same gating as the non-streaming save sites.
+                let ok = if cfg.backends[g.be].kv_cache {
+                    match sm.save_after(g, &key2).await {
+                        Ok(ok) => {
+                            sm.report_success(g);
+                            ok
                         }
-                        sm.mark_used(g);
-                        false
+                        Err(e) => {
+                            tracing::warn!(
+                                "save_after_exception g={g} key={}: {e}",
+                                short16(&key2)
+                            );
+                            if matches!(e, BackendError::Other(_)) {
+                                sm.report_failure(g);
+                            }
+                            sm.mark_used(g);
+                            false
+                        }
                     }
-                };
-                if let Err(e) = hashing::write_meta(
-                    &cfg.meta_dir,
-                    &key2,
-                    &prefix2,
-                    &blocks2,
-                    cfg.words_per_block,
-                    &model_id2,
-                ) {
-                    tracing::warn!("write_meta_exception key={}: {e}", short16(&key2));
                 } else {
-                    prune_cache(&cfg);
+                    sm.report_success(g);
+                    tracing::info!(
+                        "kv_save_skipped g={g} key={} reason=backend_kv_cache_disabled",
+                        short16(&key2)
+                    );
+                    false
+                };
+                if cfg.backends[g.be].kv_cache {
+                    if let Err(e) = hashing::write_meta(
+                        &cfg.meta_dir,
+                        &key2,
+                        &prefix2,
+                        &blocks2,
+                        cfg.words_per_block,
+                        &model_id2,
+                    ) {
+                        tracing::warn!("write_meta_exception key={}: {e}", short16(&key2));
+                    } else {
+                        prune_cache(&cfg);
+                    }
                 }
                 sm.release(guard);
                 tracing::info!("stream_reader_done g={g} key={} saved={ok}", short16(&key2));
+                // Result cache: a fully-streamed (not client-aborted) result
+                // is aggregated into a non-streaming completion and stored,
+                // so a later same-key request — streaming or not — can be
+                // served from the cache.
+                if !client_gone
+                    && let Some(store) = &result_store2
+                    && store.caches_streaming()
+                {
+                    let completion = sse_to_completion(&sse_all, &client_model2);
+                    if let Err(e) = store.store(&key2, 200, &completion) {
+                        tracing::warn!("result_cache_store_fail key={}: {e}", short16(&key2));
+                    }
+                }
                 // Finish the coalesced group: followers receive the full
                 // stream (whatever was produced before the client went away
                 // or the upstream ended).
@@ -1178,15 +1247,26 @@ async fn run_pipeline(
                     // write-meta path before the 200.
                     state.sm.report_success(g);
                     let save_ok = if is_big {
-                        match save_big(state, g, key, prefix, blocks, backend_model_id).await {
-                            Ok(ok) => ok,
-                            Err(b) => {
-                                let (resp, o) = *b;
-                                state.sm.release(guard);
-                                pl = with_slot(pl, g, restored);
-                                pl.reason = Some("save_failed".into());
-                                return (with_pipeline_log(resp, pl), Some(o));
+                        if state.config.backends[g.be].kv_cache {
+                            match save_big(state, g, key, prefix, blocks, backend_model_id).await {
+                                Ok(ok) => ok,
+                                Err(b) => {
+                                    let (resp, o) = *b;
+                                    state.sm.release(guard);
+                                    pl = with_slot(pl, g, restored);
+                                    pl.reason = Some("save_failed".into());
+                                    return (with_pipeline_log(resp, pl), Some(o));
+                                }
                             }
+                        } else {
+                            // This backend has kv_cache disabled: no KV save
+                            // and no meta write (the KV file could not be
+                            // loaded back by this backend anyway).
+                            tracing::info!(
+                                "kv_save_skipped g={g} key={} reason=backend_kv_cache_disabled",
+                                short16(key)
+                            );
+                            false
                         }
                     } else {
                         false
@@ -1210,15 +1290,26 @@ async fn run_pipeline(
                 Ok(JsonChat::Object(out)) => {
                     state.sm.report_success(g);
                     let save_ok = if is_big {
-                        match save_big(state, g, key, prefix, blocks, backend_model_id).await {
-                            Ok(ok) => ok,
-                            Err(b) => {
-                                let (resp, o) = *b;
-                                state.sm.release(guard);
-                                pl = with_slot(pl, g, restored);
-                                pl.reason = Some("save_failed".into());
-                                return (with_pipeline_log(resp, pl), Some(o));
+                        if state.config.backends[g.be].kv_cache {
+                            match save_big(state, g, key, prefix, blocks, backend_model_id).await {
+                                Ok(ok) => ok,
+                                Err(b) => {
+                                    let (resp, o) = *b;
+                                    state.sm.release(guard);
+                                    pl = with_slot(pl, g, restored);
+                                    pl.reason = Some("save_failed".into());
+                                    return (with_pipeline_log(resp, pl), Some(o));
+                                }
                             }
+                        } else {
+                            // This backend has kv_cache disabled: no KV save
+                            // and no meta write (the KV file could not be
+                            // loaded back by this backend anyway).
+                            tracing::info!(
+                                "kv_save_skipped g={g} key={} reason=backend_kv_cache_disabled",
+                                short16(key)
+                            );
+                            false
                         }
                     } else {
                         false
