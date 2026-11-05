@@ -36,7 +36,10 @@ full prefill cost every time.
    served from the cache by default (set the plugin's `cache_streaming`
    param to `true` to also aggregate completed streaming results into a
    non-streaming completion and serve cached entries to streaming clients
-   as SSE). In both cases the request never reaches
+   as SSE). With the plugin's `cache_control` param set to `true`, a
+   request whose `Cache-Control` header carries the `no-cache` directive
+   is forwarded to the backend instead of being answered from the cache.
+   In both cases the request never reaches
    llama-server — no slot is acquired, no KV cache is restored or saved,
    no meta file is written, and the request never leads or joins a
    coalescing group (several plugins are chained in config order, so the
@@ -58,7 +61,12 @@ full prefill cost every time.
    files and looks for one with the same model and `wpb` whose block list
    shares the longest common prefix; if the LCP ratio is at least `LCP_TH`
    (default 0.1), that cache is restored into the chosen slot *before* the
-   chat is dispatched.
+   chat is dispatched. A backend entry in `BACKENDS` can set
+   `"kv_cache": false` (default `true`) to opt out: restores are only ever
+   issued to slots of `kv_cache`-enabled backends, and a request served by
+   a disabled backend neither saves its KV cache nor writes a meta file —
+   use this for backends without slot save/restore support (e.g.
+   llama-server < 1.05.40).
 5. **Slot management** — every llama.cpp slot is guarded by a lock.
    The proxy picks a never-used slot first, otherwise the
    least recently used one, waits up to 300 s for it (`503 all slots busy`
@@ -87,7 +95,7 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 
 | Variable            | Default             | Meaning                                        |
 |---------------------|---------------------|------------------------------------------------|
-| `BACKENDS`          | —                   | JSON array `[{"url": "...", "n_slots": N}, ...]` |
+| `BACKENDS`          | —                   | JSON array `[{\"url\": \"...\", \"n_slots\": N, \"slot_save_path\": \"...\", \"kv_cache\": true}, ...]` (per-backend `kv_cache` gates KV save/restore; see [How it works](#how-it-works)) |
 | `LLAMA_URL`         | `http://127.0.0.1:8000` | fallback single backend when `BACKENDS` unset |
 | `N_SLOTS`           | `1`                 | fallback slot count per backend                |
 | `WORDS_PER_BLOCK`   | `100`               | words per hash block                           |

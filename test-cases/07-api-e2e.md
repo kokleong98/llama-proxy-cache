@@ -1,9 +1,9 @@
-# 7. API end-to-end — `tests/api.rs` (47)
+# 7. API end-to-end — `tests/api.rs` (48)
 
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (197 tests) runs with
+1:1 to a test function; the full suite (202 tests) runs with
 `cargo test --workspace`.
 
 The real proxy router (axum) in front of `MockLlama`, which records every
@@ -14,7 +14,7 @@ behaviour requires a real connection).
 
 ## Module overview
 
-- **Target:** `lpcache` integration tests — the `api` test binary ([`tests/api.rs`](../tests/api.rs)); 47 tests, all async.
+- **Target:** `lpcache` integration tests — the `api` test binary ([`tests/api.rs`](../tests/api.rs)); 48 tests, all async.
 - **Fixtures & helpers:**
   - `make_state*` family — builds `AppState` in front of `MockLlama`: `make_state` / `make_app` (default: 1 backend, 2 slots, wpb 100, big threshold 500 words, LCP 0.6, meta in a `tempfile` dir, `META_MAX=0`), `make_state_coalesce*` (coalescing on), `make_state*stream_queue*` (custom `STREAM_QUEUE_SIZE`), `make_state_prefilter*` (built-in keyword blocklist).
   - `load_prefilter` — loads the prefilter + result store through the production `load_prefilters` path from the config's plugin specs.
@@ -27,7 +27,7 @@ behaviour requires a real connection).
 
 ```sh
 cd lpcache
-cargo test --test api                                       # all 47 E2E tests
+cargo test --test api                                       # all 48 E2E tests
 cargo test --test api models_endpoint_returns_configured_id # one test (exact name)
 ```
 
@@ -71,18 +71,19 @@ into `cargo test` as shown above.
 | 33 | `custom_prefilter_adapter_accepts_and_rejects` | async | [L1685](../tests/api.rs#L1685) | custom `Prefilter` trait impl (rejects >5-word prompts with 413) | short prompt 200 (1 backend call); long prompt 413 with the adapter's own status/message |
 | 34 | `restore_works_after_prune_and_pruned_key_falls_back` | async | [L989](../tests/api.rs#L989) | `META_MAX=2`; 3 saves (prunes A); then B+tail; then A again | B (a surviving entry) is still restored after the prune (ratio 5/6); pruned A gets **no** restore (full prefill), still 200, and is re-saved; bound stays at 2 |
 | 35 | `restore_touches_lru_timestamp_so_prune_keeps_hot_entry` | async | [L1110](../tests/api.rs#L1110) | `META_MAX=2`; saves A, B, C (prunes A); then B+tail restores B and saves B' | the successful restore bumps B's LRU timestamp → B's own post-save prune evicts C (the true oldest), not the just-restored B |
-| 36 | `restore_rejected_cleans_up_stale_meta` | async | [L2019](../tests/api.rs#L2019) | save A (KV created); delete A's KV; mock restore → 400; A+tail; A+tail again; delete KV; A+tail2 | 400 with the KV absent from every slot-save dir → stale meta removed (`stale_meta_removed`); 400 with the KV still present → meta **kept** (may be transient); final request saves a fresh entry |
-| 37 | `restore_rejected_keeps_meta_when_save_dir_unvisible` | async | [L2094](../tests/api.rs#L2094) | configured slot-save dir does not exist on the proxy's host; mock restore → 400 | absence of the KV file can't be verified (remote backend) → meta kept (status quo) |
-| 38 | `result_cache_serves_cached_result_without_backend` | async | [L1757](../tests/api.rs#L1757) | 1st request stores the result in the cache dir; 2nd same-key request | 2nd served from cache (identical body, 200) with **no** backend call, no save/restore, no meta file; a different key misses → backend |
-| 39 | `result_cache_expires_after_ttl` | async | [L1802](../tests/api.rs#L1802) | TTL 0.2 s; fresh hit, then 300 ms sleep | fresh entry served from cache; after the TTL the entry is expired + lazily removed and the request goes to the backend (new entry stored) |
-| 40 | `result_cache_stream_requests_bypass_cache` | async | [L1831](../tests/api.rs#L1831) | same key, `stream: true` after a cached non-stream result | SSE (`text/event-stream`) from the backend — streaming requests are never served from the cache |
-| 41 | `result_cache_remove_after_serve_cleanup` | async | [L1866](../tests/api.rs#L1866) | `RemoveAfterServe` post-cleanup attached; 3 same-key requests | 1st → backend (entry stored); 2nd → served from cache, then entry file removed; 3rd → backend again (one-shot cache) |
-| 42 | `keyword_blocklist_rejects_before_result_cache_serves` | async | [L1911](../tests/api.rs#L1911) | blocklist + result cache chained; blocked prompt with a pre-populated cache entry | `400` from the blocklist — the reject beats the cached serve; backend never called |
-| 43 | `request_log_writes_xlf_record` | async | [L2263](../tests/api.rs#L2263) | non-stream chat with the built-in `request_log` plugin enabled (via `Config::with_request_log` → `Registry::with_builtins` + `load_request_loggers` + `prepare`, the `main.rs` path) | the file starts with the 4 XLF header lines and holds 1 record: W3C fields (`POST`, URI, user agent, 24-char `…Z` datetime, `cs-time` ≥ 0, `cs-bytes` = `Content-Length`, 200, `sc-bytes` > 0; `c-ip` = `-` — `oneshot` carries no `ConnectInfo`) + lpcache fields (model, `stream` false, key = `expected_key(..)[..16]`, `n-words` 2, `is-big` false, backend 0, slot 0/1, `restored`/`cache-hit`/`coalesced`/`reason` = `-`) + performance fields (mock `usage`/`timings`: prompt/completion/cached tokens `10`/`5`/`8`, `prefill-ms` `25.00`, `gen-ms` `15.00`, `prefill-tps` `400.0`, `gen-tps` `333.3`, `ttft-ms` = `-` — non-streaming) |
-| 44 | `request_log_stream_request_counts_delivered_bytes` | async | [L2371](../tests/api.rs#L2371) | `stream: true` chat, logger enabled | `lpcache-stream` = `true`, 200, and `sc-bytes` equals exactly the number of SSE bytes delivered to the client (byte counting via `Body::into_data_stream`) |
-| 45 | `request_log_logs_failed_request_without_pipeline` | async | [L2402](../tests/api.rs#L2402) | malformed JSON body — the handler fails before any pipeline view exists | 422 **and** one log record: `sc-status` 422, method/URI filled, every lpcache field `-` |
-| 46 | `request_log_rotates_and_bounds_keep` | async | [L2429](../tests/api.rs#L2429) | `max_bytes=2048` (between one and a few records, given the 28-field header), `keep=2`, repeated requests | ≥ 2 rotations: `.1` and `.2` exist, `.3` does not; every generation parses (fresh XLF header); the rotated generations hold the overflowed records; the current file is recreated after a rotation |
-| 47 | `request_log_stream_writes_perf_fields` | async | [L2334](../tests/api.rs#L2334) | `stream: true` chat, logger enabled | `lpcache-ttft-ms` is a proxy-measured value ≥ 0 (time to the first SSE chunk); the backend `usage`/`timings` carried in the stream's final chunk are logged (prompt/completion/cached tokens `10`/`5`/`8`, `prefill-ms` `25.00`, `gen-ms` `15.00`, `prefill-tps` `400.0`, `gen-tps` `333.3`) |
+| 36 | `restore_rejected_cleans_up_stale_meta` | async | [L2264](../tests/api.rs#L2264) | save A (KV created); delete A's KV; mock restore → 400; A+tail; A+tail again; delete KV; A+tail2 | 400 with the KV absent from every slot-save dir → stale meta removed (`stale_meta_removed`); 400 with the KV still present → meta **kept** (may be transient); final request saves a fresh entry |
+| 37 | `restore_rejected_keeps_meta_when_save_dir_unvisible` | async | [L2339](../tests/api.rs#L2339) | configured slot-save dir does not exist on the proxy's host; mock restore → 400 | absence of the KV file can't be verified (remote backend) → meta kept (status quo) |
+| 38 | `result_cache_serves_cached_result_without_backend` | async | [L1766](../tests/api.rs#L1766) | 1st request stores the result in the cache dir; 2nd same-key request | 2nd served from cache (identical body, 200) with **no** backend call, no save/restore, no meta file; a different key misses → backend |
+| 39 | `result_cache_expires_after_ttl` | async | [L1811](../tests/api.rs#L1811) | TTL 0.2 s; fresh hit, then 300 ms sleep | fresh entry served from cache; after the TTL the entry is expired + lazily removed and the request goes to the backend (new entry stored) |
+| 40 | `result_cache_stream_requests_bypass_cache` | async | [L1840](../tests/api.rs#L1840) | same key, `stream: true` after a cached non-stream result | SSE (`text/event-stream`) from the backend — streaming requests are never served from the cache |
+| 41 | `result_cache_remove_after_serve_cleanup` | async | [L2109](../tests/api.rs#L2109) | `RemoveAfterServe` post-cleanup attached; 3 same-key requests | 1st → backend (entry stored); 2nd → served from cache, then entry file removed; 3rd → backend again (one-shot cache) |
+| 42 | `keyword_blocklist_rejects_before_result_cache_serves` | async | [L2154](../tests/api.rs#L2154) | blocklist + result cache chained; blocked prompt with a pre-populated cache entry | `400` from the blocklist — the reject beats the cached serve; backend never called |
+| 43 | `request_log_writes_xlf_record` | async | [L2510](../tests/api.rs#L2510) | non-stream chat with the built-in `request_log` plugin enabled (via `Config::with_request_log` → `Registry::with_builtins` + `load_request_loggers` + `prepare`, the `main.rs` path) | the file starts with the 4 XLF header lines and holds 1 record: W3C fields (`POST`, URI, user agent, 24-char `…Z` datetime, `cs-time` ≥ 0, `cs-bytes` = `Content-Length`, 200, `sc-bytes` > 0; `c-ip` = `-` — `oneshot` carries no `ConnectInfo`) + lpcache fields (model, `stream` false, key = `expected_key(..)[..16]`, `n-words` 2, `is-big` false, backend 0, slot 0/1, `restored`/`cache-hit`/`coalesced`/`reason` = `-`) + performance fields (mock `usage`/`timings`: prompt/completion/cached tokens `10`/`5`/`8`, `prefill-ms` `25.00`, `gen-ms` `15.00`, `prefill-tps` `400.0`, `gen-tps` `333.3`, `ttft-ms` = `-` — non-streaming) |
+| 44 | `request_log_stream_request_counts_delivered_bytes` | async | [L2618](../tests/api.rs#L2618) | `stream: true` chat, logger enabled | `lpcache-stream` = `true`, 200, and `sc-bytes` equals exactly the number of SSE bytes delivered to the client (byte counting via `Body::into_data_stream`) |
+| 45 | `request_log_logs_failed_request_without_pipeline` | async | [L2649](../tests/api.rs#L2649) | malformed JSON body — the handler fails before any pipeline view exists | 422 **and** one log record: `sc-status` 422, method/URI filled, every lpcache field `-` |
+| 46 | `request_log_rotates_and_bounds_keep` | async | [L2676](../tests/api.rs#L2676) | `max_bytes=2048` (between one and a few records, given the 28-field header), `keep=2`, repeated requests | ≥ 2 rotations: `.1` and `.2` exist, `.3` does not; every generation parses (fresh XLF header); the rotated generations hold the overflowed records; the current file is recreated after a rotation |
+| 47 | `request_log_stream_writes_perf_fields` | async | [L2581](../tests/api.rs#L2581) | `stream: true` chat, logger enabled | `lpcache-ttft-ms` is a proxy-measured value ≥ 0 (time to the first SSE chunk); the backend `usage`/`timings` carried in the stream's final chunk are logged (prompt/completion/cached tokens `10`/`5`/`8`, `prefill-ms` `25.00`, `gen-ms` `15.00`, `prefill-tps` `400.0`, `gen-tps` `333.3`) |
+| 48 | `result_cache_no_cache_header_bypasses_the_cache` | async | [L2064](../tests/api.rs#L2064) | `result_cache` plugin with `cache_control: true` (via a `PLUGINS` spec); cache warmed; repeat same-key requests with `Cache-Control: no-cache`, `no-cache, no-store`, `max-age=60`, and no header | `no-cache` (alone or in a directive list) bypasses the cache → backend (call count grows); `max-age=60` and no header are still served from the cache (no new backend call) |
 
 ## Coverage map — feature → tests
 
@@ -97,5 +98,5 @@ into `cargo test` as shown above.
 | Request coalescing | `coalesce_concurrent_identical_requests_single_backend_call`, `coalesce_different_generation_params_still_merge`, `coalesce_mixed_stream_and_json_share_one_backend_call`, `coalesce_stream_groups_share_one_backend_stream`, `coalesce_flag_off_preserves_per_request_backend_calls`, `coalesce_new_group_after_completion` |
 | `STREAM_QUEUE_SIZE=1` backpressure | `stream_queue_size_one_delivers_full_stream`, `coalesce_stream_queue_size_one_follower_receives_full_stream` |
 | Prefilter plugins | `prefilter_rejects_keyword_request_before_backend`, `prefilter_accepts_clean_request`, `prefilter_is_case_insensitive_by_default`, `prefilter_inspects_content_part_arrays`, `prefilter_rejects_stream_request_with_json_error`, `prefilter_rejects_big_request_without_save_or_meta`, `prefilter_rejects_before_coalescing`, `custom_prefilter_adapter_accepts_and_rejects` |
-| Result-cache plugin | `result_cache_serves_cached_result_without_backend`, `result_cache_expires_after_ttl`, `result_cache_stream_requests_bypass_cache`, `result_cache_remove_after_serve_cleanup`, `keyword_blocklist_rejects_before_result_cache_serves` |
+| Result-cache plugin | `result_cache_serves_cached_result_without_backend`, `result_cache_expires_after_ttl`, `result_cache_stream_requests_bypass_cache`, `result_cache_remove_after_serve_cleanup`, `keyword_blocklist_rejects_before_result_cache_serves`, `result_cache_no_cache_header_bypasses_the_cache` |
 | Request-log plugin | `request_log_writes_xlf_record`, `request_log_stream_request_counts_delivered_bytes`, `request_log_logs_failed_request_without_pipeline`, `request_log_rotates_and_bounds_keep`, `request_log_stream_writes_perf_fields` |

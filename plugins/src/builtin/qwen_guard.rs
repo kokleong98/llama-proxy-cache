@@ -698,6 +698,7 @@ mod tests {
             key: "k".to_string(),
             n_words,
             is_big: n_words > 500,
+            headers: vec![],
         }
     }
 
@@ -902,7 +903,6 @@ mod tests {
                 .find("content-length:")
                 .and_then(|i| {
                     s[i + "content-length:".len()..]
-                        .trim()
                         .split_whitespace()
                         .next()
                         .and_then(|v| v.parse::<usize>().ok())

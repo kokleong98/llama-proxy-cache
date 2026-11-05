@@ -138,6 +138,7 @@ mod tests {
             key: "k".to_string(),
             n_words,
             is_big: n_words > 500,
+            headers: vec![],
         }
     }
 

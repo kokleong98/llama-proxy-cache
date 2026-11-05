@@ -60,6 +60,10 @@ pub struct PrefilterRequest {
     pub n_words: usize,
     /// `true` when `n_words > BIG_THRESHOLD_WORDS` (cache-eligible).
     pub is_big: bool,
+    /// The request's HTTP headers as `(lowercased name, value)` pairs
+    /// (empty when the proxy has none to share). Names are lowercased so
+    /// lookups are plain case-sensitive string compares.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Outcome of a prefilter check.

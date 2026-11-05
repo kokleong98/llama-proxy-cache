@@ -38,6 +38,10 @@
 //! - `cache_streaming` (default `false`): also cache streaming results
 //!   (aggregated to a non-streaming completion) and serve cached results to
 //!   streaming clients (converted to SSE).
+//! - `cache_control` (default `false`): honor the request's `Cache-Control`
+//!   header — a request carrying the `no-cache` directive (case-insensitive,
+//!   e.g. `no-cache` or `no-cache, no-store`) is forwarded to the backend
+//!   instead of being answered from the cache.
 
 use crate::api::{PostCleanup, Prefilter, PrefilterDecision, PrefilterRequest, ResultStore};
 use crate::registry::{PluginError, PluginFactory};
@@ -227,11 +231,17 @@ impl PostCleanup for RemoveAfterServe {
 ///   a fresh hit is served and the proxy converts it to SSE.
 /// - A cache miss returns [`PrefilterDecision::Accept`]; the normal
 ///   pipeline runs and stores a fresh result (see the `lpcache` app).
+/// - With `cache_control` enabled, a request whose `Cache-Control` header
+///   carries the `no-cache` directive is forwarded to the backend
+///   ([`PrefilterDecision::Accept`]) even on a fresh cache hit.
 /// - An optional [`PostCleanup`] adapter runs after a hit is read.
 #[derive(Clone)]
 pub struct CachedResultPrefilter {
     cache: Arc<ResultCache>,
     cleanup: Option<Arc<dyn PostCleanup>>,
+    /// Honor the request's `Cache-Control` header: a `no-cache` directive
+    /// bypasses the cache (the request is forwarded to the backend).
+    cache_control: bool,
 }
 
 impl std::fmt::Debug for CachedResultPrefilter {
@@ -240,6 +250,7 @@ impl std::fmt::Debug for CachedResultPrefilter {
             .field("cache_dir", &self.cache.dir())
             .field("ttl", &self.cache.ttl())
             .field("cleanup", &self.cleanup.as_ref().map(|c| c.name()))
+            .field("cache_control", &self.cache_control)
             .finish()
     }
 }
@@ -250,6 +261,7 @@ impl CachedResultPrefilter {
         Self {
             cache,
             cleanup: None,
+            cache_control: false,
         }
     }
 
@@ -260,11 +272,38 @@ impl CachedResultPrefilter {
         self
     }
 
+    /// Enable (or disable) honoring the request's `Cache-Control` header:
+    /// when enabled, a request carrying the `no-cache` directive bypasses
+    /// the cache and is forwarded to the backend. See the module docs.
+    pub fn with_cache_control(mut self, cache_control: bool) -> Self {
+        self.cache_control = cache_control;
+        self
+    }
+
+    /// Whether `Cache-Control: no-cache` requests bypass the cache.
+    pub fn cache_control(&self) -> bool {
+        self.cache_control
+    }
+
     /// The backing cache (the `lpcache` app stores fresh non-streaming
     /// results here after a successful backend call).
     pub fn cache(&self) -> &Arc<ResultCache> {
         &self.cache
     }
+}
+
+/// `true` when the request headers carry a `Cache-Control` header whose
+/// comma-separated directive list contains the `no-cache` directive
+/// (case-insensitive; `no-cache` may appear in any position, e.g.
+/// `no-cache, no-store`). Header names are matched lowercased, as the
+/// proxy normalizes them in [`PrefilterRequest::headers`].
+fn wants_no_cache(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.as_str() == "cache-control"
+            && value
+                .split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case("no-cache"))
+    })
 }
 
 #[async_trait]
@@ -274,6 +313,16 @@ impl Prefilter for CachedResultPrefilter {
     }
 
     async fn check(&self, req: &PrefilterRequest) -> PrefilterDecision {
+        // `cache_control` enabled: a `Cache-Control` header with the
+        // `no-cache` directive asks for a fresh result — forward the
+        // request to the backend instead of serving the cached copy.
+        if self.cache_control && wants_no_cache(&req.headers) {
+            tracing::info!(
+                "result_cache_bypass key={} cache_control=no-cache",
+                req.key.chars().take(16).collect::<String>()
+            );
+            return PrefilterDecision::Accept;
+        }
         // Streaming requests are served from the cache only when streaming
         // support is enabled: the proxy converts the cached completion to
         // SSE (`text/event-stream`) before sending it, so the client still
@@ -321,6 +370,10 @@ struct ResultCacheParams {
     /// completion) and serve cached results to streaming clients.
     #[serde(default)]
     cache_streaming: bool,
+    /// Honor the request's `Cache-Control` header: a `no-cache` directive
+    /// bypasses the cache (the request is forwarded to the backend).
+    #[serde(default)]
+    cache_control: bool,
 }
 
 fn default_ttl_secs() -> f64 {
@@ -338,6 +391,7 @@ impl PluginFactory for ResultCachePluginFactory {
             ttl_secs,
             cleanup,
             cache_streaming,
+            cache_control,
         } = ResultCacheParams::deserialize(params).map_err(|e| PluginError::BadParams {
             name: NAME.to_string(),
             message: e.to_string(),
@@ -352,7 +406,7 @@ impl PluginFactory for ResultCachePluginFactory {
         let cache = Arc::new(
             ResultCache::new(PathBuf::from(dir), ttl).with_cache_streaming(cache_streaming),
         );
-        let pf = CachedResultPrefilter::new(Arc::clone(&cache));
+        let pf = CachedResultPrefilter::new(Arc::clone(&cache)).with_cache_control(cache_control);
         let pf = match cleanup {
             None => pf,
             Some(name) => match name.as_str() {
@@ -387,7 +441,14 @@ mod tests {
             key: key.to_string(),
             n_words: 1,
             is_big: false,
+            headers: vec![],
         }
+    }
+
+    fn preq_cc(key: &str, stream: bool, headers: Vec<(String, String)>) -> PrefilterRequest {
+        let mut req = preq(key, stream);
+        req.headers = headers;
+        req
     }
 
     #[test]
@@ -482,6 +543,109 @@ mod tests {
         );
         // the adapter exposes the backing cache for the write path
         assert_eq!(pf.cache().dir(), td.path());
+    }
+
+    #[test]
+    fn wants_no_cache_parses_directives() {
+        let cc = |v: &str| vec![("cache-control".to_string(), v.to_string())];
+        assert!(!wants_no_cache(&[]));
+        assert!(!wants_no_cache(&cc("max-age=60")));
+        assert!(!wants_no_cache(&cc("public, max-age=300")));
+        assert!(wants_no_cache(&cc("no-cache")));
+        assert!(wants_no_cache(&cc("NO-CACHE")));
+        assert!(wants_no_cache(&cc("no-cache, no-store")));
+        assert!(wants_no_cache(&cc("  No-Cache , must-revalidate ")));
+        // A differently named header is ignored.
+        assert!(!wants_no_cache(&[(
+            "x-cache-control".to_string(),
+            "no-cache".to_string()
+        )]));
+    }
+
+    #[tokio::test]
+    async fn cache_control_no_cache_bypasses_the_cache() {
+        let td = tempfile::tempdir().unwrap();
+        let cache = Arc::new(ResultCache::new(
+            td.path().to_path_buf(),
+            Duration::from_secs(60),
+        ));
+        cache
+            .put("k1", 200, &json!({ "object": "chat.completion" }))
+            .unwrap();
+        let pf = CachedResultPrefilter::new(Arc::clone(&cache)).with_cache_control(true);
+        let no_cache = vec![("cache-control".to_string(), "no-cache".to_string())];
+        // `no-cache` on a fresh hit -> Accept (forward to the backend)
+        assert_eq!(
+            pf.check(&preq_cc("k1", false, no_cache.clone())).await,
+            PrefilterDecision::Accept
+        );
+        // other directives -> still served from the cache
+        let max_age = vec![("cache-control".to_string(), "max-age=60".to_string())];
+        assert_eq!(
+            pf.check(&preq_cc("k1", false, max_age)).await,
+            PrefilterDecision::Serve {
+                status: 200,
+                body: json!({ "object": "chat.completion" })
+            }
+        );
+        // no header at all -> still served from the cache
+        assert_eq!(
+            pf.check(&preq("k1", false)).await,
+            PrefilterDecision::Serve {
+                status: 200,
+                body: json!({ "object": "chat.completion" })
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_control_disabled_ignores_the_header() {
+        let td = tempfile::tempdir().unwrap();
+        let cache = Arc::new(ResultCache::new(
+            td.path().to_path_buf(),
+            Duration::from_secs(60),
+        ));
+        cache.put("k1", 200, &json!({ "n": 1 })).unwrap();
+        // Flag off (the default): `no-cache` requests are still served.
+        let pf = CachedResultPrefilter::new(Arc::clone(&cache));
+        assert!(!pf.cache_control());
+        let no_cache = vec![("cache-control".to_string(), "no-cache".to_string())];
+        assert_eq!(
+            pf.check(&preq_cc("k1", false, no_cache)).await,
+            PrefilterDecision::Serve {
+                status: 200,
+                body: json!({ "n": 1 })
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_cache_control_param_bypasses() {
+        let f = ResultCachePluginFactory;
+        let td = tempfile::tempdir().unwrap();
+        let pf = f
+            .create_prefilter(&json!({
+                "dir": td.path().to_string_lossy().into_owned(),
+                "cache_control": true
+            }))
+            .unwrap()
+            .expect("prefilter");
+        pf.result_store()
+            .expect("store")
+            .store("k1", 200, &json!({ "n": 1 }))
+            .unwrap();
+        let no_cache = vec![("cache-control".to_string(), "no-cache".to_string())];
+        assert_eq!(
+            pf.check(&preq_cc("k1", false, no_cache)).await,
+            PrefilterDecision::Accept
+        );
+        assert_eq!(
+            pf.check(&preq("k1", false)).await,
+            PrefilterDecision::Serve {
+                status: 200,
+                body: json!({ "n": 1 })
+            }
+        );
     }
 
     #[tokio::test]
