@@ -3,7 +3,7 @@
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (197 tests) runs with
+1:1 to a test function; the full suite (244 tests) runs with
 `cargo test --workspace`.
 
 Direct tests of `LlamaClient` against `MockLlama`; the two auth-header
@@ -20,7 +20,6 @@ tests capture the raw request on a one-shot TCP server.
 ## How to run
 
 ```sh
-cd lpcache
 cargo test --test client                             # all 15 client integration tests
 cargo test --test client get_model_id_from_backend   # one test (exact name)
 ```

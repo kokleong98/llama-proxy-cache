@@ -1,52 +1,18 @@
-# proxycache — Parameters Help Summary
+# lpcache — Parameters Reference
 
-All tunable parameters for the proxycache stack, in two layers:
-
-1. **`run-proxycache.sh` launcher** (env vars only)
-2. **Llama Proxy Cache** `lpcache/target/release/lpcache` (CLI flags **or** env vars — CLI > env > built-in default)
-
-Plus the matching **llama-server** flags the proxy depends on.
+All tunable parameters for the `lpcache` proxy (CLI flags **or** env
+vars — CLI > env > built-in default), plus the matching
+**llama-server** flags the proxy depends on.
 
 The proxy also carries this summary as **embedded help**:
 
 ```sh
-lpcache --help                  # Rust binary
+lpcache --help
 ```
 
 ---
 
-## 1. `run-proxycache.sh` launcher
-
-> **Note:** this convenience launcher belongs to the deployment
-> environment, not to this repository — this repo ships the `lpcache`
-> binary itself, started directly with the env vars / flags in §2.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `PROXY_PORT` | `8090` | Proxy listen port (exported to the proxy as `PORT`) |
-| `LLAMA_URL` | `http://127.0.0.1:8081` | llama-server base URL |
-| `LLAMA_API_KEY` | `777` | llama-server `--api-key`; **empty string = no auth** |
-| `N_SLOTS` | `1` | **Must match** llama-server `-np`/`--parallel` |
-| `MODEL_ID` | `qwen3.6` | Model id advertised by `GET /v1/models` |
-| `META_DIR` | `<script dir>/kv_meta` | Directory for `<key>.meta.json` files |
-| `META_MAX` | `2` | LRU bound on meta files (hardcoded in the script, not overridable) |
-| `SLOT_SAVE_PATH` | `/data/llama.cpp/slots/8081` | Must match llama-server `--slot-save-path`; auto-unset (and KV-file pruning skipped) if the dir is missing/unwritable |
-| `IMPL` | `auto` | `auto` \| `rust` — both launch the Llama Proxy Cache (kept for compatibility; `auto` = prebuilt binary if present, else build Rust) |
-
-Examples:
-
-```sh
-./run-proxycache.sh
-N_SLOTS=4 ./run-proxycache.sh
-PROXY_PORT=9000 LLAMA_URL=http://10.0.0.5:8081 LLAMA_API_KEY= ./run-proxycache.sh
-```
-
-The script exports `PORT LLAMA_URL N_SLOTS MODEL_ID META_DIR META_MAX` and
-(optionally) `LLAMA_API_KEY` / `SLOT_SAVE_PATH`.
-
----
-
-## 2. Llama Proxy Cache (`lpcache`)
+## 1. Llama Proxy Cache (`lpcache`)
 
 Every parameter is settable as an **env var** or a **command-line flag**.
 Explicit flags take precedence over environment variables, which take
@@ -68,7 +34,7 @@ precedence over the built-in defaults. `-h` / `--help` prints the built-in help.
 | `PORT` | `--port <PORT>` | `8081` | Proxy listen port |
 | `LLAMA_API_KEY` | `--api-key <KEY>` | — | Sent to the backend as `Authorization: Bearer <KEY>` (llama-server `--api-key`). Blank/whitespace-only = no header |
 | `LOG_LEVEL` | `--log-level <LEVEL>` | `INFO` | `TRACE`..`ERROR`; **`RUST_LOG` env var overrides it when set** |
-| `STREAM_QUEUE_SIZE` | `--stream-queue-size <N>` | `16` | Capacity of the per-request bounded channel that buffers streamed SSE bytes between the background reader and the HTTP response. Must be `>= 1` (`0`/invalid fall back to the default with a warning). Smaller values backpressure a slow client faster; the default 16 matches the Python original |
+| `STREAM_QUEUE_SIZE` | `--stream-queue-size <N>` | `16` | Capacity of the per-request bounded channel that buffers streamed SSE bytes between the background reader and the HTTP response. Must be `>= 1` (`0`/invalid fall back to the default with a warning). Smaller values backpressure a slow client faster; the default is 16 |
 | `COALESCE_REQUESTS` | `--coalesce-requests <BOOL>` | `false` | Group concurrent requests with the same KV cache key into one backend call (followers receive the leader's result, regardless of generation parameters) |
 | `PLUGINS` | `--plugins <JSON>` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` from the `lpcache-plugins` library — built-ins: `keyword` (params `keywords`, `case_insensitive`), `qwen_guard` (params `url` (required base URL of a separate llama-server hosting a Qwen3Guard-Gen model), `api_key`, `model`, `timeout_secs` (default `30`), `max_input_chars` (default `0` = no truncation), `reject_levels` (default `["Unsafe"]` — `Safe`/`Controversial`/`Unsafe`, case-insensitive), `reject_categories` (default `[]` — any of the nine Qwen3Guard categories: `Violent`, `Non-violent Illegal Acts`, `Sexual Content or Sexual Acts`, `PII`, `Suicide & Self-Harm`, `Unethical Acts`, `Politically Sensitive Topics`, `Copyright Violation`, `Jailbreak`; case-insensitive), `on_error`/`on_unparseable` (`"accept"` default, or `"reject"` to fail closed; `"allow"`/`"block"` also accepted — a non-2xx guard response, e.g. llama-server's `503` while the model is loading, follows `on_error`), `cache_max` (default `0` = off; bounded LRU of verdicts keyed by request KV cache key) — rejects matching requests with `400` before the backend), `result_cache` (params `dir`, `ttl_secs`, `cleanup`, `cache_streaming` (default `false` — when true, completed streaming results are aggregated into a non-streaming completion and cached, and cached entries are served to streaming clients as SSE), `cache_control` (default `false` — when true, requests whose `Cache-Control` header carries the `no-cache` directive (case-insensitive, e.g. `no-cache` or `no-cache, no-store`) are forwarded to the backend instead of being answered from the cache)), `chain` (param `filters`: nested plugin specs) and `request_log` (params `path`, `max_bytes`, `keep`, `fields` — the W3C-XLF request logger; a spec here takes precedence over the `REQUEST_LOG*` variables below). Prefilter specs are chained in list order; an empty array (`[]`) is valid and disables the prefilter. **Takes precedence over the legacy `PREFILTER_*` variables below**, which are translated into the equivalent plugin specs when `PLUGINS` is unset. The llama.cpp backend client is **not** selected here — one built-in `llama` plugin client is created per backend (each `BACKENDS` entry, or the fallback backend) from `LLAMA_URL`/`BACKENDS`, `LLAMA_API_KEY` and `REQUEST_TIMEOUT` |
 | `REQUEST_LOG` | `--request-log <BOOL>` | `false` | When true, one [W3C-XLF](https://www.w3.org/TR/xlf-10/) record per **finished** request (successes, errors and client disconnects — the record is written when the response body completes or is dropped) is appended to `REQUEST_LOG_PATH` — the built-in `request_log` plugin |
@@ -102,7 +68,7 @@ lpcache --port 8090 --llama-url http://127.0.0.1:8081 --n-slots 4 \
 
 ---
 
-## 3. Matching llama-server flags
+## 2. Matching llama-server flags
 
 The proxy only works correctly when the backend is started with the
 corresponding flags:
@@ -124,19 +90,17 @@ llama-server -m ./model.gguf -np 4 --api-key 777 \
 
 ---
 
-## 4. Precedence & gotchas
+## 3. Precedence & gotchas
 
-- **Rust:** CLI flag > env var > built-in default.
-- **Launcher:** your env > script defaults; the script never sets variables
-  you already exported.
-- `META_DIR` and relative `SLOT_SAVE_PATH` are resolved against the **current
-  working directory** (the launcher `cd`s to its own dir first).
+- CLI flag > env var > built-in default.
+- `META_DIR` and relative `SLOT_SAVE_PATH` are resolved against the
+  **current working directory**.
 - `META_MAX=0` disables pruning; a later restore of a pruned key simply fails
   and falls back to a full prefill.
 - With `BACKENDS` set, `LLAMA_URL`, `N_SLOTS`, and `SLOT_SAVE_PATH` env vars
   are **ignored** — per-backend values in the JSON array win.
-- Blank `LLAMA_API_KEY` means "no auth" (the launcher explicitly unsets it).
-- `RUST_LOG` (Rust only) overrides `LOG_LEVEL` when set.
+- Blank `LLAMA_API_KEY` means "no auth".
+- `RUST_LOG` overrides `LOG_LEVEL` when set.
 - Request log: a `request_log` spec in `PLUGINS` takes precedence over the `REQUEST_LOG*`
   variables — with `PLUGINS` set, the spec synthesized from the `REQUEST_LOG*` settings is
   not appended. After a rotation the current file is missing until the next record is

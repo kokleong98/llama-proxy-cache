@@ -3,7 +3,7 @@
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (197 tests) runs with
+1:1 to a test function; the full suite (244 tests) runs with
 `cargo test --workspace`.
 
 The built-in `llama` plugin's `LlamaClient` — slot-pinning unit tests
@@ -18,7 +18,6 @@ plus the plugin factory.
 ## How to run
 
 ```sh
-cd lpcache
 cargo test -p lpcache-plugins llama::tests                               # all 5 plugin tests
 cargo test -p lpcache-plugins builtin::llama::tests::slot_pinning_none  # one test, exact path
 ```

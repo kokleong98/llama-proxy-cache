@@ -27,7 +27,6 @@ any slot/backend work.
 ## How to run
 
 ```sh
-cd lpcache
 cargo test -p lpcache-plugins qwen_guard::tests   # all 17 qwen guard tests
 cargo test -p lpcache-plugins builtin::qwen_guard::tests::check_rejects_unsafe_verdict   # one, exact path
 ```
@@ -39,43 +38,43 @@ Output parser (3 tests):
 
 | # | Test case (exact filter) | Kind | Source | What it verifies | Expected result |
 |---|--------------------------|------|--------|------------------|-----------------|
-| 1 | `builtin::qwen_guard::tests::parses_model_card_outputs` | sync | [L709](../plugins/src/builtin/qwen_guard.rs#L709) | the exact Qwen3Guard-Gen model-card formats: prompt output, response output with the extra `Refusal:` line, multi-category list | level + categories parsed; unknown names ignored, duplicates dropped, `None` dropped |
-| 2 | `builtin::qwen_guard::tests::parse_is_case_insensitive_and_tolerates_whitespace` | sync | [L732](../plugins/src/builtin/qwen_guard.rs#L732) | `safety:   UNsafe` / `categories:` with extra whitespace | still parses to `Unsafe` + `NonViolentIllegalActs` |
-| 3 | `builtin::qwen_guard::tests::parse_category_aliases` | sync | [L740](../plugins/src/builtin/qwen_guard.rs#L740) | name aliases (`Personally Identifiable Information` → `PII`, `suicide and self-harm`) and unknown inputs | aliases map; unknown level/category → `None`; no guard output → empty verdict |
+| 1 | `builtin::qwen_guard::tests::parses_model_card_outputs` | sync | [L718](../plugins/src/builtin/qwen_guard.rs#L718) | the exact Qwen3Guard-Gen model-card formats: prompt output, response output with the extra `Refusal:` line, multi-category list | level + categories parsed; unknown names ignored, duplicates dropped, `None` dropped |
+| 2 | `builtin::qwen_guard::tests::parse_is_case_insensitive_and_tolerates_whitespace` | sync | [L741](../plugins/src/builtin/qwen_guard.rs#L741) | `safety:   UNsafe` / `categories:` with extra whitespace | still parses to `Unsafe` + `NonViolentIllegalActs` |
+| 3 | `builtin::qwen_guard::tests::parse_category_aliases` | sync | [L749](../plugins/src/builtin/qwen_guard.rs#L749) | name aliases (`Personally Identifiable Information` → `PII`, `suicide and self-harm`) and unknown inputs | aliases map; unknown level/category → `None`; no guard output → empty verdict |
 
 Decision policy (3 tests):
 
 | # | Test case (exact filter) | Kind | Source | What it verifies | Expected result |
 |---|--------------------------|------|--------|------------------|-----------------|
-| 4 | `builtin::qwen_guard::tests::decide_level_rule_first` | sync | [L756](../plugins/src/builtin/qwen_guard.rs#L756) | verdict level in `reject_levels` | `Reject { 400 }` with `Safety=Unsafe` and the categories in the message; rejects even with an empty category list |
-| 5 | `builtin::qwen_guard::tests::decide_category_rule_independent_of_level` | sync | [L786](../plugins/src/builtin/qwen_guard.rs#L786) | category in `reject_categories` while the level is allowed (and with no level at all) | Controversial + PII → `Reject { 400 }` naming PII; clean → `Accept`; level-less + rejected category → `Reject` |
-| 6 | `builtin::qwen_guard::tests::decide_accepts_safe` | sync | [L824](../plugins/src/builtin/qwen_guard.rs#L824) | `Safe` verdict with every category configured as rejected | `Accept` (the level rule never trips for `Safe`) |
+| 4 | `builtin::qwen_guard::tests::decide_level_rule_first` | sync | [L765](../plugins/src/builtin/qwen_guard.rs#L765) | verdict level in `reject_levels` | `Reject { 400 }` with `Safety=Unsafe` and the categories in the message; rejects even with an empty category list |
+| 5 | `builtin::qwen_guard::tests::decide_category_rule_independent_of_level` | sync | [L795](../plugins/src/builtin/qwen_guard.rs#L795) | category in `reject_categories` while the level is allowed (and with no level at all) | Controversial + PII → `Reject { 400 }` naming PII; clean → `Accept`; level-less + rejected category → `Reject` |
+| 6 | `builtin::qwen_guard::tests::decide_accepts_safe` | sync | [L833](../plugins/src/builtin/qwen_guard.rs#L833) | `Safe` verdict with every category configured as rejected | `Accept` (the level rule never trips for `Safe`) |
 
 Verdict cache (1 test):
 
 | # | Test case (exact filter) | Kind | Source | What it verifies | Expected result |
 |---|--------------------------|------|--------|------------------|-----------------|
-| 7 | `builtin::qwen_guard::tests::verdict_cache_is_bounded_lru` | sync | [L840](../plugins/src/builtin/qwen_guard.rs#L840) | bounded LRU put/get at capacity 2 | the least-recently-used entry is evicted; recently-accessed entries survive |
+| 7 | `builtin::qwen_guard::tests::verdict_cache_is_bounded_lru` | sync | [L849](../plugins/src/builtin/qwen_guard.rs#L849) | bounded LRU put/get at capacity 2 | the least-recently-used entry is evicted; recently-accessed entries survive |
 
 HTTP round-trip against a one-shot mock guard server (7 tests):
 
 | # | Test case (exact filter) | Kind | Source | What it verifies | Expected result |
 |---|--------------------------|------|--------|------------------|-----------------|
-| 8 | `builtin::qwen_guard::tests::check_rejects_unsafe_verdict` | async | [L954](../plugins/src/builtin/qwen_guard.rs#L954) | end-to-end: guard answers `Unsafe` / `Violent` | `Reject { 400 }` with level + category in the message |
-| 9 | `builtin::qwen_guard::tests::check_accepts_safe_verdict` | async | [L969](../plugins/src/builtin/qwen_guard.rs#L969) | guard answers `Safe` / `None` | `Accept` |
-| 10 | `builtin::qwen_guard::tests::check_fail_open_on_error` | async | [L977](../plugins/src/builtin/qwen_guard.rs#L977) | guard drops the connection (transport error), default `on_error` | `Accept` (fail open) |
-| 11 | `builtin::qwen_guard::tests::check_fail_closed_on_error_and_unparseable` | async | [L985](../plugins/src/builtin/qwen_guard.rs#L985) | `on_error: reject` on transport failure; `on_unparseable: reject` on garbage guard output (`Safety: Who knows`) | `Reject { 503 }` for the error; `Reject { 400 }` for the unparseable output |
-| 12 | `builtin::qwen_guard::tests::check_guard_http_error_uses_on_error_not_unparseable` | async | [L1011](../plugins/src/builtin/qwen_guard.rs#L1011) | guard server answers `503 {"error":{"message":"Loading model"}}` (valid JSON, no `choices`) | with `on_error: reject` / `on_unparseable: accept` → `Reject { 503 }` naming the HTTP error; discriminator `on_error: accept` / `on_unparseable: reject` → `Accept` (proves it routes to `on_error`, not `on_unparseable`) |
-| 13 | `builtin::qwen_guard::tests::check_skips_guard_for_empty_text` | async | [L1060](../plugins/src/builtin/qwen_guard.rs#L1060) | request with no message text, pointed at an unroutable URL | `Accept` without any HTTP call |
-| 14 | `builtin::qwen_guard::tests::check_reuses_cached_verdict_per_key` | async | [L1071](../plugins/src/builtin/qwen_guard.rs#L1071) | mock answers exactly one connection; second `check()` for the same request key | first call `Reject`; second call served from the LRU (a second HTTP attempt would fail the test) |
+| 8 | `builtin::qwen_guard::tests::check_rejects_unsafe_verdict` | async | [L962](../plugins/src/builtin/qwen_guard.rs#L962) | end-to-end: guard answers `Unsafe` / `Violent` | `Reject { 400 }` with level + category in the message |
+| 9 | `builtin::qwen_guard::tests::check_accepts_safe_verdict` | async | [L977](../plugins/src/builtin/qwen_guard.rs#L977) | guard answers `Safe` / `None` | `Accept` |
+| 10 | `builtin::qwen_guard::tests::check_fail_open_on_error` | async | [L985](../plugins/src/builtin/qwen_guard.rs#L985) | guard drops the connection (transport error), default `on_error` | `Accept` (fail open) |
+| 11 | `builtin::qwen_guard::tests::check_fail_closed_on_error_and_unparseable` | async | [L993](../plugins/src/builtin/qwen_guard.rs#L993) | `on_error: reject` on transport failure; `on_unparseable: reject` on garbage guard output (`Safety: Who knows`) | `Reject { 503 }` for the error; `Reject { 400 }` for the unparseable output |
+| 12 | `builtin::qwen_guard::tests::check_guard_http_error_uses_on_error_not_unparseable` | async | [L1019](../plugins/src/builtin/qwen_guard.rs#L1019) | guard server answers `503 {"error":{"message":"Loading model"}}` (valid JSON, no `choices`) | with `on_error: reject` / `on_unparseable: accept` → `Reject { 503 }` naming the HTTP error; discriminator `on_error: accept` / `on_unparseable: reject` → `Accept` (proves it routes to `on_error`, not `on_unparseable`) |
+| 13 | `builtin::qwen_guard::tests::check_skips_guard_for_empty_text` | async | [L1068](../plugins/src/builtin/qwen_guard.rs#L1068) | request with no message text, pointed at an unroutable URL | `Accept` without any HTTP call |
+| 14 | `builtin::qwen_guard::tests::check_reuses_cached_verdict_per_key` | async | [L1079](../plugins/src/builtin/qwen_guard.rs#L1079) | mock answers exactly one connection; second `check()` for the same request key | first call `Reject`; second call served from the LRU (a second HTTP attempt would fail the test) |
 
 Factory / config validation (3 tests):
 
 | # | Test case (exact filter) | Kind | Source | What it verifies | Expected result |
 |---|--------------------------|------|--------|------------------|-----------------|
-| 15 | `builtin::qwen_guard::tests::factory_creates_prefilter_from_json_params` | async | [L1104](../plugins/src/builtin/qwen_guard.rs#L1104) | full param wiring: `reject_levels: ["unsafe","controversial"]`, comma-string `reject_categories: "jailbreak, pii"`, `on_error: "reject"` | Controversial verdict → `Reject { 400 }` (level rule); Safe + PII → `Reject { 400 }` (category rule); unreachable guard → `Reject { 503 }` |
-| 16 | `builtin::qwen_guard::tests::factory_defaults` | async | [L1169](../plugins/src/builtin/qwen_guard.rs#L1169) | `url`-only spec (all defaults) | Controversial → `Accept` (default `reject_levels: ["Unsafe"]`), Unsafe → `Reject { 400 }`, transport error → `Accept` (fail open) |
-| 17 | `builtin::qwen_guard::tests::factory_rejects_bad_params` | sync | [L1208](../plugins/src/builtin/qwen_guard.rs#L1208) | missing `url`, unknown level (`"maybe"`), unknown category (`"gore"`), unknown fail action (`"ban"`); `create_backend` | `BadParams` with a descriptive message in each case; factory provides no backend client |
+| 15 | `builtin::qwen_guard::tests::factory_creates_prefilter_from_json_params` | async | [L1112](../plugins/src/builtin/qwen_guard.rs#L1112) | full param wiring: `reject_levels: ["unsafe","controversial"]`, comma-string `reject_categories: "jailbreak, pii"`, `on_error: "reject"` | Controversial verdict → `Reject { 400 }` (level rule); Safe + PII → `Reject { 400 }` (category rule); unreachable guard → `Reject { 503 }` |
+| 16 | `builtin::qwen_guard::tests::factory_defaults` | async | [L1177](../plugins/src/builtin/qwen_guard.rs#L1177) | `url`-only spec (all defaults) | Controversial → `Accept` (default `reject_levels: ["Unsafe"]`), Unsafe → `Reject { 400 }`, transport error → `Accept` (fail open) |
+| 17 | `builtin::qwen_guard::tests::factory_rejects_bad_params` | sync | [L1216](../plugins/src/builtin/qwen_guard.rs#L1216) | missing `url`, unknown level (`"maybe"`), unknown category (`"gore"`), unknown fail action (`"ban"`); `create_backend` | `BadParams` with a descriptive message in each case; factory provides no backend client |
 
 ## Coverage notes
 

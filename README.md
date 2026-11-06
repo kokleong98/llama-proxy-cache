@@ -309,29 +309,36 @@ words appended — the second request logs
 cargo test --workspace
 ```
 
-- **Unit tests** (80): config parsing/defaults (incl. `META_MAX` /
-  `SLOT_SAVE_PATH` / `PREFILTER_*` / `REQUEST_LOG*` / `PLUGINS` spec
-  synthesis and precedence), raw-prefix construction, word
+- **Unit tests** (84): config parsing/defaults (incl. `META_MAX` /
+  `SLOT_SAVE_PATH` / per-backend `kv_cache` / `PREFILTER_*` /
+  `REQUEST_LOG*` / `PLUGINS` spec synthesis and precedence), raw-prefix
+  construction, word
   tokenization, block hashing, LCP, SHA256 vectors, meta file round-trips,
   candidate filtering/thresholds, LRU pruning, slot selection (free/oldest
   ordering, idle-aware, multi-backend, circuit breaker, escalating
-  backoff, success/probe recovery, retry slot exclusion), per-slot locking,
+  backoff, success/probe recovery, retry slot exclusion, restore targeting
+  only `kv_cache`-enabled backends), per-slot locking,
   acquire timeout, save semantics (incl. save auto-retry).
-- **Plugin library tests** (81 + 3 doctests, 2 ignored): the
+- **Plugin library tests** (87 + 3 doctests, 2 ignored): the
   `lpcache-plugins` trait objects and built-ins — keyword matching, case
   sensitivity, content-part arrays, Qwen3Guard-Gen prefilter (output
   parsing, level/category decision policy, fail-open/fail-closed,
   HTTP-error routing to `on_error`, verdict LRU, HTTP round-trip against a mock guard server, factory
-  validation), result-cache put/get/expire,
-  `RemoveAfterServe` one-shot cleanup, store-trait dispatch,
+  validation), result-cache put/get/expire, `cache_streaming` /
+  `cache_control` params (streaming aggregation + SSE serve, `no-cache`
+  header bypass),
+  `RemoveAfterServe` one-shot cleanup, corrupt-entry self-healing,
+  store-trait dispatch,
   `LlamaClient` against a mock server (slot pin in body/options/query,
   JSON/non-JSON answers), the `request_log` plugin (XLF header, field
-  rendering/escaping, field selection, size rotation with `keep`), the
+  rendering/escaping, field selection, size rotation with `keep`,
+  performance fields), the
   `dashboard` plugin (params validation, counters, bucket pruning, recent
-  ring, self-contained HTML) and the plugin registry (`PluginSpec`
+  ring, `?since` range scoping, long-range coarsening, chart rendering,
+  stats-path join, self-contained HTML) and the plugin registry (`PluginSpec`
   parsing, builtin registration, unknown plugin error, zero/one/many
-  `load_prefilters` chaining, loader kind filtering).
-- **Integration tests** (65): the built-in `llama` plugin's `LlamaClient`
+  `load_prefilters` / `load_dashboard` chaining, loader kind filtering).
+- **Integration tests** (73): the built-in `llama` plugin's `LlamaClient`
   against the mock backend
   (slot pinning in body/options/query, save/restore status codes, JSON vs
   non-JSON provider answers, streaming), and end-to-end proxy behaviour
@@ -342,7 +349,10 @@ cargo test --workspace
   restore of surviving entries after a prune with graceful fallback for
   pruned keys, LRU timestamp bump on successful restore, stale-meta
   cleanup after a rejected restore (KV file gone from all slot-save
-  dirs), concurrent-request coalescing (identical merges, generation-param
+  dirs), meta kept when the slot-save dir is unvisible (remote
+  backend),
+  `kv_cache`-disabled backends (never save or restore, no stream save,
+  restore prefers a kv-enabled backend), concurrent-request coalescing (identical merges, generation-param
   independence, shared stream/JSON groups, full stream for followers,
   off-flag per-request calls, fresh group after completion), stream queue
   backpressure at size 1, prefilter
@@ -350,11 +360,15 @@ cargo test --workspace
   backend calls, case-insensitive matching, content-part inspection,
   stream/big-request rejection, reject-before-coalescing, custom
   `Prefilter` adapter, result-cache serve/expire/one-shot cleanup driven
-  through plugin specs, legacy `PREFILTER_*` env behaviour, W3C-XLF
+  through plugin specs, `cache_streaming` (completed stream aggregated,
+  cached and re-served to a streaming client as SSE), `no-cache` header
+  bypass, legacy `PREFILTER_*` env behaviour, W3C-XLF
   request log (record per finished request, delivered stream bytes,
   failed requests without pipeline fields, size rotation + `keep` bound,
   backend performance fields), dashboard (page and stats JSON reachable,
-  counters/time-series/recent updated after requests, custom page path)).
+  counters/time-series/recent updated after requests, custom page path,
+  `?since` range scoping, chart bar figures, dashboard routes excluded
+  from the request log and the aggregates)).
 
 `cargo clippy --all-targets` and `cargo fmt --check` are clean.
 

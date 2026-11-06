@@ -3,7 +3,7 @@
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (197 tests) runs with
+1:1 to a test function; the full suite (244 tests) runs with
 `cargo test --workspace`.
 
 The built-in `request_log` plugin: a W3C Extended Log Format (XLF)
@@ -24,7 +24,6 @@ size-based rotation — and its `PluginFactory`), plus the shared
 ## How to run
 
 ```sh
-cd lpcache
 cargo test -p lpcache-plugins request_log::tests                          # all 13 plugin tests
 cargo test -p lpcache-plugins builtin::request_log::tests::header_and_record_format   # one, exact path
 ```

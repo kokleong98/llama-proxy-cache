@@ -3,7 +3,7 @@
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (197 tests) runs with
+1:1 to a test function; the full suite (244 tests) runs with
 `cargo test --workspace`.
 
 ## Module overview
@@ -15,7 +15,6 @@ Part of the [lpcache regression test cases](README.md): every entry maps
 ## How to run
 
 ```sh
-cd lpcache
 cargo test --lib hashing::tests                  # all 19 hashing/meta/pruning tests
 cargo test --lib hashing::tests::meta_roundtrip  # one test, exact path
 cargo test --lib meta_roundtrip                  # one test, name substring

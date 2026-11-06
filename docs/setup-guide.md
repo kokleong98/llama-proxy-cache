@@ -156,7 +156,7 @@ Expected startup logs:
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
 slot_manager n_backends=2 total_slots=2
-app_start version=0.5.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
+app_start version=0.8.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
 
@@ -164,7 +164,7 @@ listening on 0.0.0.0:8081
 
 | Variable              | Default                    | Meaning                                             |
 |-----------------------|----------------------------|-----------------------------------------------------|
-| `BACKENDS`            | —                          | JSON array `[{"url":"...","n_slots":N}, ...]`      |
+| `BACKENDS`            | —                          | JSON array `[{"url":"...","n_slots":N,"slot_save_path":"...","kv_cache":true}, ...]`; per-backend `slot_save_path` (the KV-file pruning dir) and `kv_cache` (default `true`) are optional — a backend with `kv_cache: false` (no slot save/restore support) never saves/restores KV and gets no meta file for requests it serves |
 | `LLAMA_URL`           | `http://127.0.0.1:8000`    | single-backend fallback when `BACKENDS` is unset    |
 | `N_SLOTS`             | `1`                        | slot count for the fallback backend                 |
 | `WORDS_PER_BLOCK`     | `100`                      | words per hash block (must be stable — it is part of the restore filter) |
@@ -278,8 +278,14 @@ single entry via its `filters` param):
   same-key request with a previously cached backend result (the original
   JSON body and status code), read from `{dir}/{key}.json`. Fresh
   non-streaming results are stored there after the backend call;
-  **streaming requests are never served from the cache** and always fall
-  through to the backend. Entries expire after the `ttl_secs` param
+  **streaming requests are never served from the cache by default** and
+  always fall through to the backend — set the plugin's `cache_streaming`
+  param to `true` to also aggregate completed streaming results into a
+  non-streaming completion (cached) and serve cached entries to streaming
+  clients as SSE. With `cache_control` set to `true`, a request whose
+  `Cache-Control` header carries the `no-cache` directive (case-insensitive)
+  is forwarded to the backend instead of being answered from the cache.
+  Entries expire after the `ttl_secs` param
   (`0` = never) and are removed lazily on read. Logs
   `prefilter_serve filter=result_cache` / `result_cache_hit` on a hit, and
   `result_cache_store_fail` if storing a fresh result fails. The
@@ -454,7 +460,7 @@ Then, with a >500-word prompt in the messages, send the prompt twice
 ```
 
 This is the same flow the test-suite validates; the identical flows are
-covered by `cargo test --workspace` (197 tests) against the in-process mock.
+covered by `cargo test --workspace` (244 tests) against the in-process mock.
 
 ### 7.1 Load test (optional)
 
@@ -525,8 +531,8 @@ journalctl -u lpcache -f
 - **`WORDS_PER_BLOCK`** — changing it orphans existing caches (the restore
   filter skips mismatching `wpb`); only change it before caches are needed.
 - **`PLUGINS`** — the general extension point: select and chain
-  prefilter plugins (`keyword`, `result_cache`, `chain`) by name with
-  per-plugin `params` (see 4.4), and optionally enable the
+  prefilter plugins (`keyword`, `qwen_guard`, `result_cache`, `chain`) by
+  name with per-plugin `params` (see 4.4), and optionally enable the
   `request_log` plugin (4.5) and the `dashboard` plugin (4.6). The
   llama.cpp backend client is always the built-in `llama` plugin,
   instantiated once per backend (each `BACKENDS` entry or the fallback
