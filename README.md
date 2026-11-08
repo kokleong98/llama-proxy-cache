@@ -21,7 +21,7 @@ full prefill cost every time.
    likewise a plugin (the built-in `llama`) and is instantiated per
    `BACKENDS` entry with its URL, API key and timeout from the standard
    config.
-   Three built-in prefilter plugins: the **keyword blocklist**
+   The built-in prefilter plugins — the **keyword blocklist**
    (`keyword`) rejects requests whose message contents contain a blocked
    keyword (plain substring match, case-insensitive by default) with a
    `400` JSON error; the **Qwen guard** (`qwen_guard`) classifies the

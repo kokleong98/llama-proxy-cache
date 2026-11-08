@@ -36,7 +36,7 @@ precedence over the built-in defaults. `-h` / `--help` prints the built-in help.
 | `LOG_LEVEL` | `--log-level <LEVEL>` | `INFO` | `TRACE`..`ERROR`; **`RUST_LOG` env var overrides it when set** |
 | `STREAM_QUEUE_SIZE` | `--stream-queue-size <N>` | `16` | Capacity of the per-request bounded channel that buffers streamed SSE bytes between the background reader and the HTTP response. Must be `>= 1` (`0`/invalid fall back to the default with a warning). Smaller values backpressure a slow client faster; the default is 16 |
 | `COALESCE_REQUESTS` | `--coalesce-requests <BOOL>` | `false` | Group concurrent requests with the same KV cache key into one backend call (followers receive the leader's result, regardless of generation parameters) |
-| `PLUGINS` | `--plugins <JSON>` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` from the `lpcache-plugins` library — built-ins: `keyword` (params `keywords`, `case_insensitive`), `qwen_guard` (params `url` (required base URL of a separate llama-server hosting a Qwen3Guard-Gen model), `api_key`, `model`, `timeout_secs` (default `30`), `max_input_chars` (default `0` = no truncation), `reject_levels` (default `["Unsafe"]` — `Safe`/`Controversial`/`Unsafe`, case-insensitive), `reject_categories` (default `[]` — any of the nine Qwen3Guard categories: `Violent`, `Non-violent Illegal Acts`, `Sexual Content or Sexual Acts`, `PII`, `Suicide & Self-Harm`, `Unethical Acts`, `Politically Sensitive Topics`, `Copyright Violation`, `Jailbreak`; case-insensitive), `on_error`/`on_unparseable` (`"accept"` default, or `"reject"` to fail closed; `"allow"`/`"block"` also accepted — a non-2xx guard response, e.g. llama-server's `503` while the model is loading, follows `on_error`), `cache_max` (default `0` = off; bounded LRU of verdicts keyed by request KV cache key) — rejects matching requests with `400` before the backend), `result_cache` (params `dir`, `ttl_secs`, `cleanup`, `cache_streaming` (default `false` — when true, completed streaming results are aggregated into a non-streaming completion and cached, and cached entries are served to streaming clients as SSE), `cache_control` (default `false` — when true, requests whose `Cache-Control` header carries the `no-cache` directive (case-insensitive, e.g. `no-cache` or `no-cache, no-store`) are forwarded to the backend instead of being answered from the cache)), `chain` (param `filters`: nested plugin specs) and `request_log` (params `path`, `max_bytes`, `keep`, `fields` — the W3C-XLF request logger; a spec here takes precedence over the `REQUEST_LOG*` variables below). Prefilter specs are chained in list order; an empty array (`[]`) is valid and disables the prefilter. **Takes precedence over the legacy `PREFILTER_*` variables below**, which are translated into the equivalent plugin specs when `PLUGINS` is unset. The llama.cpp backend client is **not** selected here — one built-in `llama` plugin client is created per backend (each `BACKENDS` entry, or the fallback backend) from `LLAMA_URL`/`BACKENDS`, `LLAMA_API_KEY` and `REQUEST_TIMEOUT` |
+| `PLUGINS` | `--plugins <JSON>` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` loaded from the `lpcache-plugins` registry at runtime — built-ins: `keyword`, `qwen_guard`, `result_cache`, `chain`, `llama`, `request_log`, `dashboard`. Full per-plugin parameter reference: see the **Plugins** subsection below. |
 | `REQUEST_LOG` | `--request-log <BOOL>` | `false` | When true, one [W3C-XLF](https://www.w3.org/TR/xlf-10/) record per **finished** request (successes, errors and client disconnects — the record is written when the response body completes or is dropped) is appended to `REQUEST_LOG_PATH` — the built-in `request_log` plugin |
 | `REQUEST_LOG_PATH` | `--request-log-path <PATH>` | `lpcache-request.log` | Request-log file location; relative paths resolve against the **current working directory**; the parent dir is created at startup |
 | `REQUEST_LOG_MAX_BYTES` | `--request-log-max-bytes <N>` | `10485760` (10 MiB) | Rotation threshold in bytes: the current file is renamed to `<path>.1` and older generations shift upward (`<path>.2`, …); the fresh current file starts with a new XLF header. `0` = no rotation |
@@ -64,6 +64,170 @@ Example:
 ```sh
 lpcache --port 8090 --llama-url http://127.0.0.1:8081 --n-slots 4 \
            --api-key 777 --meta-max 500 --lcp-th 0.5
+```
+
+### 1.1 Plugins (`PLUGINS` / `--plugins`)
+
+`PLUGINS` loads one or more plugins from the `lpcache-plugins` registry by
+name, at runtime. Each entry is a **plugin spec**:
+
+```json
+{ "name": "<plugin name>", "params": { ... } }
+```
+
+and the whole value is a JSON **array** of such specs. Which plugins run is
+decided entirely by configuration, not by compile-time wiring — so a custom
+plugin crate can register new names and become loadable from configuration
+like any built-in.
+
+Rules:
+
+- **Prefilter** specs (`keyword`, `qwen_guard`, `result_cache`, `chain`) are
+  **chained in list order**; the first non-`Accept` decision (a `Reject` or a
+  `Serve`) wins. An empty array (`[]`) is valid and disables the prefilter.
+- **`PLUGINS` takes precedence** over the legacy `PREFILTER_*` and
+  `REQUEST_LOG*` variables below. When `PLUGINS` is **set**, the specs are
+  used as-is and the legacy settings are ignored. When `PLUGINS` is **unset**,
+  the specs are synthesized from the legacy settings — a non-empty
+  `PREFILTER_BLOCKLIST` → a `keyword` spec, `PREFILTER_RESULT_CACHE_DIR` → a
+  `result_cache` spec, and `REQUEST_LOG=true` → a `request_log` spec (a
+  `request_log` spec present in `PLUGINS` also suppresses the `REQUEST_LOG*`
+  settings).
+- The **`llama` backend client is not selected here**: one built-in `llama`
+  plugin client is created per backend from `BACKENDS` / `LLAMA_URL`,
+  `LLAMA_API_KEY` and `REQUEST_TIMEOUT`. It is listed below for reference and
+  for embedded use, where a `llama` spec can be loaded explicitly.
+- At most **one** `dashboard` plugin may be configured.
+
+#### `keyword` — keyword blocklist prefilter
+
+Rejects a request when the combined message text (string content and text
+content parts) contains any blocked keyword (plain substring match).
+Rejections are `400` naming the first matching keyword; an empty keyword list
+yields no plugin.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `keywords` (required) | — | Array of keyword strings, or a comma-separated string (`"a, b"`); surrounding whitespace is trimmed and empty entries dropped |
+| `case_insensitive` | `true` | `true` matches keywords and text lowercased; `false` is exact case |
+
+#### `qwen_guard` — Qwen3Guard-Gen content-safety prefilter
+
+Runs a **Qwen3Guard-Gen** moderation model (hosted on a separate llama-server
+or any OpenAI-compatible endpoint) over the request's combined message text in
+prompt-moderation mode and applies the configured allow/reject policy. A
+non-2xx guard response (e.g. llama-server's `503` while the model is still
+loading) is a *failed check* (follows `on_error`), never an *unparseable* one.
+Rejections are `400` before any slot/backend work.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `url` (required) | — | Base URL of the server hosting the guard model; the plugin POSTs to `{url}/v1/chat/completions` |
+| `api_key` | — | Sent as `Authorization: Bearer <key>` |
+| `model` | — | Model id in the chat-completions request |
+| `timeout_secs` | `30` | Per-check timeout |
+| `max_input_chars` | `0` | Cap on the flattened text sent to the guard; `0` = no truncation (guard models have small contexts) |
+| `reject_levels` | `["Unsafe"]` | Severity levels that reject outright — `Safe`/`Controversial`/`Unsafe` (case-insensitive) |
+| `reject_categories` | `[]` | Categories that reject when present in the verdict (independent of the level); any of the nine Qwen3Guard categories below (case-insensitive; `PII` also matches "Personally Identifiable Information") |
+| `on_error` | `"accept"` | `"accept"` or `"reject"` (aliases `"allow"`/`"block"`) — what to do when the guard call fails (transport/HTTP/timeout) |
+| `on_unparseable` | `"accept"` | `"accept"` or `"reject"` — what to do when the guard responds but its output cannot be parsed |
+| `cache_max` | `0` | Bounded LRU of verdicts keyed by the request's KV cache key; `0` = off (repeated same-key prompts skip the guard call) |
+
+The nine Qwen3Guard categories: `Violent`, `Non-violent Illegal Acts`,
+`Sexual Content or Sexual Acts`, `PII`, `Suicide & Self-Harm`, `Unethical
+Acts`, `Politically Sensitive Topics`, `Copyright Violation`, `Jailbreak`
+(input only).
+
+#### `result_cache` — file-based result cache + cached-result prefilter
+
+Stores completed non-streaming backend results on disk (one `{key}.json` per
+request KV cache key) and answers fresh (non-expired) same-key requests with a
+previously cached result **before any slot/backend work** — no slot, no
+restore/save, no meta file, no coalescing group. The proxy stores fresh
+non-streaming 200 JSON results under the key after the backend call; streaming
+requests are never served from the cache unless `cache_streaming` is enabled.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `dir` (required) | — | Cache-result path (dir holding the `{key}.json` entries); created on first write |
+| `ttl_secs` | `300` | Per-entry expiry in seconds; `0` = entries never expire |
+| `cleanup` | — | `"remove_after_serve"` attaches the built-in one-shot cleanup (the entry file is deleted after it is served); omitted/`null` = no cleanup |
+| `cache_streaming` | `false` | When true, completed streaming results are aggregated into a non-streaming completion and cached, and cached entries are served to streaming clients as SSE |
+| `cache_control` | `false` | When true, requests whose `Cache-Control` header carries the `no-cache` directive (case-insensitive, e.g. `no-cache` or `no-cache, no-store`) are forwarded to the backend instead of being answered from the cache |
+
+#### `chain` — run nested prefilters in order
+
+Runs several prefilter plugins in order; the first non-`Accept` decision wins.
+The proxy synthesizes a chain automatically when several prefilter specs are
+configured, but a `chain` spec also lets you nest arbitrary (custom) plugins
+explicitly.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `filters` (required) | — | Array of nested plugin specs `[{"name": "...", "params": {...}}, ...]`, resolved against the same registry (in evaluation order) |
+
+Example:
+
+```json
+{ "name": "chain",
+  "params": { "filters": [
+    { "name": "keyword", "params": { "keywords": ["a"] } },
+    { "name": "result_cache", "params": { "dir": "/var/rc" } }
+  ] } }
+```
+
+#### `llama` — llama.cpp backend client
+
+The reqwest-based HTTP client for one llama.cpp backend (chat stream/JSON,
+slot save/restore, model id). **Not selected via `PLUGINS`** — the proxy
+creates one per backend automatically; a `llama` spec is only used in embedded
+setups that load a backend explicitly.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `url` (required) | — | The backend base URL |
+| `api_key` | — | Sent as `Authorization: Bearer <key>` (llama-server's `--api-key`) |
+| `timeout_secs` | `600` | Per-request timeout |
+
+#### `request_log` — W3C-XLF request logger
+
+One [W3C Extended Log Format (XLF)](https://www.w3.org/TR/xlf-10/) record per
+finished request (success, error, rejection or disconnect) to a size-rotated
+log file. A `request_log` spec in `PLUGINS` takes precedence over the
+`REQUEST_LOG*` variables — when one is present, the `REQUEST_LOG*` settings are
+ignored. See the `REQUEST_LOG*` rows above for the full field list.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `path` | `lpcache-request.log` | Log file location; relative paths resolve against the **current working directory**; the parent dir is created |
+| `max_bytes` | `10485760` (10 MiB) | Rotation threshold in bytes; `0` = no rotation |
+| `keep` | `5` | Rotated generations retained (the oldest is dropped); `0` = keep them all |
+| `fields` | all 28 fields | Ordered list of field names to emit — any subset of the known XLF fields (see `REQUEST_LOG_FIELDS`) |
+
+#### `dashboard` — real-time statistics web dashboard
+
+Serves a self-contained HTML page (inline CSS + JS, no external assets) plus a
+JSON stats endpoint, fed by one record per finished request (the same records
+the request logger receives). The dashboard's own routes are excluded from the
+aggregates and the request log. At most one `dashboard` plugin.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `path` | `/dashboard` | Page URL path (must start with `/`); the stats API is mounted at `{path}/api/stats` |
+| `refresh_ms` | `2000` | The page's polling interval |
+| `window_secs` | `300` | Trailing window for a stats poll without `?since` |
+| `bucket_secs` | `5` | Time-series bucket size |
+| `max_recent` | `100` | Recent-requests ring buffer size; `0` = no recent list |
+
+Example:
+
+```sh
+lpcache --plugins '[
+  {"name": "keyword",      "params": {"keywords": ["forbidden"]}},
+  {"name": "result_cache", "params": {"dir": "./result_cache", "ttl_secs": 600}},
+  {"name": "request_log",  "params": {"path": "./lpcache.log", "max_bytes": 5242880}},
+  {"name": "dashboard",    "params": {"path": "/dashboard"}}
+]'
 ```
 
 ---
