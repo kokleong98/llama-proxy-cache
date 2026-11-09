@@ -93,6 +93,11 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 
 ## Configuration
 
+> 🛠 Prefer a guided setup? The bundled **`lpcache-config`** configurator
+> offers one-shot CLI commands, an interactive wizard (`configure`) and a
+> web UI (`serve`) to build, validate and export the configuration below —
+> see the [Configurator Guide](docs/configurator-guide.md).
+
 | Variable            | Default             | Meaning                                        |
 |---------------------|---------------------|------------------------------------------------|
 | `BACKENDS`          | —                   | JSON array `[{\"url\": \"...\", \"n_slots\": N, \"slot_save_path\": \"...\", \"kv_cache\": true}, ...]` (per-backend `kv_cache` gates KV save/restore; see [How it works](#how-it-works)) |
