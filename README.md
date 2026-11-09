@@ -152,6 +152,11 @@ precedence over the built-in defaults:
   --port 8081 --meta-dir ./kv_meta --log-level INFO
 ```
 
+> 📖 **Plugins in depth.** The table above lists the `PLUGINS` names and the
+> legacy `PREFILTER_*`/`REQUEST_LOG*` variables. For full plugin behavior,
+> edge cases, worked examples and a live Llama-3.2-1B run, see
+> [PLUGINS.md](PLUGINS.md).
+
 ## Request log
 
 When `REQUEST_LOG=true` — or a `request_log` spec is listed in `PLUGINS`
@@ -305,70 +310,141 @@ words appended — the second request logs
 
 ## Tests
 
-```bash
-cargo test --workspace
-```
+The suite spans the core proxy (`lpcache`) and the adapter plugin library
+(`lpcache-plugins`) across unit, integration and doc tests — **245 passing
+tests** plus **2 ignored** doc tests:
 
-- **Unit tests** (84): config parsing/defaults (incl. `META_MAX` /
-  `SLOT_SAVE_PATH` / per-backend `kv_cache` / `PREFILTER_*` /
-  `REQUEST_LOG*` / `PLUGINS` spec synthesis and precedence), raw-prefix
-  construction, word
-  tokenization, block hashing, LCP, SHA256 vectors, meta file round-trips,
-  candidate filtering/thresholds, LRU pruning, slot selection (free/oldest
-  ordering, idle-aware, multi-backend, circuit breaker, escalating
-  backoff, success/probe recovery, retry slot exclusion, restore targeting
-  only `kv_cache`-enabled backends), per-slot locking,
-  acquire timeout, save semantics (incl. save auto-retry).
-- **Plugin library tests** (87 + 3 doctests, 2 ignored): the
-  `lpcache-plugins` trait objects and built-ins — keyword matching, case
-  sensitivity, content-part arrays, Qwen3Guard-Gen prefilter (output
-  parsing, level/category decision policy, fail-open/fail-closed,
-  HTTP-error routing to `on_error`, verdict LRU, HTTP round-trip against a mock guard server, factory
-  validation), result-cache put/get/expire, `cache_streaming` /
-  `cache_control` params (streaming aggregation + SSE serve, `no-cache`
-  header bypass),
-  `RemoveAfterServe` one-shot cleanup, corrupt-entry self-healing,
-  store-trait dispatch,
-  `LlamaClient` against a mock server (slot pin in body/options/query,
-  JSON/non-JSON answers), the `request_log` plugin (XLF header, field
-  rendering/escaping, field selection, size rotation with `keep`,
-  performance fields), the
-  `dashboard` plugin (params validation, counters, bucket pruning, recent
-  ring, `?since` range scoping, long-range coarsening, chart rendering,
-  stats-path join, self-contained HTML) and the plugin registry (`PluginSpec`
-  parsing, builtin registration, unknown plugin error, zero/one/many
-  `load_prefilters` / `load_dashboard` chaining, loader kind filtering).
-- **Integration tests** (73): the built-in `llama` plugin's `LlamaClient`
-  against the mock backend
-  (slot pinning in body/options/query, save/restore status codes, JSON vs
-  non-JSON provider answers, streaming), and end-to-end proxy behaviour
-  (small vs big requests, meta file creation, restore on the second big
-  request, SSE passthrough, provider error mapping, 422 on bad JSON, dead
-  backend failover, transparent retry on connection failure, probe recovery
-  of a cooled-down backend, failing-slot non-pinning, LRU meta+KV pruning,
-  restore of surviving entries after a prune with graceful fallback for
-  pruned keys, LRU timestamp bump on successful restore, stale-meta
-  cleanup after a rejected restore (KV file gone from all slot-save
-  dirs), meta kept when the slot-save dir is unvisible (remote
-  backend),
-  `kv_cache`-disabled backends (never save or restore, no stream save,
-  restore prefers a kv-enabled backend), concurrent-request coalescing (identical merges, generation-param
-  independence, shared stream/JSON groups, full stream for followers,
-  off-flag per-request calls, fresh group after completion), stream queue
-  backpressure at size 1, prefilter
-  accept/reject before the backend — keyword reject with zero
-  backend calls, case-insensitive matching, content-part inspection,
-  stream/big-request rejection, reject-before-coalescing, custom
-  `Prefilter` adapter, result-cache serve/expire/one-shot cleanup driven
-  through plugin specs, `cache_streaming` (completed stream aggregated,
-  cached and re-served to a streaming client as SSE), `no-cache` header
-  bypass, legacy `PREFILTER_*` env behaviour, W3C-XLF
-  request log (record per finished request, delivered stream bytes,
-  failed requests without pipeline fields, size rotation + `keep` bound,
-  backend performance fields), dashboard (page and stats JSON reachable,
-  counters/time-series/recent updated after requests, custom page path,
-  `?since` range scoping, chart bar figures, dashboard routes excluded
-  from the request log and the aggregates)).
+| Suite | Location | Tests | Command |
+| --- | --- | ---: | --- |
+| Core proxy units | `src/` | 84 | `cargo test -p lpcache --lib` |
+| Plugin library units | `plugins/src/` | 87 | `cargo test -p lpcache-plugins --lib` |
+| Proxy integration (end-to-end) | `tests/api.rs` | 58 | `cargo test -p lpcache --test api` |
+| Backend-client integration | `tests/client.rs` | 15 | `cargo test -p lpcache --test client` |
+| Plugin doc tests | `plugins/src/` | 3 (1 + 2 ignored) | `cargo test -p lpcache-plugins --doc` |
+
+Everything runs at once with `cargo test --workspace`. Narrow the run with a
+name filter (e.g. `cargo test -p lpcache --test api restore`) or add
+`-- --ignored` to also execute the ignored doctests.
+
+### Core proxy units — `lpcache` (84, `src/`)
+
+Unit tests live in `#[cfg(test)]` modules next to the code they cover.
+
+- **Config & CLI** (`config.rs`, 37): defaults and env fallbacks
+  (`META_DIR`, `META_MAX`, `SLOT_SAVE_PATH`, `API_KEY`, non-numeric values),
+  `BACKENDS` JSON parsing (incl. per-backend `slot_save_path` / `kv_cache`,
+  invalid-JSON fallback), full CLI parsing (space/equal forms, extra `=`,
+  last-wins, unknown/missing flags, `--help`/`--version`, usage text),
+  CLI-over-env-over-default precedence, and `PLUGINS` / legacy
+  `PREFILTER_*` / `REQUEST_LOG*` spec synthesis and precedence.
+- **Hashing & meta files** (`hashing.rs`, 19): raw-prefix construction
+  (join/strip, empty/missing, non-string content), word tokenization, block
+  hashing, LCP ratio, SHA256 known vectors, meta-file round-trip and scanning
+  (corrupt/extension/missing-dir), timestamp bump, restore-candidate
+  filtering/thresholds and best-ratio pick, and LRU meta pruning.
+- **Coalescing / single-flight** (`coalesce.rs`, 4): leader/follower entry,
+  group forget, finish waking waiters with the outcome, ordered SSE append/
+  drain.
+- **Slot management** (`slot_manager.rs`, 24): slot selection and ordering
+  (free-first, used-then-oldest, multi-backend, idle-aware), restore
+  targeting and retry-slot exclusion (only `kv_cache`-enabled backends),
+  save semantics with auto-retry (500 vs other errors, retries until
+  success / exhausted / disabled), per-slot locking and acquire timeout, and
+  the circuit breaker (skip while others up, all-down fail-open, cooldown
+  expiry, escalating backoff, success/probe recovery).
+
+### Plugin library units — `lpcache-plugins` (87, `plugins/src/`)
+
+- **Registry** (`registry.rs`, 10): builtin registration and idempotent
+  global registry, custom-plugin registration, unknown/wrong-kind errors,
+  loader kind filtering, zero/one/many `load_prefilters` / `load_dashboard`
+  chaining, error propagation, `PluginSpec` parsing.
+- **`keyword`** (`keyword.rs`, 11): match/accept, case-insensitive default,
+  scans all messages, content-part arrays, empty messages, message-text
+  flattening, comma-list parsing, trait-object dispatch, factory build and
+  empty/missing-keyword rejection.
+- **`qwen_guard`** (`qwen_guard.rs`, 17): model-card output parsing
+  (case/whitespace tolerant, category aliases), level-then-category decision
+  policy, safe acceptance, bounded verdict LRU + per-key reuse, reject/accept
+  checks, fail-open/fail-closed, HTTP-error routing to `on_error`,
+  empty-text skip, factory build/defaults/bad-param rejection.
+- **`result_cache`** (`result_cache.rs`, 20): store put/get round-trip,
+  trait dispatch, expire/zero-TTL, corrupt-entry self-healing, fresh-hit
+  serve, stream bypass and `cache_streaming` aggregation, `Cache-Control:
+  no-cache` bypass (on/off), `RemoveAfterServe` one-shot cleanup (incl.
+  missing-file noop), factory build and `dir`/cleanup validation.
+- **`request_log`** (`request_log.rs`, 13): XLF header and record format,
+  UTC millisecond precision, dash rendering for missing/perf fields, field
+  escaping, custom-field subset/order, invalid field-list rejection, size
+  rotation with `keep` bound, rotation-disabled at 0, parent-dir creation,
+  lossless concurrent writes, factory params/defaults.
+- **`dashboard`** (`dashboard.rs`, 8): factory defaults/validation, stats
+  path join, counters/time-series/recent updates, `?since` range scoping,
+  long-range coarsening and oldest-bucket cap, self-contained HTML, chart
+  bar figures and baseline.
+- **`chain`** (`chain.rs`, 3) and **`llama` backend** (`llama.rs`, 5): chain
+  accept/reject ordering and nested factory build; slot pinning in
+  body/options/query (with and without an existing `options` key) and the
+  backend factory build/url validation.
+
+### Integration tests — `lpcache` (73, `tests/`)
+
+- **`tests/client.rs` (15)** — the built-in `llama` plugin's `LlamaClient`
+  against the mock backend: model-id lookup (up/down), API-key authorization
+  header (present/absent), JSON chat (object passthrough, slot pinning on/off,
+  non-JSON content-type, malformed/non-object bodies, HTTP errors), streaming
+  (chunk reassembly, error status), save/restore status-code mapping, and
+  trailing-slash base-URL normalization.
+- **`tests/api.rs` (58)** — the full proxy (axum app) in front of a mock
+  llama.cpp backend:
+  - *Basics* (2): configured model id on `/v1/models`, model defaulting.
+  - *Cache lifecycle* (3): small request (no save/meta), big request (save +
+    meta file), restore on the second identical big request.
+  - *Streaming & cancellation* (3): SSE passthrough + post-save, non-stream
+    and stream client-cancel aborting upstream (over TCP).
+  - *Provider error mapping* (4): stream error passthrough, JSON 500,
+    non-object/JSON-array 502, 422 on invalid JSON body.
+  - *Failover & recovery* (4): dead-backend failover to a live one,
+    connection-failure retry, probe recovery of a cooled-down backend,
+    failing slots not pinning all traffic.
+  - *LRU pruning* (3): meta + KV file pruning, restore of surviving entries
+    with fallback for pruned keys, LRU timestamp bump keeping hot entries.
+  - *`kv_cache` flag* (3): kv-disabled backends never save/restore (incl.
+    stream save), restore prefers a kv-enabled backend.
+  - *Coalescing* (6): identical-request merge, generation-param independence,
+    mixed stream/JSON sharing one call, shared stream group, off-flag
+    per-request calls, fresh group after completion.
+  - *Stream-queue backpressure* (2): size-1 delivers the full stream to the
+    leader and to followers.
+  - *Prefilter* (8): keyword reject before the backend (zero backend calls),
+    accept clean, case-insensitivity, content-part inspection, stream/big
+    reject, reject-before-coalescing, custom `Prefilter` adapter.
+  - *Result cache* (7): serve without backend, TTL expiry, stream bypass,
+    `cache_streaming` aggregation re-served as SSE, `no-cache` header bypass,
+    `RemoveAfterServe` cleanup, keyword blocklist running before the cache.
+  - *Stale-meta cleanup* (2): meta removed after a rejected restore, meta kept
+    when the slot-save dir is unvisible (remote backend).
+  - *Request log* (5): XLF record per request, stream perf fields, delivered
+    stream bytes, failed request without pipeline fields, rotation + `keep`.
+  - *Dashboard* (6): page and stats JSON reachable, chart figures, counters
+    updated after requests, `?since` scoping, routes excluded from the request
+    log and aggregates, custom page path.
+
+### Functional & load testing
+
+Beyond the automated suite, two examples give manual and load coverage against
+a running proxy:
+
+- `mock_llama` — a mock llama.cpp backend (`/v1/models`,
+  `/v1/chat/completions` JSON or SSE, `/slots/:id?action=save|restore`) —
+  used by the integration tests and by the [smoke test](#smoke-test-without-a-real-model).
+- `load_test` — a concurrent load generator (`cargo run --release --example
+  load_test -- [base_url] [workers] [duration_secs] [big_words]`) that hammers
+  three shared long prompts (so most requests hit the restore hot path) and
+  prints a status breakdown plus latency percentiles (p50/p90/p99) and
+  throughput.
+
+### Lints
 
 `cargo clippy --all-targets` and `cargo fmt --check` are clean.
 
