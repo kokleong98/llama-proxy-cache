@@ -33,11 +33,12 @@ in the same suites and pass under `cargo test --workspace`.
 ## How to run
 
 ```sh
-cargo test --workspace        # full regression suite (244 tests + 3 doctests, ~4 s)
+cargo test --workspace        # full regression suite (270 tests + 3 doctests, ~4 s)
 cargo test --lib              # 84 lpcache unit tests only
 cargo test -p lpcache-plugins # 87 plugin library unit tests
 cargo test --test api         # 58 API integration tests
 cargo test --test client      # 15 client integration tests
+cargo test -p lpcache-config  # 26 configurator unit tests
 cargo test <name-substring>   # run a single test by name filter
 cargo clippy --all-targets    # lint gate (expected: 0 warnings)
 ```

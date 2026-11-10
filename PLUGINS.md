@@ -74,14 +74,17 @@ Every plugin is described by a **spec** — a JSON object with a `name` (a regis
 ]
 ```
 
+`params` is optional — a spec without one (or with a `null` value) is treated
+as `{}` (all of the plugin's default parameters). The whole `PLUGINS` value
+must be a JSON **array**; anything else (including a bare object) is a
+startup error.
+
 ### 2.2 `PLUGINS` vs. legacy variables
 
-- **`PLUGINS` set** → the specs are used **as-is**; the legacy `PREFILTER_*` and `REQUEST_LOG*` variables are **ignored**.
-- **`PLUGINS` unset** → specs are **synthesized** from the legacy settings:
-  - a non-empty `PREFILTER_BLOCKLIST` → a `keyword` spec;
-  - `PREFILTER_RESULT_CACHE_DIR` set → a `result_cache` spec;
-  - `REQUEST_LOG=true` → a `request_log` spec.
-  - (a `request_log` spec already present in `PLUGINS` suppresses the `REQUEST_LOG*` settings.)
+- **Prefilter specs:**
+  - **`PLUGINS` set** → the prefilter specs are used **as-is**; the legacy `PREFILTER_*` variables are **ignored**.
+  - **`PLUGINS` unset** → prefilter specs are **synthesized** from the legacy settings: a non-empty `PREFILTER_BLOCKLIST` → a `keyword` spec (placed first, so a blocked request is rejected with `400` before a cache hit could serve it), and `PREFILTER_RESULT_CACHE_DIR` set → a `result_cache` spec.
+- **Request logging:** a `request_log` **spec in `PLUGINS` takes precedence** — its params are used as-is, the `REQUEST_LOG*` settings are ignored, and the spec enables logging on its own (even with `REQUEST_LOG` unset). When `PLUGINS` has **no** `request_log` spec (whether `PLUGINS` is set without one or unset at all) and `REQUEST_LOG=true`, a `request_log` spec is synthesized from the `REQUEST_LOG_*` values and appended to the list — so `REQUEST_LOG=true` keeps enabling logging alongside `PLUGINS` unless `PLUGINS` carries its own `request_log` spec.
 
 An empty array `[]` is valid and disables the prefilter.
 
@@ -124,6 +127,53 @@ The decision is one of:
 - **`Reject { status, message }`** — return a JSON error (`{"error": message}`) with `status` (built-ins use `400`; `qwen_guard` uses `503` on a failed check). The request never reaches a backend.
 - **`Serve { status, body }`** — return a previously-cached backend result (a full JSON body + its original status). The request never reaches a backend.
 
+### 2.5 Parameter validation and startup errors
+
+Plugins are instantiated **at startup**, before the proxy binds its port: any
+invalid spec prints `lpcache: failed to load <prefilter|request-log|dashboard>
+plugin: <message>` (or `lpcache: failed to prepare request log: …` for an
+unopenable log path) and exits with **code 2**. `lpcache-config validate`
+reports these same conditions pre-startup (see
+[the configurator guide](docs/configurator-guide.md#what-validate-checks)). The message names the
+offending plugin — and, for a nested `chain` filter, its index:
+
+| Condition | Message |
+|---|---|
+| `PLUGINS` is not a JSON array | `PLUGINS is not valid JSON: …` |
+| an entry is not a spec object (missing / non-string `name`) | `PLUGINS[i]: spec must be an object with a `name` string` |
+| name not registered | `no plugin registered under name "x"` |
+| missing / malformed / out-of-range params | `invalid params for plugin "x": <detail>` |
+| a second `request_log` / `dashboard` spec | `invalid params for plugin "x": only one request logger plugin is supported` / `…only one dashboard plugin is supported` |
+
+Per-plugin validation (what makes a spec invalid at startup):
+
+| plugin | fails when |
+|---|---|
+| `keyword` | `keywords` is missing, not an array-of-strings / comma-separated string, or empty after trimming |
+| `result_cache` | `dir` is missing or empty; `cleanup` is anything other than `"remove_after_serve"` (or omitted/`null`) |
+| `qwen_guard` | `url` is missing or empty; a `reject_levels` entry is not `Safe`/`Controversial`/`Unsafe`; a `reject_categories` entry is not one of the nine categories; `on_error`/`on_unparseable` is not `accept`/`reject` (each error names the valid values) |
+| `chain` | `filters` is missing, not an array, or empty; any nested spec is invalid (reported as `filters[i]: …`, so a nested unknown name or bad params is pinpointed) |
+| `llama` | `url` is missing or empty |
+| `request_log` | `path` is empty; `fields` is an empty list, names an unknown field, or repeats a field (the error lists the known fields) |
+| `dashboard` | `path` does not start with `/`; **any unknown param** (see below); a number outside its range (`refresh_ms` 100..=3600000, `window_secs` 10..=86400, `bucket_secs` 1..=3600, `max_recent` 0..=10000) |
+
+Two asymmetries worth knowing:
+
+- **Unknown params are silently ignored** by every built-in **except
+  `dashboard`**, which rejects them — so a typo'd param name in another
+  plugin's spec does *not* fail startup (the plugin just runs with its default
+  for that param); `dashboard` is the only built-in that protects against such
+  typos.
+- **Negative numerics:** `result_cache.ttl_secs` (→ `0` = never expire) and
+  `llama.timeout_secs` (→ `0` = **no per-request timeout**) are silently
+  clamped to zero, while `qwen_guard`'s `timeout_secs`/`max_input_chars`/
+  `cache_max` and every `dashboard` number are unsigned types, so a negative
+  value there is a startup error. `dashboard` additionally range-validates its
+  numbers — `refresh_ms` 100..=3600000, `window_secs` 10..=86400,
+  `bucket_secs` 1..=3600, `max_recent` 0..=10000 — and an out-of-range value
+  is a startup error (the other built-ins clamp or take whatever fits their
+  types).
+
 ---
 
 ## 3. Built-in plugins
@@ -147,7 +197,7 @@ Each of the seven built-ins is a module in `plugins/src/builtin/` implementing o
 **Behavior.**
 - The message text is flattened by `message_text`: it handles both a plain-string `content` and OpenAI content-part arrays (`[{"type":"text","text":"…"}]`); parts without a text payload (images, tool calls) and messages without `content` are skipped; pieces are joined with newlines.
 - `case_insensitive` (default `true`): keywords and text are matched lowercased; `false` is exact case.
-- Empty/whitespace keywords are dropped at construction; an all-empty list yields **no plugin** (the config synthesizes a `keyword` spec only when the blocklist is non-empty).
+- Empty/whitespace keywords are dropped at construction. In a `PLUGINS` spec a `keywords` list that ends up empty is a **startup error** (`"keywords must be a non-empty list"`); with the legacy `PREFILTER_BLOCKLIST`, an empty/whitespace-only blocklist instead simply synthesizes **no** `keyword` spec.
 - A match rejects with **`400`** and a message naming the **first** matching keyword.
 
 **Params.**
@@ -203,13 +253,13 @@ Live result ([§6.4](#64-result_cache-miss-then-hit)): first non-streaming reque
 
 **Behavior.**
 - Qwen3Guard-Gen is a generative classifier: it answers `Safety: <Level>` / `Categories: <c1, c2>` with one of three severity levels — `Safe`, `Controversial`, `Unsafe` — and zero or more harm categories.
-- The plugin sends the flattened message text as a single `user` message to `{url}/v1/chat/completions`, parses the verdict, and **rejects** (`400`) when the level is in `reject_levels` or any category is in `reject_categories`; otherwise it **accepts**.
+- The plugin sends the flattened message text as a single `user` message to `{url}/v1/chat/completions` (with `max_tokens: 64`, `temperature: 0`, `stream: false`; the `model` field is sent **only when the `model` param is set** — otherwise the guard server's default model is used), parses the verdict, and **rejects** (`400`) when the level is in `reject_levels` or any category is in `reject_categories`; otherwise it **accepts**.
 - **Empty text** (no message content) skips the guard call and is accepted.
 - **Failure handling** (fail-open vs. fail-closed):
   - **`on_error`** (default `"accept"`): action when the guard call fails (transport / HTTP / timeout). A **non-2xx** guard response (e.g. llama-server's `503 {"error":{"message":"Loading model"}}` while the model loads) is a *failed check* → `on_error`, **never** `on_unparseable` (so a fail-closed deployment cannot fail open just because the error body happened to be valid JSON without a `choices` array). A failed check with `on_error:"reject"` returns **`503`**.
   - **`on_unparseable`** (default `"accept"`): action when the guard responds but its output cannot be parsed into a level/categories; `on_unparseable:"reject"` returns **`400`**.
   - Both accept `"accept"` or `"reject"` (aliases `"allow"`/`"block"`).
-- **Verdict cache:** `cache_max` (default `0` = off) — a bounded LRU of verdicts keyed by the request's KV cache key; repeated same-key prompts skip the guard call.
+- **Verdict cache:** `cache_max` (default `0` = off) — a bounded LRU of verdicts keyed by the request's KV cache key; repeated same-key prompts skip the guard call. The LRU memoizes **every** decision — accepts *and* rejects — so a blocked prompt is not re-checked either.
 - A rejected request never reaches the chat backend (no slot, no KV work, no meta file, no coalescing group).
 
 **The nine Qwen3Guard categories** (case-insensitive; `PII` also matches "Personally Identifiable Information"): `Violent`, `Non-violent Illegal Acts`, `Sexual Content or Sexual Acts`, `PII`, `Suicide & Self-Harm`, `Unethical Acts`, `Politically Sensitive Topics`, `Copyright Violation`, `Jailbreak` (input only).
@@ -220,11 +270,11 @@ Live result ([§6.4](#64-result_cache-miss-then-hit)): first non-streaming reque
 |---|---|---|
 | `url` (required) | — | Base URL of the server hosting the guard model; POSTs to `{url}/v1/chat/completions` |
 | `api_key` | — | Sent as `Authorization: Bearer <key>` |
-| `model` | — | Model id in the chat-completions request |
+| `model` | — | Model id in the chat-completions request; when omitted the `model` field is left out and the guard server's default model is used |
 | `timeout_secs` | `30` | Per-check timeout |
-| `max_input_chars` | `0` | Cap on the flattened text sent to the guard (`0` = no truncation); guard models have small contexts |
-| `reject_levels` | `["Unsafe"]` | Severity levels that reject outright |
-| `reject_categories` | `[]` | Categories that reject when present (independent of the level) |
+| `max_input_chars` | `0` | Cap, in **characters** (not bytes), on the flattened text sent to the guard (`0` = no truncation); guard models have small contexts |
+| `reject_levels` | `["Unsafe"]` | Severity levels that reject outright — a JSON array or a comma-separated string of `Safe`/`Controversial`/`Unsafe` (case-insensitive) |
+| `reject_categories` | `[]` | Categories that reject when present (independent of the level) — a JSON array or a comma-separated string; any of the nine categories below (case-insensitive) |
 | `on_error` | `"accept"` | Action when the guard call fails |
 | `on_unparseable` | `"accept"` | Action when the verdict is unparseable |
 | `cache_max` | `0` | Bounded LRU of verdicts keyed by KV cache key; `0` = off |
@@ -312,7 +362,7 @@ Live results ([§6.6](#66-qwen_guard-fail-open--fail-closed)): with the guard do
 | `path` | `lpcache-request.log` | Log file location (relative → cwd; parent dir created) |
 | `max_bytes` | `10485760` (10 MiB) | Rotation threshold; `0` = no rotation |
 | `keep` | `5` | Rotated generations kept; `0` = keep all |
-| `fields` | all 28 | Ordered subset of the known XLF fields |
+| `fields` | all 28 | Ordered subset of the known XLF fields; omitted = all 28 in the default order. An empty list, an unknown field name, or a repeated field is a startup error (the error lists the known fields) |
 
 **Example.**
 
@@ -338,16 +388,17 @@ Live result ([§6.5](#65-request_log-xlf-request-log)): every request — includ
 - The page polls every `refresh_ms` and renders stat cards, throughput charts, the backend table, a per-slot occupancy grid and the recent-requests table; a time-filter dropdown (presets + custom/all-time) scopes the cards/charts/table via `?since`.
 - **Its own routes are excluded:** the page and stats requests are neither logged nor fed into the aggregates, so polling never inflates the statistics.
 - **Nothing is persisted:** all aggregates reset on proxy restart. **At most one** dashboard plugin may be configured.
+- **Strict params:** the only built-in that rejects **unknown params** — a typo'd param name is a startup error, so a bad dashboard config fails loudly instead of silently falling back to defaults (see [§2.5](#25-parameter-validation-and-startup-errors)).
 
 **Params.**
 
 | Param | Default | Meaning |
 |---|---|---|
 | `path` | `/dashboard` | Page URL path (must start with `/`); stats at `{path}/api/stats` |
-| `refresh_ms` | `2000` | Page polling interval |
-| `window_secs` | `300` | Trailing window for a stats poll without `?since` |
-| `bucket_secs` | `5` | Time-series bucket size |
-| `max_recent` | `100` | Recent-requests ring size; `0` = no recent list |
+| `refresh_ms` | `2000` | Page polling interval (100..=3600000 ms) |
+| `window_secs` | `300` | Trailing window for a stats poll without `?since` (10..=86400 s) |
+| `bucket_secs` | `5` | Time-series bucket size (1..=3600 s) |
+| `max_recent` | `100` | Recent-requests ring size (0..=10000; `0` = no recent list) |
 
 **Example.**
 

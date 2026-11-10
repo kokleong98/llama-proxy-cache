@@ -349,6 +349,18 @@ function localErrors(sc, params) {
       if (par.min !== null && par.min !== undefined && n < par.min) { errs[par.key] = 'must be >= ' + par.min; continue; }
       if (par.max !== null && par.max !== undefined && n > par.max) { errs[par.key] = 'must be <= ' + par.max; continue; }
     }
+    if (par.kind === 'list' || par.kind === 'cilist') {
+      if (par.errorIfEmpty && Array.isArray(v) && !v.length) { errs[par.key] = 'must not be empty (leave blank for the plugin default)'; continue; }
+      if (par.noDuplicates && Array.isArray(v)) {
+        const seen = new Set();
+        for (const it of v) {
+          const k = String(it).toLowerCase();
+          if (seen.has(k)) { errs[par.key] = 'value "' + it + '" is repeated'; break; }
+          seen.add(k);
+        }
+      }
+    }
+    if (par.kind === 'nested' && Array.isArray(v) && !v.length) { errs[par.key] = 'must not be empty — the runtime refuses to start with an empty chain'; continue; }
     const items = Array.isArray(v) ? v : [v];
     if (par.kind !== 'nested' && par.choices && par.choices.length && items.length) {
       const ci = par.kind === 'cilist';
@@ -357,7 +369,7 @@ function localErrors(sc, params) {
         if (!hit) { errs[par.key] = 'unknown value "' + it + '" — allowed: ' + par.choices.join(', '); break; }
       }
     }
-    if (par.key === 'path' && typeof v === 'string' && !v.startsWith('/')) errs[par.key] = 'must start with "/"';
+    if (sc && sc.name === 'dashboard' && par.key === 'path' && typeof v === 'string' && !v.startsWith('/')) errs[par.key] = 'must start with "/"';
     if (par.kind === 'nested' && Array.isArray(v)) {
       for (const sub of v) {
         const subErrs = localErrors(schemaOf(sub && sub.name), sub && sub.params);
@@ -386,6 +398,8 @@ function specSummary(sc, spec) {
   }
   const head = bits.slice(0, 3).join(', ');
   return bits.length > 3 ? head + ' (+' + (bits.length - 3) + ' more)' : head;
+}
+
 /// Plugins the add-picker offers: selectable, kind-filtered (nested lists
 /// only take prefilter kinds), and `unique` kinds only once.
 function availablePlugins(arr, allowedFn) {
@@ -560,6 +574,8 @@ function pluginForm(spec, onChange) {
   }
   for (const par of sc.params) form.appendChild(fieldControl(par, spec, onChange));
   return form;
+}
+
 /// Mount a plugin list into `box` (top level, or a nested chain.filters).
 /// `allowedFn` filters which kinds may be added; `onParam` bubbles param
 /// changes up so the parent repaints and the preview refreshes.
@@ -619,9 +635,6 @@ $('btn-plugins-raw').addEventListener('click', () => {
   }
   refresh();
 });
-
-
-}
 
 
 function setStatus(text, cls) {
@@ -738,6 +751,7 @@ document.addEventListener('change', refresh);
 
 (async function init() {
   buildTabs();
+  try { PLUGIN_SCHEMA = await api('/api/plugins'); } catch (_) {} // schema fetch failed — raw-JSON editing still works
   try {
     const s = await api('/api/state');
     $('cfg-path').textContent = s.path;

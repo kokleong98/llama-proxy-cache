@@ -53,4 +53,4 @@ Chain plugin (3 tests):
 |---|--------------------------|------|--------|------------------|-----------------|
 | 12 | `builtin::chain::tests::chain_first_non_accept_wins` | async | [L165](../plugins/src/builtin/chain.rs#L165) | `ChainPrefilter` (keyword → serve-fixture) | clean request → `Serve` from the 2nd adapter; blocked request → `Reject { 400 }` from the 1st beats the later serve |
 | 13 | `builtin::chain::tests::chain_all_accepts_accepts` | async | [L194](../plugins/src/builtin/chain.rs#L194) | all adapters return `Accept` | chain returns `Accept` |
-| 14 | `builtin::chain::tests::factory_builds_nested_chain_from_specs` | sync | [L204](../plugins/src/builtin/chain.rs#L204) | `chain` factory with a nested `prefilters` spec list | nested chain constructed and dispatching |
+| 14 | `builtin::chain::tests::factory_builds_nested_chain_from_specs` | sync | [L204](../plugins/src/builtin/chain.rs#L204) | `chain` factory with a nested `filters` spec list | nested chain constructed and dispatching |

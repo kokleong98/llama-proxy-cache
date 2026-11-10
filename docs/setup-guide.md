@@ -460,7 +460,7 @@ Then, with a >500-word prompt in the messages, send the prompt twice
 ```
 
 This is the same flow the test-suite validates; the identical flows are
-covered by `cargo test --workspace` (244 tests) against the in-process mock.
+covered by `cargo test --workspace` (270 tests) against the in-process mock.
 
 ### 7.1 Load test (optional)
 

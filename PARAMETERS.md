@@ -85,19 +85,27 @@ Rules:
 - **Prefilter** specs (`keyword`, `qwen_guard`, `result_cache`, `chain`) are
   **chained in list order**; the first non-`Accept` decision (a `Reject` or a
   `Serve`) wins. An empty array (`[]`) is valid and disables the prefilter.
-- **`PLUGINS` takes precedence** over the legacy `PREFILTER_*` and
-  `REQUEST_LOG*` variables below. When `PLUGINS` is **set**, the specs are
-  used as-is and the legacy settings are ignored. When `PLUGINS` is **unset**,
-  the specs are synthesized from the legacy settings — a non-empty
+- **`PLUGINS` vs. legacy `PREFILTER_*`:** **`PLUGINS` takes precedence** over
+  the legacy `PREFILTER_*` variables below — when `PLUGINS` is **set**, the
+  prefilter specs are used as-is and the `PREFILTER_*` settings are ignored;
+  when **unset**, they are synthesized into specs — a non-empty
   `PREFILTER_BLOCKLIST` → a `keyword` spec, `PREFILTER_RESULT_CACHE_DIR` → a
-  `result_cache` spec, and `REQUEST_LOG=true` → a `request_log` spec (a
-  `request_log` spec present in `PLUGINS` also suppresses the `REQUEST_LOG*`
-  settings).
+  `result_cache` spec.
+- **Request logging:** a `request_log` **spec** in `PLUGINS` takes precedence
+  over the `REQUEST_LOG*` variables (its params are used as-is, the
+  `REQUEST_LOG*` settings are ignored); but when `PLUGINS` has **no**
+  `request_log` spec — whether set or unset — `REQUEST_LOG=true` still
+  synthesizes a `request_log` spec from the `REQUEST_LOG_*` values and appends
+  it.
 - The **`llama` backend client is not selected here**: one built-in `llama`
   plugin client is created per backend from `BACKENDS` / `LLAMA_URL`,
   `LLAMA_API_KEY` and `REQUEST_TIMEOUT`. It is listed below for reference and
   for embedded use, where a `llama` spec can be loaded explicitly.
-- At most **one** `dashboard` plugin may be configured.
+- At most **one** `request_log` and one `dashboard` plugin may be configured.
+- Invalid specs are **startup errors** — the proxy prints the offending entry
+  and exits with code 2 before binding its port; per-plugin validation rules
+  and the exact error-message formats are documented in
+  [PLUGINS.md §2.5](PLUGINS.md#25-parameter-validation-and-startup-errors).
 
 #### `keyword` — keyword blocklist prefilter
 
@@ -122,16 +130,16 @@ Rejections are `400` before any slot/backend work.
 
 | Param | Default | Meaning |
 |---|---|---|
-| `url` (required) | — | Base URL of the server hosting the guard model; the plugin POSTs to `{url}/v1/chat/completions` |
+| `url` (required) | — | Base URL of the server hosting the guard model; the plugin POSTs to `{url}/v1/chat/completions` (single `user` message, `max_tokens: 64`, `temperature: 0`) |
 | `api_key` | — | Sent as `Authorization: Bearer <key>` |
-| `model` | — | Model id in the chat-completions request |
+| `model` | — | Model id in the chat-completions request; when omitted the `model` field is left out and the guard server's default model is used |
 | `timeout_secs` | `30` | Per-check timeout |
-| `max_input_chars` | `0` | Cap on the flattened text sent to the guard; `0` = no truncation (guard models have small contexts) |
-| `reject_levels` | `["Unsafe"]` | Severity levels that reject outright — `Safe`/`Controversial`/`Unsafe` (case-insensitive) |
-| `reject_categories` | `[]` | Categories that reject when present in the verdict (independent of the level); any of the nine Qwen3Guard categories below (case-insensitive; `PII` also matches "Personally Identifiable Information") |
+| `max_input_chars` | `0` | Cap, in **characters** (not bytes), on the flattened text sent to the guard; `0` = no truncation (guard models have small contexts) |
+| `reject_levels` | `["Unsafe"]` | Severity levels that reject outright — a JSON array or a comma-separated string of `Safe`/`Controversial`/`Unsafe` (case-insensitive) |
+| `reject_categories` | `[]` | Categories that reject when present in the verdict (independent of the level) — a JSON array or a comma-separated string; any of the nine Qwen3Guard categories below (case-insensitive; `PII` also matches "Personally Identifiable Information") |
 | `on_error` | `"accept"` | `"accept"` or `"reject"` (aliases `"allow"`/`"block"`) — what to do when the guard call fails (transport/HTTP/timeout) |
-| `on_unparseable` | `"accept"` | `"accept"` or `"reject"` — what to do when the guard responds but its output cannot be parsed |
-| `cache_max` | `0` | Bounded LRU of verdicts keyed by the request's KV cache key; `0` = off (repeated same-key prompts skip the guard call) |
+| `on_unparseable` | `"accept"` | `"accept"` or `"reject"` (aliases `"allow"`/`"block"`) — what to do when the guard responds but its output cannot be parsed |
+| `cache_max` | `0` | Bounded LRU of verdicts (accepts and rejects) keyed by the request's KV cache key; `0` = off (repeated same-key prompts skip the guard call) |
 
 The nine Qwen3Guard categories: `Violent`, `Non-violent Illegal Acts`,
 `Sexual Content or Sexual Acts`, `PII`, `Suicide & Self-Harm`, `Unethical
@@ -151,7 +159,7 @@ requests are never served from the cache unless `cache_streaming` is enabled.
 |---|---|---|
 | `dir` (required) | — | Cache-result path (dir holding the `{key}.json` entries); created on first write |
 | `ttl_secs` | `300` | Per-entry expiry in seconds; `0` = entries never expire |
-| `cleanup` | — | `"remove_after_serve"` attaches the built-in one-shot cleanup (the entry file is deleted after it is served); omitted/`null` = no cleanup |
+| `cleanup` | — | `"remove_after_serve"` attaches the built-in one-shot cleanup (the entry file is deleted after it is served); omitted/`null` = no cleanup; any other value is a startup error |
 | `cache_streaming` | `false` | When true, completed streaming results are aggregated into a non-streaming completion and cached, and cached entries are served to streaming clients as SSE |
 | `cache_control` | `false` | When true, requests whose `Cache-Control` header carries the `no-cache` directive (case-insensitive, e.g. `no-cache` or `no-cache, no-store`) are forwarded to the backend instead of being answered from the cache |
 
@@ -202,22 +210,24 @@ ignored. See the `REQUEST_LOG*` rows above for the full field list.
 | `path` | `lpcache-request.log` | Log file location; relative paths resolve against the **current working directory**; the parent dir is created |
 | `max_bytes` | `10485760` (10 MiB) | Rotation threshold in bytes; `0` = no rotation |
 | `keep` | `5` | Rotated generations retained (the oldest is dropped); `0` = keep them all |
-| `fields` | all 28 fields | Ordered list of field names to emit — any subset of the known XLF fields (see `REQUEST_LOG_FIELDS`) |
+| `fields` | all 28 fields | Ordered list of field names to emit — any subset of the known XLF fields (see `REQUEST_LOG_FIELDS`); omitted = all 28. An empty list, an unknown name, or a duplicate is a startup error |
 
 #### `dashboard` — real-time statistics web dashboard
 
 Serves a self-contained HTML page (inline CSS + JS, no external assets) plus a
 JSON stats endpoint, fed by one record per finished request (the same records
 the request logger receives). The dashboard's own routes are excluded from the
-aggregates and the request log. At most one `dashboard` plugin.
+aggregates and the request log. At most one `dashboard` plugin. Unlike the
+other plugins it **rejects unknown params** — a typo'd param name is a startup
+error.
 
 | Param | Default | Meaning |
 |---|---|---|
 | `path` | `/dashboard` | Page URL path (must start with `/`); the stats API is mounted at `{path}/api/stats` |
-| `refresh_ms` | `2000` | The page's polling interval |
-| `window_secs` | `300` | Trailing window for a stats poll without `?since` |
-| `bucket_secs` | `5` | Time-series bucket size |
-| `max_recent` | `100` | Recent-requests ring buffer size; `0` = no recent list |
+| `refresh_ms` | `2000` | The page's polling interval (100..=3600000 ms; out-of-range = startup error) |
+| `window_secs` | `300` | Trailing window for a stats poll without `?since` (10..=86400 s) |
+| `bucket_secs` | `5` | Time-series bucket size (1..=3600 s) |
+| `max_recent` | `100` | Recent-requests ring buffer size (0..=10000; `0` = no recent list) |
 
 Example:
 

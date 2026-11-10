@@ -45,6 +45,12 @@ pub struct Param {
     pub kind: FieldKind,
     /// Runtime refuses to start without it (missing **or** empty).
     pub required: bool,
+    /// The runtime rejects an **empty** list for this optional param
+    /// (`request_log.fields`: omitted = all 28 fields, but an explicit
+    /// `[]` is a startup error).
+    pub error_if_empty: bool,
+    /// The runtime rejects repeated list items (`request_log.fields`).
+    pub no_duplicates: bool,
     /// The `StrList`/`CiList` forms also accept a comma-separated string.
     pub comma_ok: bool,
     /// Human-readable default (`""` = none) shown by the prompts.
@@ -68,6 +74,9 @@ pub struct Plugin {
     pub summary: &'static str,
     /// Offered by the add-plugin picker (false for the auto `llama`).
     pub selectable: bool,
+    /// Only one spec may be configured — the runtime rejects a second
+    /// (`request_log` and `dashboard`).
+    pub unique: bool,
     /// The runtime deserializes this plugin with `deny_unknown_fields`.
     pub deny_unknown_params: bool,
     pub params: &'static [Param],
@@ -146,6 +155,8 @@ fn p(key: &'static str, label: &'static str, kind: FieldKind) -> Param {
         label,
         kind,
         required: false,
+        error_if_empty: false,
+        no_duplicates: false,
         comma_ok: false,
         default: "",
         help: "",
@@ -158,6 +169,8 @@ fn p(key: &'static str, label: &'static str, kind: FieldKind) -> Param {
 
 impl Param {
     const fn req(mut self) -> Self { self.required = true; self }
+    const fn no_empty(mut self) -> Self { self.error_if_empty = true; self }
+    const fn no_dup(mut self) -> Self { self.no_duplicates = true; self }
     const fn comma(mut self) -> Self { self.comma_ok = true; self }
     const fn def(mut self, d: &'static str) -> Self { self.default = d; self }
     const fn help(mut self, h: &'static str) -> Self { self.help = h; self }
@@ -179,6 +192,7 @@ fn plugin(
             kind,
             summary,
             selectable: true,
+            unique: false,
             deny_unknown_params: false,
             params: Box::leak(params.into_boxed_slice()),
         },
@@ -192,6 +206,10 @@ struct BuiltPlugin {
 impl BuiltPlugin {
     fn no_pick(mut self) -> Self {
         self.spec.selectable = false;
+        self
+    }
+    fn unique(mut self) -> Self {
+        self.spec.unique = true;
         self
     }
     fn deny(mut self) -> Self {
@@ -316,11 +334,13 @@ fn build() -> Vec<Plugin> {
                     .ge(0.0)
                     .help("rotated generations kept (0 = keep all)"),
                 p("fields", "fields", StrList)
-                    .def("(all 28)")
                     .ch(XLF_FIELDS)
-                    .help("ordered subset of the known XLF field names (empty = all)"),
+                    .no_empty()
+                    .no_dup()
+                    .help("ordered subset of the known XLF field names (blank = all 28; an explicit empty list or a repeated field is a startup error)"),
             ],
         )
+        .unique()
         .build(),
         plugin(
             "dashboard",
@@ -353,6 +373,7 @@ fn build() -> Vec<Plugin> {
             ],
         )
         .deny()
+        .unique()
         .build(),
         plugin(
             "llama",
@@ -474,17 +495,13 @@ pub fn validate_plugins(raw: &str) -> (Vec<String>, Vec<String>) {
     for (i, v) in arr.iter().enumerate() {
         validate_spec(v, &format!("plugins.json[{i}]"), 0, &mut errors, &mut warnings);
     }
-    // request_log / dashboard are singletons — a second spec is a startup
-    // error ("only one … plugin is supported").
-    let count = |name: &str| {
-        arr.iter()
+    // Singleton plugins (marked `unique` in the schema) — a second spec is a
+    // startup error ("only one … plugin is supported").
+    for name in plugins().iter().filter(|p| p.unique).map(|p| p.name) {
+        let n = arr
+            .iter()
             .filter(|v| v.get("name").and_then(|n| n.as_str()) == Some(name))
-            .count()
-    };
-    for (name, n) in [
-        ("request_log", count("request_log")),
-        ("dashboard", count("dashboard")),
-    ] {
+            .count();
         if n > 1 {
             errors.push(format!(
                 "plugins.json: {n} {name:?} specs — only one {name} plugin is supported"
@@ -670,6 +687,15 @@ fn check_param(
             let Some(items) = items else { return };
             if par.required && items.is_empty() {
                 bad("must be a non-empty list".into());
+            } else if par.error_if_empty && items.is_empty() {
+                bad("must not be empty (omit the param for the plugin default)".into());
+            }
+            if par.no_duplicates {
+                for (i, item) in items.iter().enumerate() {
+                    if items[..i].iter().any(|seen| seen == item) {
+                        bad(format!("duplicate value {item:?} (each may appear once)"));
+                    }
+                }
             }
             if !par.choices.is_empty() {
                 for item in items {
@@ -691,9 +717,8 @@ fn check_param(
                 return;
             };
             if items.is_empty() {
-                warnings.push(format!(
-                    r#"{at} ({name}): "filters" is empty — the chain passes every request through"#
-                ));
+                bad("`filters` must not be empty".into());
+                return;
             }
             for (j, item) in items.iter().enumerate() {
                 validate_spec(item, &format!("{at}.{}[{j}]", par.key), depth + 1, errors, warnings);
@@ -735,6 +760,8 @@ pub fn schemas_json() -> Value {
                         "choices": par.choices,
                         "min": par.min,
                         "max": par.max,
+                        "errorIfEmpty": par.error_if_empty,
+                        "noDuplicates": par.no_duplicates,
                         // Nested lists (chain.filters) only take prefilter kinds.
                         "accepts": if par.kind == FieldKind::Nested {
                             "prefilter"
@@ -836,8 +863,11 @@ mod tests {
                 .any(|x| x.contains("plugins.json[0].filters[0]") && x.contains("array of plugin specs")),
             "{e:?}"
         );
-        let (_, w) = validate_plugins(r#"[{"name":"chain","params":{"filters":[]}}]"#);
-        assert!(w.iter().any(|x| x.contains("passes every request")), "{w:?}");
+        let e = errs(r#"[{"name":"chain","params":{"filters":[]}}]"#);
+        assert!(
+            e.iter().any(|x| x.contains("`filters` must not be empty")),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -867,6 +897,11 @@ mod tests {
         assert!(e.iter().any(|x| x.contains("unknown value \"nope\"")), "{e:?}");
         let e = errs(r#"[{"name":"request_log","params":{"fields":"datetime"}}]"#);
         assert!(e.iter().any(|x| x.contains("array of strings")), "{e:?}");
+        // explicit empty list and repeated fields are startup errors
+        let e = errs(r#"[{"name":"request_log","params":{"fields":[]}}]"#);
+        assert!(e.iter().any(|x| x.contains("must not be empty")), "{e:?}");
+        let e = errs(r#"[{"name":"request_log","params":{"fields":["datetime","lpcache-key","datetime"]}}]"#);
+        assert!(e.iter().any(|x| x.contains("duplicate value \"datetime\"")), "{e:?}");
         // dashboard denies unknown params; path needs a leading slash; ranges enforced
         let e = errs(r#"[{"name":"dashboard","params":{"colour":"red","path":"dash","refresh_ms":5}}]"#);
         assert!(e.iter().any(|x| x.contains("unknown param(s): colour")), "{e:?}");

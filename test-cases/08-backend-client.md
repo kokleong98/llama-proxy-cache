@@ -41,8 +41,8 @@ into `cargo test` as shown above.
 | 10 | `chat_json_http_error` | async | [L168](../tests/client.rs#L168) | 503 | `Err(HttpStatus { 503, "mock chat failure" })` |
 | 11 | `chat_stream_chunks` | async | [L184](../tests/client.rs#L184) | 200 SSE stream | chunks contain Hello, world, `[DONE]` |
 | 12 | `chat_stream_error_status` | async | [L204](../tests/client.rs#L204) | 500 stream | `StreamChat { status: 500 }` + error body passes through |
-| 13 | `save_slot_statuses` | async | [L223](../tests/client.rs#L223) | `POST /slot/{id}/save` | 200 → `true`, 500 → `false`, 404 → `Err(HttpStatus)`; calls recorded in order |
-| 14 | `restore_slot_statuses` | async | [L248](../tests/client.rs#L248) | `POST /slot/{id}/restore` | 200 → `Restored`, 400 → `Rejected`, 500 → `Failed` (no error); calls recorded |
+| 13 | `save_slot_statuses` | async | [L223](../tests/client.rs#L223) | `POST /slots/{id}?action=save` | 200 → `true`, 500 → `false`, 404 → `Err(HttpStatus)`; calls recorded in order |
+| 14 | `restore_slot_statuses` | async | [L248](../tests/client.rs#L248) | `POST /slots/{id}?action=restore` | 200 → `Restored`, 400 → `Rejected`, 500 → `Failed` (no error); calls recorded |
 | 15 | `base_url_trailing_slash_normalized` | async | [L271](../tests/client.rs#L271) | backend URL with a trailing `/` | works — model id resolved |
 
 ## Coverage map — mock endpoint → tests
@@ -53,6 +53,6 @@ into `cargo test` as shown above.
 | Auth header on the wire | `api_key_sends_authorization_header`, `no_api_key_sends_no_authorization_header` |
 | `POST` chat completion (JSON) | `chat_json_object_passthrough_and_slot_pinning`, `chat_json_no_pinning_when_slot_none`, `chat_json_non_json_content_type`, `chat_json_malformed_json_body`, `chat_json_non_object_json`, `chat_json_http_error` |
 | `POST` chat completion (SSE) | `chat_stream_chunks`, `chat_stream_error_status` |
-| `POST /slot/{id}/save` | `save_slot_statuses` |
-| `POST /slot/{id}/restore` | `restore_slot_statuses` |
+| `POST /slots/{id}?action=save` | `save_slot_statuses` |
+| `POST /slots/{id}?action=restore` | `restore_slot_statuses` |
 | URL normalization | `base_url_trailing_slash_normalized` |

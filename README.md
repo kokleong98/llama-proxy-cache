@@ -315,9 +315,10 @@ words appended — the second request logs
 
 ## Tests
 
-The suite spans the core proxy (`lpcache`) and the adapter plugin library
-(`lpcache-plugins`) across unit, integration and doc tests — **245 passing
-tests** plus **2 ignored** doc tests:
+The suite spans the core proxy (`lpcache`), the adapter plugin library
+(`lpcache-plugins`) and the configurator (`lpcache-config`) across unit,
+integration and doc tests — **271 passing tests** plus **2 ignored** doc
+tests:
 
 | Suite | Location | Tests | Command |
 | --- | --- | ---: | --- |
@@ -325,6 +326,7 @@ tests** plus **2 ignored** doc tests:
 | Plugin library units | `plugins/src/` | 87 | `cargo test -p lpcache-plugins --lib` |
 | Proxy integration (end-to-end) | `tests/api.rs` | 58 | `cargo test -p lpcache --test api` |
 | Backend-client integration | `tests/client.rs` | 15 | `cargo test -p lpcache --test client` |
+| Configurator units | `configurator/src/` | 26 | `cargo test -p lpcache-config` |
 | Plugin doc tests | `plugins/src/` | 3 (1 + 2 ignored) | `cargo test -p lpcache-plugins --doc` |
 
 Everything runs at once with `cargo test --workspace`. Narrow the run with a
@@ -391,6 +393,21 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   accept/reject ordering and nested factory build; slot pinning in
   body/options/query (with and without an existing `options` key) and the
   backend factory build/url validation.
+
+### Configurator units — `lpcache-config` (26, `configurator/src/`)
+
+- **Template & config model** (`main.rs`, `model.rs`, 7): the default TOML
+  template parses and validates, defaults round-trip, dot-key set/get,
+  did-you-mean for typos, section keys, validation and value semantics.
+- **Exporters** (`exporters.rs`, 8): env-var pairs (single/multi-backend),
+  env-script quoting and grouping, single-line CLI flags, the systemd unit
+  and docker-run shapes, and the per-backend llama-server flags.
+- **Plugin schema** (`plugin_schema.rs`, 8): `PLUGINS` spec validation
+  against the runtime factories (known names, required params, singleton
+  bounds, recursive `chain` `filters`), shell quoting, unknown-format
+  errors, and the JSON schema/summaries the web UI serves.
+- **Wizard** (`wizard.rs`, 3): the menu covers every action, host/port
+  parsing, backend list line shapes.
 
 ### Integration tests — `lpcache` (73, `tests/`)
 
