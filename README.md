@@ -121,7 +121,7 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `REQUEST_LOG_PATH` | `lpcache-request.log` | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
 | `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB) | rotation threshold in bytes; the file is rotated when exceeded (`<path>.1`, `<path>.2`, …); `0` = no rotation |
 | `REQUEST_LOG_KEEP` | `5` | rotated generations retained (the oldest is dropped); `0` = keep them all |
-| `REQUEST_LOG_FIELDS` | all 28 fields | comma-separated ordered subset of the known XLF field names (W3C fields + `lpcache-*` pipeline/performance fields — see [Request log](#request-log)) |
+| `REQUEST_LOG_FIELDS` | all 31 fields | comma-separated ordered subset of the known XLF field names (W3C fields + `lpcache-*` pipeline/performance/resource fields — see [Request log](#request-log)) |
 | `PREFILTER_BLOCKLIST` | —                 | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; requests whose message contents contain any are rejected with `400` before the backend (default: no prefilter) |
 | `PREFILTER_CASE_INSENSITIVE` | `true`     | **legacy**: keyword matching is case-insensitive           |
 | `PREFILTER_RESULT_CACHE_DIR` | —          | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): cache-result path (`{key}.json` per cache key); fresh same-key requests are answered from the cached backend result before the backend (default: disabled) |
@@ -236,15 +236,18 @@ usually runs on). The proxy mounts two routes from the plugin:
   live state (slot occupancy per backend/slot, circuit-breaker state,
   in-flight count, active coalesced groups, KV meta cache size, uptime)
   merged with the plugin's per-request aggregates (lifetime counters,
-  success rate, a per-bucket time series, and the recent-requests ring).
+  success rate, process resource totals — the proxy's own CPU ms and
+  disk bytes read/written — a per-bucket time series, and the
+  recent-requests ring).
   The endpoint accepts an optional `?since=<unix seconds>` query
   parameter that scopes the aggregates to `[since, now]` (served as
   `range.counters` plus the range's time series, coarsened to at most
   360 points so long ranges stay cheap); without it the payload is the
   lifetime counters plus the trailing `window_secs` series
 
-The page polls the stats endpoint and renders KPI cards, bar charts
-(requests/s and completion tokens/s) and the backend/slot/recent tables.
+The page polls the stats endpoint and renders KPI cards (incl. the
+proxy's CPU / disk metrics), bar charts (requests, completion tokens,
+cached tokens and CPU ms per bucket) and the backend/slot/recent tables.
 A time-filter dropdown, grouped into presets (30 seconds, 1 minute,
 5 minutes, 15 minutes) and other (custom time, all time), scopes the
 cards, charts and recent table to the selected range by polling with

@@ -21,7 +21,9 @@
 //!
 //! - **counters** — total requests by status class, cache hits, KV
 //!   restores, big/streamed requests, coalesced followers, token totals,
-//!   average duration / time-to-first-token / generation rate;
+//!   process resource totals (CPU ms, disk bytes read/written — the
+//!   proxy's own per-request deltas), average duration /
+//!   time-to-first-token / generation rate;
 //! - **time series** — one bucket of `bucket_secs` (full request
 //!   counters per bucket) covering the whole process lifetime, bounded
 //!   by `MAX_BUCKETS` (oldest dropped first); a range query over many
@@ -217,6 +219,12 @@ pub struct RecentRow {
     pub cached_tokens: Option<u64>,
     pub ttft_ms: Option<f64>,
     pub gen_tps: Option<f64>,
+    /// Per-request CPU time in ms (the proxy process's delta).
+    pub cpu_ms: Option<f64>,
+    /// Per-request disk bytes read (the proxy process's delta).
+    pub disk_read_bytes: Option<u64>,
+    /// Per-request disk bytes written (the proxy process's delta).
+    pub disk_write_bytes: Option<u64>,
 }
 
 /// Lifetime aggregate counters.
@@ -242,6 +250,15 @@ pub struct Counters {
     gen_tps_n: u64,
     prefill_tps_sum: f64,
     prefill_tps_n: u64,
+    /// Sum of the per-request CPU time in ms (over the records that carry
+    /// `cpu_ms` — the proxy samples every finished request).
+    pub cpu_ms_sum: f64,
+    /// Count of records carrying `cpu_ms` (the `avg_cpu_ms` denominator).
+    pub cpu_ms_n: u64,
+    /// Total disk bytes read by the proxy process (per-request deltas).
+    pub disk_read_bytes: u64,
+    /// Total disk bytes written by the proxy process (per-request deltas).
+    pub disk_write_bytes: u64,
 }
 
 impl Counters {
@@ -288,6 +305,12 @@ impl Counters {
             self.prefill_tps_sum += t;
             self.prefill_tps_n += 1;
         }
+        if let Some(c) = record.cpu_ms {
+            self.cpu_ms_sum += c;
+            self.cpu_ms_n += 1;
+        }
+        self.disk_read_bytes += record.disk_read_bytes.unwrap_or(0);
+        self.disk_write_bytes += record.disk_write_bytes.unwrap_or(0);
     }
 
     /// Add the counters held by one bucket to `self`.
@@ -312,6 +335,10 @@ impl Counters {
         self.gen_tps_n += b.c.gen_tps_n;
         self.prefill_tps_sum += b.c.prefill_tps_sum;
         self.prefill_tps_n += b.c.prefill_tps_n;
+        self.cpu_ms_sum += b.c.cpu_ms_sum;
+        self.cpu_ms_n += b.c.cpu_ms_n;
+        self.disk_read_bytes += b.c.disk_read_bytes;
+        self.disk_write_bytes += b.c.disk_write_bytes;
     }
 
     /// The sum of the counters held by the given buckets (the counters
@@ -350,6 +377,12 @@ fn counters_json(c: &Counters) -> Value {
             "completion": c.completion_tokens,
             "cached": c.cached_tokens,
         },
+        "resources": {
+            "cpu_ms": c.cpu_ms_sum,
+            "avg_cpu_ms": Counters::avg(c.cpu_ms_n, c.cpu_ms_sum),
+            "disk_read_bytes": c.disk_read_bytes,
+            "disk_write_bytes": c.disk_write_bytes,
+        },
         "avg_duration_secs": Counters::avg(c.duration_n, c.duration_sum),
         "avg_ttft_ms": Counters::avg(c.ttft_n, c.ttft_sum),
         "avg_gen_tps": Counters::avg(c.gen_tps_n, c.gen_tps_sum),
@@ -365,6 +398,7 @@ fn bucket_point(b: &Bucket) -> Value {
         "reqs": b.c.total,
         "completions": b.c.completion_tokens,
         "cached_tokens": b.c.cached_tokens,
+        "cpu_ms": b.c.cpu_ms_sum,
     })
 }
 
@@ -424,6 +458,9 @@ impl Inner {
                 cached_tokens: record.cached_tokens,
                 ttft_ms: record.ttft_ms,
                 gen_tps: record.gen_tps,
+                cpu_ms: record.cpu_ms,
+                disk_read_bytes: record.disk_read_bytes,
+                disk_write_bytes: record.disk_write_bytes,
             });
             while self.recent.len() > max_recent {
                 self.recent.remove(0);
@@ -728,12 +765,16 @@ const PAGE_BODY: &str = r##"
     <div class="card"><div class="lbl">avg duration</div><div class="v" id="c-dur-v">&ndash;</div><div class="s">end to end</div></div>
     <div class="card"><div class="lbl">avg ttft</div><div class="v" id="c-ttft-v">&ndash;</div><div class="s">streaming only</div></div>
     <div class="card"><div class="lbl">avg gen rate</div><div class="v" id="c-gtps-v">&ndash;</div><div class="s">tok/s (backend)</div></div>
+    <div class="card"><div class="lbl">avg cpu</div><div class="v" id="c-cpu-v">&ndash;</div><div class="s" id="c-cpu-s">proxy process</div></div>
+    <div class="card"><div class="lbl">disk read</div><div class="v" id="c-dr-v">&ndash;</div><div class="s" id="c-dr-s">proxy process</div></div>
+    <div class="card"><div class="lbl">disk write</div><div class="v" id="c-dw-v">&ndash;</div><div class="s" id="c-dw-s">proxy process</div></div>
   </section>
   <section class="panel">
     <h2>throughput</h2>
     <div class="chartwrap"><div class="cap"><span>requests per bucket</span><span id="cap-req"></span></div><canvas id="chart-req"></canvas></div>
     <div class="chartwrap"><div class="cap"><span>completion tokens per bucket</span><span id="cap-tok"></span></div><canvas id="chart-tok"></canvas></div>
     <div class="chartwrap"><div class="cap"><span>cached (restored) prompt tokens per bucket</span><span id="cap-cached"></span></div><canvas id="chart-cached"></canvas></div>
+    <div class="chartwrap"><div class="cap"><span>cpu ms per bucket</span><span id="cap-cpu"></span></div><canvas id="chart-cpu"></canvas></div>
   </section>
   <section class="panel"><h2>backends</h2><div id="backends"></div></section>
   <section class="panel"><h2>slots</h2><div id="slots" class="slots"></div></section>
@@ -771,6 +812,8 @@ function statsUrl(){
 }
 function fmtN(v){ return v==null ? "\u2013" : Math.round(v).toLocaleString(); }
 function fmtDur(v){ if(v==null) return "\u2013"; if(v<1) return Math.round(v*1000)+" ms"; if(v<120) return v.toFixed(1)+" s"; if(v<7200) return Math.floor(v/60)+" m "+Math.round(v%60)+" s"; return Math.floor(v/3600)+" h "+Math.floor((v%3600)/60)+" m"; }
+function fmtBytes(v){ if(v==null) return "\u2013"; if(v<1024) return v+" B"; if(v<1048576) return (v/1024).toFixed(1)+" KB"; if(v<1073741824) return (v/1048576).toFixed(1)+" MB"; return (v/1073741824).toFixed(2)+" GB"; }
+function fmtMs(v){ if(v==null) return "\u2013"; if(v<1000) return (v<10 ? v.toFixed(2) : v.toFixed(1))+" ms"; return (v/1000).toFixed(2)+" s"; }
 function fmtUp(v){ if(v==null) return "\u2013"; const s=Math.floor(v); if(s<3600) return Math.floor(s/60)+" m "+(s%60)+" s"; if(s<86400) return Math.floor(s/3600)+" h "+Math.floor((s%3600)/60)+" m"; return Math.floor(s/86400)+" d "+Math.floor((s%86400)/3600)+" h"; }
 function pct(v){ return v==null ? "\u2013" : (v*100).toFixed(1)+" %"; }
 function card(id, v, s){ $(id+"-v").textContent=v; if(s!=null) $(id+"-s").textContent=s; }
@@ -784,7 +827,7 @@ function fillSeries(buckets, bucketSecs){
   for(let t=first; t<=last; t+=bucketSecs){
     let b = null;
     for(const x of buckets){ if(x.t===t){ b=x; break; } }
-    out.push(b || {t:t, reqs:0, completions:0, cached_tokens:0});
+    out.push(b || {t:t, reqs:0, completions:0, cached_tokens:0, cpu_ms:0});
   }
   return out;
 }
@@ -914,15 +957,21 @@ function render(d){
   card("c-dur", fmtDur(c.avg_duration_secs));
   card("c-ttft", c.avg_ttft_ms==null ? "\u2013" : Math.round(c.avg_ttft_ms)+" ms");
   card("c-gtps", c.avg_gen_tps==null ? "\u2013" : c.avg_gen_tps.toFixed(1));
+  const res = c.resources || {};
+  card("c-cpu", fmtMs(res.avg_cpu_ms), "total "+fmtMs(res.cpu_ms)+" \u00b7 proxy process");
+  card("c-dr", fmtBytes(res.disk_read_bytes), "total \u00b7 "+rangeLabel());
+  card("c-dw", fmtBytes(res.disk_write_bytes), "total \u00b7 "+rangeLabel());
   const series = fillSeries(s.buckets, s.bucket_secs);
   drawBars($("chart-req"), series, "reqs", "requests", "#58a6ff", -1);
   drawBars($("chart-tok"), series, "completions", "completion tokens", "#3fb950", -1);
   drawBars($("chart-cached"), series, "cached_tokens", "cached tokens", "#d29922", -1);
+  drawBars($("chart-cpu"), series, "cpu_ms", "cpu ms", "#bc8cff", -1);
   const span = series.length ? series.length*s.bucket_secs : 0;
   const spanLabel = span ? (ranged ? rangeLabel() : span+" s window")+" \u00b7 "+s.bucket_secs+" s buckets" : "";
   $("cap-req").textContent = spanLabel;
   $("cap-tok").textContent = spanLabel;
   $("cap-cached").textContent = spanLabel;
+  $("cap-cpu").textContent = spanLabel;
   let bt = "<table><tr><th>url</th><th>state</th><th>cooldown</th><th>fail streak</th><th>slots</th></tr>";
   p.backends.forEach((b,i)=>{
     bt += "<tr><td>"+esc(b.url)+"</td><td>"+(b.down ? '<span class="badge b-err">DOWN</span>' : '<span class="badge b-ok">UP</span>')+"</td><td>"+(b.cooldown_secs>0 ? b.cooldown_secs.toFixed(0)+" s" : "\u2013")+"</td><td>"+(b.failure_streak||"\u2013")+"</td><td>"+b.busy_slots+" / "+b.n_slots+"</td></tr>";
@@ -942,7 +991,7 @@ function render(d){
   if(ranged) rows = rows.filter(r=>r.ts >= (d.range.since==null ? 0 : d.range.since));
   if(!rows.length){ $("recent").innerHTML = '<div class="empty">no finished requests yet</div>'; }
   else {
-    let rt = "<table><tr><th>time</th><th>status</th><th>duration</th><th>model</th><th>key</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>note</th></tr>";
+    let rt = "<table><tr><th>time</th><th>status</th><th>duration</th><th>model</th><th>key</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w</th><th>note</th></tr>";
     rows.forEach(r=>{
       const flags = [];
       if(r.cache_hit) flags.push('<span class="badge b-acc">cache</span>');
@@ -951,7 +1000,9 @@ function render(d){
       if(r.stream) flags.push('<span class="badge b-dim">stream</span>');
       const when = new Date(r.ts*1000).toLocaleTimeString();
       const toks = r.prompt_tokens!=null ? r.prompt_tokens+" / "+(r.completion_tokens!=null?r.completion_tokens:"?")+" / "+(r.cached_tokens!=null?r.cached_tokens:0) : "\u2013";
-      rt += "<tr><td>"+when+"</td><td>"+statusBadge(r.status)+"</td><td>"+fmtDur(r.duration_secs)+"</td><td>"+esc(r.model)+"</td><td>"+(r.key?esc(r.key):"\u2013")+"</td><td>"+flags.join(" ")+"</td><td>"+toks+"</td><td>"+(r.ttft_ms!=null?Math.round(r.ttft_ms)+" ms":"\u2013")+"</td><td>"+(r.gen_tps!=null?r.gen_tps.toFixed(1):"\u2013")+"</td><td>"+(r.reason?esc(r.reason):"")+"</td></tr>";
+      const cpu = r.cpu_ms!=null ? r.cpu_ms.toFixed(1)+" ms" : "\u2013";
+      const diow = (r.disk_read_bytes!=null || r.disk_write_bytes!=null) ? fmtBytes(r.disk_read_bytes||0)+" / "+fmtBytes(r.disk_write_bytes||0) : "\u2013";
+      rt += "<tr><td>"+when+"</td><td>"+statusBadge(r.status)+"</td><td>"+fmtDur(r.duration_secs)+"</td><td>"+esc(r.model)+"</td><td>"+(r.key?esc(r.key):"\u2013")+"</td><td>"+flags.join(" ")+"</td><td>"+toks+"</td><td>"+(r.ttft_ms!=null?Math.round(r.ttft_ms)+" ms":"\u2013")+"</td><td>"+(r.gen_tps!=null?r.gen_tps.toFixed(1):"\u2013")+"</td><td>"+cpu+"</td><td>"+diow+"</td><td>"+(r.reason?esc(r.reason):"")+"</td></tr>";
     });
     rt += "</table>";
     $("recent").innerHTML = rt;
@@ -993,7 +1044,7 @@ function applyCustom(){
 }
 $("custom-apply").addEventListener("click", applyCustom);
 $("custom-secs").addEventListener("keydown", e=>{ if(e.key==="Enter") applyCustom(); });
-["chart-req","chart-tok","chart-cached"].forEach(id=>attachChart($(id)));
+["chart-req","chart-tok","chart-cached","chart-cpu"].forEach(id=>attachChart($(id)));
 tick();
 </script>
 </body>
@@ -1053,6 +1104,9 @@ mod tests {
             ttft_ms: Some(120.0),
             gen_tps: Some(25.0),
             prefill_tps: Some(500.0),
+            cpu_ms: Some(12.5),
+            disk_read_bytes: Some(1024),
+            disk_write_bytes: Some(2048),
             ..Default::default()
         }
     }
@@ -1151,6 +1205,18 @@ mod tests {
         assert_eq!(v["counters"]["coalesced_followers"], 3);
         assert_eq!(v["counters"]["tokens"]["completion"], 150);
         assert_eq!(v["counters"]["avg_ttft_ms"], 120.0);
+        // process resource metrics (the per-request deltas)
+        assert_eq!(v["counters"]["resources"]["cpu_ms"], 37.5);
+        assert_eq!(v["counters"]["resources"]["avg_cpu_ms"], 12.5);
+        assert_eq!(v["counters"]["resources"]["disk_read_bytes"], 3072);
+        assert_eq!(v["counters"]["resources"]["disk_write_bytes"], 6144);
+        // the series carries the per-bucket cpu ms
+        assert_eq!(v["series"]["buckets"][0]["cpu_ms"], 25.0);
+        assert_eq!(v["series"]["buckets"][1]["cpu_ms"], 12.5);
+        // the recent ring carries the per-request resource fields
+        assert_eq!(v["recent"][0]["cpu_ms"], 12.5);
+        assert_eq!(v["recent"][1]["disk_read_bytes"], 1024);
+        assert_eq!(v["recent"][1]["disk_write_bytes"], 2048);
         assert_eq!(v["series"]["buckets"].as_array().unwrap().len(), 2);
         assert_eq!(v["series"]["buckets"][0]["t"], 100);
         assert_eq!(v["series"]["buckets"][0]["reqs"], 2);
@@ -1170,6 +1236,26 @@ mod tests {
     }
 
     #[test]
+    fn resource_metrics_empty_when_records_lack_them() {
+        // Records without the resource fields (e.g. fed by an external
+        // producer) leave the metrics zero/absent instead of erroring.
+        let d = DashboardPlugin::new(params(json!({}))).unwrap();
+        let mut rec = record(200);
+        rec.cpu_ms = None;
+        rec.disk_read_bytes = None;
+        rec.disk_write_bytes = None;
+        d.record_now(&rec).unwrap();
+        let v = d.stats(&proxy(), None);
+        assert_eq!(v["counters"]["resources"]["cpu_ms"], 0.0);
+        assert!(v["counters"]["resources"]["avg_cpu_ms"].is_null());
+        assert_eq!(v["counters"]["resources"]["disk_read_bytes"], 0);
+        assert_eq!(v["counters"]["resources"]["disk_write_bytes"], 0);
+        assert!(v["recent"][0]["cpu_ms"].is_null());
+        assert!(v["recent"][0]["disk_read_bytes"].is_null());
+        assert!(v["recent"][0]["disk_write_bytes"].is_null());
+    }
+
+    #[test]
     fn since_scopes_range_counters_and_series() {
         let d = DashboardPlugin::new(params(
             json!({ "window_secs": 30, "bucket_secs": 10, "max_recent": 0 }),
@@ -1182,6 +1268,10 @@ mod tests {
         assert_eq!(v["range"]["since"], 150);
         assert_eq!(v["range"]["counters"]["total"], 1);
         assert_eq!(v["range"]["counters"]["client_errors"], 1);
+        // the resource totals are range-scoped like the other counters
+        assert_eq!(v["range"]["counters"]["resources"]["cpu_ms"], 12.5);
+        assert_eq!(v["range"]["counters"]["resources"]["disk_read_bytes"], 1024);
+        assert_eq!(v["range"]["counters"]["resources"]["disk_write_bytes"], 2048);
         let buckets = v["series"]["buckets"].as_array().unwrap();
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0]["t"], 200);
@@ -1272,7 +1362,7 @@ mod tests {
         let d = DashboardPlugin::new(params(json!({}))).unwrap();
         let page = d.html();
         // one canvas per throughput series
-        for id in ["chart-req", "chart-tok", "chart-cached"] {
+        for id in ["chart-req", "chart-tok", "chart-cached", "chart-cpu"] {
             assert!(page.contains(&format!("canvas id=\"{id}\"")), "canvas {id}");
         }
         // per-bar figure with adaptive stride, drawn above each bar
@@ -1301,9 +1391,9 @@ mod tests {
         assert!(page.contains("function attachChart(cv)"));
         assert!(
             page.contains(
-                "[\"chart-req\",\"chart-tok\",\"chart-cached\"].forEach(id=>attachChart($(id)));"
+                "[\"chart-req\",\"chart-tok\",\"chart-cached\",\"chart-cpu\"].forEach(id=>attachChart($(id)));"
             ),
-            "hover handlers attached to all three charts"
+            "hover handlers attached to all four charts"
         );
     }
 }

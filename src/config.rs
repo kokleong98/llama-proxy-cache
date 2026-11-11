@@ -69,7 +69,9 @@
 //!   lpcache performance fields `lpcache-prompt-tokens`,
 //!   `lpcache-completion-tokens`, `lpcache-cached-tokens`,
 //!   `lpcache-prefill-ms`, `lpcache-gen-ms`, `lpcache-prefill-tps`,
-//!   `lpcache-gen-tps`, `lpcache-ttft-ms`; default: all of them)
+//!   `lpcache-gen-tps`, `lpcache-ttft-ms` and lpcache resource fields
+//!   `lpcache-cpu-ms`, `lpcache-disk-read-bytes`,
+//!   `lpcache-disk-write-bytes`; default: all of them)
 //! - `LOG_LEVEL` (`INFO`)
 //!
 //! Every variable can also be set with a command-line flag (see [`Cli`]);

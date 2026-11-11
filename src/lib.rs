@@ -31,6 +31,7 @@ pub mod coalesce;
 pub mod config;
 pub mod hashing;
 pub mod mock_backend;
+pub mod procsample;
 pub mod slot_manager;
 
 /// The adapter plugin library (re-exported for downstream convenience).

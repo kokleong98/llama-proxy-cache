@@ -46,7 +46,7 @@ pub struct Param {
     /// Runtime refuses to start without it (missing **or** empty).
     pub required: bool,
     /// The runtime rejects an **empty** list for this optional param
-    /// (`request_log.fields`: omitted = all 28 fields, but an explicit
+    /// (`request_log.fields`: omitted = all 31 fields, but an explicit
     /// `[]` is a startup error).
     pub error_if_empty: bool,
     /// The runtime rejects repeated list items (`request_log.fields`).
@@ -337,7 +337,7 @@ fn build() -> Vec<Plugin> {
                     .ch(XLF_FIELDS)
                     .no_empty()
                     .no_dup()
-                    .help("ordered subset of the known XLF field names (blank = all 28; an explicit empty list or a repeated field is a startup error)"),
+                    .help("ordered subset of the known XLF field names (blank = all 31; an explicit empty list or a repeated field is a startup error)"),
             ],
         )
         .unique()

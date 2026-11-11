@@ -46,7 +46,12 @@
 //! record is written through the `RequestLogger` plugin when the response
 //! body is done — completed, errored, or the client went away — and
 //! logging failures are swallowed: logging never breaks request serving.
-//! The built-in plugin size-rotates the log file.
+//! The built-in plugin size-rotates the log file. The middleware also
+//! samples the process's CPU and disk-I/O counters (see the `procsample`
+//! module) when the request starts and when the body is done, so each
+//! record carries the proxy's own resource usage for the request
+//! (`lpcache-cpu-ms`, `lpcache-disk-read-bytes`,
+//! `lpcache-disk-write-bytes`; approximate under concurrency).
 //!
 //! The same middleware feeds the loaded dashboard (when one is present)
 //! for its aggregates. The dashboard's own routes (its page and
@@ -57,6 +62,7 @@
 use crate::coalesce::{Flight, SharedOutcome, SingleFlight};
 use crate::config::Config;
 use crate::hashing;
+use crate::procsample::ProcSample;
 use crate::slot_manager::{AcquireTimeout, GSlot, SlotGuard, SlotManager};
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -403,6 +409,10 @@ struct PendingRequestLog {
     status: u16,
     pl: PipelineLog,
     t0: Instant,
+    /// Process resource counters at request start (see the `procsample`
+    /// module); the record's `lpcache-cpu-ms` / `lpcache-disk-*` fields
+    /// are the delta against a sample taken when the body is done.
+    proc0: ProcSample,
     delivered: Arc<AtomicUsize>,
 }
 
@@ -419,6 +429,10 @@ impl Drop for PendingRequestLog {
             .perf
             .as_ref()
             .and_then(|p| p.lock().ok().map(|g| g.clone()));
+        // The request's proxy-side resource usage: process counters
+        // sampled now minus the sample taken when the request started
+        // (see the `procsample` module for the concurrency caveat).
+        let proc = self.proc0.delta(&ProcSample::now());
         let record = RequestLogRecord {
             datetime: Some(format_utc(now.as_secs(), now.subsec_nanos())),
             method: Some(self.method.clone()),
@@ -448,6 +462,9 @@ impl Drop for PendingRequestLog {
             prefill_tps: perf.as_ref().and_then(|p| p.prefill_tps),
             gen_tps: perf.as_ref().and_then(|p| p.gen_tps),
             ttft_ms: perf.as_ref().and_then(|p| p.ttft_ms),
+            cpu_ms: proc.cpu_ms,
+            disk_read_bytes: proc.disk_read_bytes,
+            disk_write_bytes: proc.disk_write_bytes,
         };
         if let Some(logger) = &self.logger
             && let Err(e) = logger.log(&record)
@@ -482,8 +499,10 @@ fn is_dashboard_own_route(path: &str, d: &dyn Dashboard) -> bool {
 /// Request-log / dashboard middleware (active when `AppState::request_log`
 /// and/or `AppState::dashboard` is set): captures the W3C fields of every
 /// request (method, URI, client IP, user agent, request bytes from
-/// `Content-Length`), wraps the response body to count the bytes actually
-/// handed to the client, and hands the finished request (see
+/// `Content-Length`) plus the process resource counters at request start
+/// (the record's `lpcache-cpu-ms` / `lpcache-disk-*` fields are the delta
+/// against completion), wraps the response body to count the bytes
+/// actually handed to the client, and hands the finished request (see
 /// [`PendingRequestLog`]) to the request logger and/or the dashboard when
 /// the body is done. The dashboard's own routes (its page and stats API)
 /// are skipped: they are not written to the request log and not fed into
@@ -509,6 +528,9 @@ async fn request_log_middleware(
         return next.run(req).await;
     }
     let t0 = Instant::now();
+    // Resource counters at request start (the record's `lpcache-cpu-ms`
+    // / `lpcache-disk-*` fields are the delta against completion).
+    let proc0 = ProcSample::now();
     let method = req.method().to_string();
     let uri = req.uri().path_and_query().map(|pq| pq.as_str().to_string());
     let client_ip = req
@@ -543,6 +565,7 @@ async fn request_log_middleware(
         status,
         pl,
         t0,
+        proc0,
         delivered,
     };
     // Count the bytes handed to the client; the pending record rides

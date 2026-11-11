@@ -2849,6 +2849,18 @@ async fn request_log_writes_xlf_record() {
     assert_eq!(rec["lpcache-prefill-tps"], "400.0");
     assert_eq!(rec["lpcache-gen-tps"], "333.3");
     assert_eq!(rec["lpcache-ttft-ms"], "-", "non-streaming has no ttft");
+    // resource fields: the proxy process's own CPU time and disk I/O
+    // (numeric wherever the platform can sample; the disk counters fall
+    // back to `-` on systems where they are unavailable).
+    let cpu_ms: f64 = rec["lpcache-cpu-ms"].parse().expect("cpu-ms");
+    assert!(cpu_ms >= 0.0, "cpu-ms: {}", rec["lpcache-cpu-ms"]);
+    for f in ["lpcache-disk-read-bytes", "lpcache-disk-write-bytes"] {
+        assert!(
+            rec[f] == "-" || rec[f].parse::<u64>().is_ok(),
+            "{f}: {}",
+            rec[f]
+        );
+    }
 }
 
 #[tokio::test]
@@ -3143,7 +3155,7 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
     let html = String::from_utf8(bytes.to_vec()).expect("utf8");
 
     // one canvas per throughput series
-    for id in ["chart-req", "chart-tok", "chart-cached"] {
+    for id in ["chart-req", "chart-tok", "chart-cached", "chart-cpu"] {
         assert!(html.contains(&format!("canvas id=\"{id}\"")), "canvas {id}");
     }
     // per-bar figure with adaptive stride, drawn above each bar
@@ -3169,9 +3181,9 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
     // hover handlers attached to every chart canvas
     assert!(
         html.contains(
-            "[\"chart-req\",\"chart-tok\",\"chart-cached\"].forEach(id=>attachChart($(id)));"
+            "[\"chart-req\",\"chart-tok\",\"chart-cached\",\"chart-cpu\"].forEach(id=>attachChart($(id)));"
         ),
-        "hover handlers attached to all three charts"
+        "hover handlers attached to all four charts"
     );
 }
 
@@ -3210,6 +3222,12 @@ async fn dashboard_counters_update_after_requests() {
     assert_eq!(v["counters"]["success_rate"], 0.5);
     assert_eq!(v["counters"]["big_requests"], 0);
     assert_eq!(v["counters"]["streamed"], 0);
+    // Process resource metrics (CPU ms + disk bytes) are sampled per
+    // request by the proxy itself, so the totals are present.
+    assert!(v["counters"]["resources"]["cpu_ms"].as_f64().unwrap() >= 0.0);
+    assert!(v["counters"]["resources"]["avg_cpu_ms"].as_f64().is_some());
+    assert!(v["counters"]["resources"]["disk_read_bytes"].is_u64());
+    assert!(v["counters"]["resources"]["disk_write_bytes"].is_u64());
     // The time series holds the bucket both requests fell in.
     let buckets = v["series"]["buckets"].as_array().unwrap();
     assert_eq!(buckets.len(), 1);

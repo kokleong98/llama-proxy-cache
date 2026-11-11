@@ -312,7 +312,7 @@ Behaviour and worked examples:
 | `path` | text | `lpcache-request.log` | log file location; relative paths resolve against the proxy's cwd |
 | `max_bytes` | int ≥ 0 | `10485760` | rotation threshold; 0 = no rotation |
 | `keep` | int ≥ 0 | `5` | rotated generations kept; 0 = keep all |
-| `fields` | string list | all 28 | ordered subset of the 28 known XLF field names; **blank / omitted = all 28** — an explicit `[]` or a repeated field is a startup error |
+| `fields` | string list | all 31 | ordered subset of the 31 known XLF field names; **blank / omitted = all 31** — an explicit `[]` or a repeated field is a startup error |
 
 #### `dashboard` — real-time statistics web dashboard (singleton)
 

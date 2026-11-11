@@ -362,7 +362,7 @@ Live results ([§6.6](#66-qwen_guard-fail-open--fail-closed)): with the guard do
 | `path` | `lpcache-request.log` | Log file location (relative → cwd; parent dir created) |
 | `max_bytes` | `10485760` (10 MiB) | Rotation threshold; `0` = no rotation |
 | `keep` | `5` | Rotated generations kept; `0` = keep all |
-| `fields` | all 28 | Ordered subset of the known XLF fields; omitted = all 28 in the default order. An empty list, an unknown field name, or a repeated field is a startup error (the error lists the known fields) |
+| `fields` | all 31 | Ordered subset of the known XLF fields; omitted = all 31 in the default order. An empty list, an unknown field name, or a repeated field is a startup error (the error lists the known fields) |
 
 **Example.**
 
@@ -382,7 +382,7 @@ Live result ([§6.5](#65-request_log-xlf-request-log)): every request — includ
   - `GET {path}/api/stats` — the JSON payload: the proxy's live state (a `ProxyStatus` snapshot — version, uptime, model id, port, coalescing, thresholds, meta files, in-flight slots, per-backend and per-slot status, circuit-breaker state) **merged** with the plugin's aggregates.
 - The stats endpoint accepts `?since=<unix seconds>` to scope the aggregates to `[since, now]`; without it the payload is the lifetime counters plus the trailing `window_secs` series.
 - The plugin keeps in memory:
-  - **counters** — requests by status class, cache hits / hit-rate, KV restores, big/streamed requests, coalesced followers, token totals, average duration / TTFT / generation rate;
+  - **counters** — requests by status class, cache hits / hit-rate, KV restores, big/streamed requests, coalesced followers, token totals, process resource totals (CPU ms, disk bytes read/written — the proxy's own per-request deltas), average duration / TTFT / generation rate;
   - **time series** — one bucket of `bucket_secs` covering the process lifetime, bounded by a hard cap (oldest dropped first); a long range is coarsened to a bounded number of points;
   - **recent requests** — a ring buffer of the last `max_recent` finished requests.
 - The page polls every `refresh_ms` and renders stat cards, throughput charts, the backend table, a per-slot occupancy grid and the recent-requests table; a time-filter dropdown (presets + custom/all-time) scopes the cards/charts/table via `?since`.
@@ -406,7 +406,7 @@ Live result ([§6.5](#65-request_log-xlf-request-log)): every request — includ
 { "name": "dashboard", "params": { "path": "/dashboard" } }
 ```
 
-Live result ([§6.7](#67-dashboard)): `GET /dashboard` returns an ~83 KB self-contained page titled "lpcache dashboard" (headings: throughput / backends / slots / recent requests); `GET /dashboard/api/stats` returns JSON with a `counters` object (`ok`, `client_errors`, `cache_hits`, `cache_hit_rate`, `tokens`, …) plus the live `proxy` snapshot.
+Live result ([§6.7](#67-dashboard)): `GET /dashboard` returns an ~85 KB self-contained page titled "lpcache dashboard" (headings: throughput / backends / slots / recent requests); `GET /dashboard/api/stats` returns JSON with a `counters` object (`ok`, `client_errors`, `cache_hits`, `cache_hit_rate`, `tokens`, `resources` — the process CPU ms and disk bytes read/written, …) plus the live `proxy` snapshot.
 
 ---
 
@@ -634,7 +634,7 @@ This validates the plugin's wiring and both failure paths. A full safety-classif
 
 ```text
 $ curl -s http://127.0.0.1:8085/dashboard | wc -c
-83811                       # self-contained HTML page, titled "lpcache dashboard"
+85468                       # self-contained HTML page, titled "lpcache dashboard"
 
 $ curl -s 'http://127.0.0.1:8085/dashboard/api/stats' | python3 -c 'import sys,json; print(list(json.load(sys.stdin).keys()))'
 ['counters', 'model', 'proxy', 'recent', 'refresh_ms', 'series', 'uptime_secs', 'version', 'window_secs']
@@ -646,10 +646,12 @@ The `counters` object reflects the run's traffic (after the tests above):
 { "ok": 7, "client_errors": 3, "cache_hits": 2, "cache_hit_rate": 0.2,
   "total": 10, "success_rate": 0.7, "restored": 0, "streamed": 0, "coalesced_followers": 0,
   "avg_duration_secs": 0.085, "avg_prefill_tps": 319.97, "avg_gen_tps": 119.95,
-  "tokens": { "prompt": 252, "completion": 12, "cached": 0 } }
+  "tokens": { "prompt": 252, "completion": 12, "cached": 0 },
+  "resources": { "cpu_ms": 41.2, "avg_cpu_ms": 4.12,
+                 "disk_read_bytes": 32768, "disk_write_bytes": 65536 } }
 ```
 
-`client_errors` counts the `400` keyword rejections; `cache_hits` counts the `result_cache` serves. The `proxy` key carries the live `ProxyStatus` (backends, slots, circuit breakers, meta files, in-flight). The dashboard's own page/stats requests are excluded, so polling never inflates these numbers.
+`client_errors` counts the `400` keyword rejections; `cache_hits` counts the `result_cache` serves. The `resources` object is the proxy's **own** per-request process deltas summed (CPU ms and disk bytes read/written — the backend's KV I/O is not included). The `proxy` key carries the live `ProxyStatus` (backends, slots, circuit breakers, meta files, in-flight). The dashboard's own page/stats requests are excluded, so polling never inflates these numbers.
 
 ---
 

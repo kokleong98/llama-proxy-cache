@@ -191,7 +191,7 @@ listening on 0.0.0.0:8081
 | `REQUEST_LOG_PATH`      | `lpcache-request.log`      | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
 | `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB)        | rotation threshold in bytes (`<path>.1`, `<path>.2`, …); `0` = no rotation |
 | `REQUEST_LOG_KEEP`      | `5`                        | rotated generations retained (the oldest is dropped); `0` = keep them all |
-| `REQUEST_LOG_FIELDS`    | all 28 fields              | comma-separated ordered subset of the known XLF field names (W3C + `lpcache-*` pipeline/performance fields) |
+| `REQUEST_LOG_FIELDS`    | all 31 fields              | comma-separated ordered subset of the known XLF field names (W3C + `lpcache-*` pipeline/performance/resource fields) |
 
 Every variable also has a command-line flag; explicit flags take
 precedence over environment variables, which take precedence over the
@@ -332,7 +332,7 @@ token). Missing values render as `-`.
   file starting with a new XLF header) and at most
   `REQUEST_LOG_KEEP` (default 5) generations are kept; `0` for either
   disables rotation / keeps all generations. `REQUEST_LOG_FIELDS`
-  selects an ordered subset of the 28 known fields.
+  selects an ordered subset of the 31 known fields.
 - Logging never breaks request serving: log I/O failures are logged and
   swallowed.
 - The full field list and format details are in the
@@ -360,10 +360,12 @@ aggregates to a time range); the page polls it every `refresh_ms`
 - **KPIs**: total requests and success rate, cache-hit and KV-restore
   counts, slots in flight, active coalesced groups, request rate and
   completion token rate over the selected time range, KV meta files on
-  disk, and average duration / TTFT / backend generation rate.
-- **Charts**: bar charts of requests, completion tokens and cached
-  (restored) prompt tokens per `bucket_secs` bucket (default 5 s; long
-  ranges are coarsened to at most 360 points automatically).
+  disk, average duration / TTFT / backend generation rate, and the
+  proxy's own resource usage — average CPU ms (with the total) and disk
+  bytes read/written over the range.
+- **Charts**: bar charts of requests, completion tokens, cached
+  (restored) prompt tokens and CPU ms per `bucket_secs` bucket (default
+  5 s; long ranges are coarsened to at most 360 points automatically).
 - **Tables**: per-backend status (URL, slots, busy slots, circuit
   breaker state), per-slot occupancy grid, and the recent-requests ring
   (`max_recent`, default 100: status, model, stream, tokens, timing,

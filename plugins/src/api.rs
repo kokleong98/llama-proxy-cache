@@ -388,6 +388,24 @@ pub struct RequestLogRecord {
     /// from the start of stream processing until the first SSE chunk
     /// received from the backend (streaming requests only).
     pub ttft_ms: Option<f64>,
+    // lpcache resource fields (the proxy process's own CPU and disk-I/O
+    // consumption during the request: process-wide counters sampled at
+    // request start and when the response body completes; with
+    // concurrent requests the per-request values are approximate; missing
+    // when the platform cannot sample them — renders as `-`).
+    /// `lpcache-cpu-ms`: CPU time (user + system) consumed by the proxy
+    /// process during the request, in milliseconds (the llama.cpp
+    /// backend is a separate process and never counts toward this).
+    pub cpu_ms: Option<f64>,
+    /// `lpcache-disk-read-bytes`: storage bytes read by the proxy
+    /// process during the request (actual disk transfers; Windows
+    /// reports page-cache-inclusive transfer counts instead — see the
+    /// `lpcache` crate's `procsample` module).
+    pub disk_read_bytes: Option<u64>,
+    /// `lpcache-disk-write-bytes`: storage bytes written by the proxy
+    /// process during the request (same platform caveats as
+    /// `disk_read_bytes`).
+    pub disk_write_bytes: Option<u64>,
 }
 
 /// A request-log adapter: receives one [`RequestLogRecord`] per finished

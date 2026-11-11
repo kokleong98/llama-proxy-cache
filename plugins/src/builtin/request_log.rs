@@ -12,7 +12,10 @@
 //! `lpcache-cached-tokens`, `lpcache-prefill-ms`, `lpcache-gen-ms`,
 //! `lpcache-prefill-tps`, `lpcache-gen-tps`, `lpcache-ttft-ms` —
 //! backend-reported token counts/timings plus the proxy-side time to
-//! first token).
+//! first token) and the lpcache resource fields (`lpcache-cpu-ms`,
+//! `lpcache-disk-read-bytes`, `lpcache-disk-write-bytes` — the proxy
+//! process's own CPU and disk-I/O consumption during the request; see
+//! the `lpcache` crate's `procsample` module).
 //!
 //! The file starts with the XLF header:
 //!
@@ -41,7 +44,7 @@
 //! - `max_bytes` (default 10 MiB): rotation threshold; `0` = no rotation.
 //! - `keep` (default `5`): rotated generations kept (`0` = keep all).
 //! - `fields` (optional): ordered list of field names to emit — any
-//!   subset of the 28 known fields (default: all of them, W3C fields
+//!   subset of the 31 known fields (default: all of them, W3C fields
 //!   first).
 //!
 //! The `datetime` field uses UTC with millisecond precision
@@ -96,6 +99,9 @@ pub const DEFAULT_FIELDS: &[&str] = &[
     "lpcache-prefill-tps",
     "lpcache-gen-tps",
     "lpcache-ttft-ms",
+    "lpcache-cpu-ms",
+    "lpcache-disk-read-bytes",
+    "lpcache-disk-write-bytes",
 ];
 
 /// Every known field name (the `fields` parameter is validated against
@@ -179,6 +185,9 @@ fn field_value(record: &RequestLogRecord, field: &str) -> Option<String> {
         "lpcache-prefill-tps" => record.prefill_tps.map(format_tps),
         "lpcache-gen-tps" => record.gen_tps.map(format_tps),
         "lpcache-ttft-ms" => record.ttft_ms.map(format_ms),
+        "lpcache-cpu-ms" => record.cpu_ms.map(format_ms),
+        "lpcache-disk-read-bytes" => record.disk_read_bytes.map(|v| v.to_string()),
+        "lpcache-disk-write-bytes" => record.disk_write_bytes.map(|v| v.to_string()),
         // Unreachable: the field list is validated at construction.
         _ => None,
     }
@@ -525,6 +534,9 @@ mod tests {
             prefill_tps: Some(907.6),
             gen_tps: Some(57.9),
             ttft_ms: Some(312.4),
+            cpu_ms: Some(87.5),
+            disk_read_bytes: Some(104_857_600),
+            disk_write_bytes: Some(4096),
         }
     }
 
@@ -589,6 +601,10 @@ mod tests {
         assert_eq!(get("lpcache-prefill-tps"), "907.6");
         assert_eq!(get("lpcache-gen-tps"), "57.9");
         assert_eq!(get("lpcache-ttft-ms"), "312.40");
+        // resource fields (deterministic mock values).
+        assert_eq!(get("lpcache-cpu-ms"), "87.50");
+        assert_eq!(get("lpcache-disk-read-bytes"), "104857600");
+        assert_eq!(get("lpcache-disk-write-bytes"), "4096");
     }
 
     #[test]
@@ -632,6 +648,36 @@ mod tests {
         }
         // non-perf fields unaffected.
         assert_eq!(get("lpcache-model"), "llama.cpp");
+        assert_eq!(get("sc-status"), "200");
+    }
+
+    #[test]
+    fn resource_fields_render_dash_when_sampling_unavailable() {
+        // A record with no resource data (e.g. a platform where CPU/disk
+        // sampling is unavailable): every resource field is `-` while the
+        // other fields are intact.
+        let td = tempfile::tempdir().expect("tempdir");
+        let (log, path) = log_in(&td);
+        let mut r = record();
+        r.cpu_ms = None;
+        r.disk_read_bytes = None;
+        r.disk_write_bytes = None;
+        log.log(&r).expect("log");
+        let content = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = content.lines().collect();
+        let values: Vec<&str> = lines[4].split(' ').collect();
+        let get = |name: &str| -> &str {
+            let i = DEFAULT_FIELDS
+                .iter()
+                .position(|f| *f == name)
+                .expect("field");
+            values[i]
+        };
+        for f in ["lpcache-cpu-ms", "lpcache-disk-read-bytes", "lpcache-disk-write-bytes"] {
+            assert_eq!(get(f), "-", "{f}");
+        }
+        // non-resource fields unaffected.
+        assert_eq!(get("lpcache-ttft-ms"), "312.40");
         assert_eq!(get("sc-status"), "200");
     }
 
