@@ -389,10 +389,12 @@ pub struct RequestLogRecord {
     /// received from the backend (streaming requests only).
     pub ttft_ms: Option<f64>,
     // lpcache resource fields (the proxy process's own CPU and disk-I/O
-    // consumption during the request: process-wide counters sampled at
-    // request start and when the response body completes; with
-    // concurrent requests the per-request values are approximate; missing
-    // when the platform cannot sample them — renders as `-`).
+    // consumption during the request plus its resident memory: the
+    // counters are process-wide, sampled at request start and when the
+    // response body completes (with concurrent requests the per-request
+    // values are approximate); the memory gauges are point-in-time
+    // values at completion; missing when the platform cannot sample
+    // them — renders as `-`).
     /// `lpcache-cpu-ms`: CPU time (user + system) consumed by the proxy
     /// process during the request, in milliseconds (the llama.cpp
     /// backend is a separate process and never counts toward this).
@@ -406,6 +408,17 @@ pub struct RequestLogRecord {
     /// process during the request (same platform caveats as
     /// `disk_read_bytes`).
     pub disk_write_bytes: Option<u64>,
+    /// `lpcache-ram-bytes`: the proxy process's resident memory (bytes)
+    /// when the request completed — Linux `VmRSS`, macOS physical
+    /// footprint, Windows working set (see the `lpcache` crate's
+    /// `procsample` module). A point-in-time value, not a per-request
+    /// delta.
+    pub ram_bytes: Option<u64>,
+    /// `lpcache-peak-ram-bytes`: the proxy process's peak resident
+    /// memory (bytes, high-water mark since process start) when the
+    /// request completed (point-in-time value; same platform caveats
+    /// as `ram_bytes`).
+    pub peak_ram_bytes: Option<u64>,
 }
 
 /// A request-log adapter: receives one [`RequestLogRecord`] per finished
@@ -513,6 +526,25 @@ pub struct ProxyStatus {
     pub slots: Vec<SlotStatus>,
 }
 
+/// The backend scope of a dashboard stats query (the `?backend` query
+/// parameter of the stats endpoint): which subset of the finished
+/// requests the plugin's aggregates are restricted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendScope {
+    /// No filtering: every finished request (the default).
+    #[default]
+    All,
+    /// Only the requests that ran on the given backend index (requests
+    /// that never touched a backend — cache hits, prefilter rejects,
+    /// coalesced followers — do not count). A backend that never got
+    /// traffic yields zero statistics.
+    Backend(usize),
+    /// Only the requests served from the result cache (a result-cache
+    /// hit): they are replayed without any backend call, so they carry
+    /// no backend index.
+    Cached,
+}
+
 /// A dashboard adapter: serves the proxy's real-time statistics as a web
 /// page. The proxy mounts two routes for a loaded dashboard plugin —
 /// `GET {path}` (the page) and `GET {path}/api/stats` (the JSON payload
@@ -552,14 +584,21 @@ pub trait Dashboard: Send + Sync {
     fn html(&self) -> String;
 
     /// The current stats payload, served as JSON from `{path}/api/stats`,
-    /// optionally range-scoped by `since` (unix seconds): the proxy's
-    /// live [`ProxyStatus`] merged with the plugin's aggregates over
-    /// `[since, now]`. `None` selects the plugin's default aggregation
-    /// (the built-in dashboard: lifetime counters plus the trailing
-    /// `window_secs` series). The built-in dashboard's page polls with
-    /// `?since=<unix seconds>` so its time filter can scope the KPIs,
-    /// charts and recent-requests table to the selected range.
-    fn stats(&self, proxy: &ProxyStatus, since: Option<u64>) -> Value;
+    /// optionally range-scoped by `since` (unix seconds) and
+    /// backend-scoped by `scope` ([`BackendScope::Backend`], a backend
+    /// index, or [`BackendScope::Cached`], the records served from the
+    /// result cache — [`BackendScope::All`] is the default, every
+    /// statistic includes everything): the proxy's live
+    /// [`ProxyStatus`] merged with the plugin's aggregates over
+    /// `[since, now]` and, when `scope` is not [`BackendScope::All`],
+    /// restricted to the records of that scope. `since` of `None`
+    /// selects the plugin's default aggregation (the built-in dashboard:
+    /// lifetime counters plus the trailing `window_secs` series). The
+    /// built-in dashboard's page polls with
+    /// `?since=<unix seconds>&backend=<index|cached>` so its time and
+    /// backend filters can scope the KPIs, charts and recent-requests
+    /// table.
+    fn stats(&self, proxy: &ProxyStatus, since: Option<u64>, scope: BackendScope) -> Value;
 
     /// Feed one finished request into the plugin's aggregates. Called
     /// (synchronously) exactly once per finished request — success,

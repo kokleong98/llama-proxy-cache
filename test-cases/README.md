@@ -8,7 +8,7 @@ documents every test with its exact runnable filter, sync/async kind and
 source line, plus the module's fixtures/helpers, how to run just that
 module, and a coverage map of the surface it exercises.
 
-**Total: 249 test cases** — 88 lpcache unit + 88 lpcache-plugins
+**Total: 255 test cases** — 90 lpcache unit + 92 lpcache-plugins
 unit + 58 API integration + 15 client integration.
 
 | # | Suite | Location | Tests | Kinds |
@@ -26,17 +26,17 @@ unit + 58 API integration + 15 client integration.
 | 11 | [Request log plugin (W3C-XLF format, rotation)](11-request-log-plugin.md) | `plugins/src/builtin/request_log.rs` | 14 | 14 sync |
 | 12 | [Qwen guard prefilter (Qwen3Guard-Gen safety check)](12-qwen-guard-plugin.md) | `plugins/src/builtin/qwen_guard.rs` | 17 | 8 sync + 9 async |
 
-The module pages catalog 237 of the 250 cases; the remaining 13 (the
-9 `dashboard` plugin unit tests and the 4 `procsample` unit tests,
+The module pages catalog 237 of the 255 cases; the remaining 18 (the
+12 `dashboard` plugin unit tests and the 6 `procsample` unit tests,
 which have no dedicated module pages) run
 in the same suites and pass under `cargo test --workspace`.
 
 ## How to run
 
 ```sh
-cargo test --workspace        # full regression suite (275 tests + 3 doctests, ~4 s)
-cargo test --lib              # 88 lpcache unit tests only
-cargo test -p lpcache-plugins # 88 plugin library unit tests
+cargo test --workspace        # full regression suite (282 tests incl. 1 doctest, ~4 s)
+cargo test --lib              # 90 lpcache unit tests only
+cargo test -p lpcache-plugins # 92 plugin library unit tests
 cargo test --test api         # 58 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test -p lpcache-config  # 26 configurator unit tests
@@ -74,8 +74,8 @@ client-disconnect behaviour.
 | Result cache plugin (Rust-only feature) | 20 plugin unit + 8 E2E tests (7 result-cache, incl. `cache_streaming` and `no-cache` header bypass + 1 blocklist-over-cache chain) |
 | Plugin system (`PLUGINS` env/flag, `lpcache-plugins` registry) | 6 `PLUGINS` config tests + 10 registry tests + 8 plugin `factory_*` tests; E2E state is built via `load_prefilters` / `load_request_loggers` |
 | Per-backend `kv_cache` flag (Rust-only feature) | `backends_kv_cache_flag` (config), `acquire_excluding_respects_kv_flag` / `restore_prefers_kv_enabled_backend` / `restore_skipped_when_no_kv_enabled_backend` (unit), `kv_cache_disabled_backend_never_saves_or_restores` / `kv_cache_disabled_backend_skips_stream_save` / `kv_restore_prefers_kv_enabled_backend` (E2E) |
-| Request log (`REQUEST_LOG*` env/flags or a `request_log` spec in `PLUGINS`, Rust-only feature) | 3 config tests + 13 plugin unit tests (section 11) + 5 E2E tests (`request_log_writes_xlf_record` — incl. the performance fields, `request_log_stream_request_counts_delivered_bytes`, `request_log_logs_failed_request_without_pipeline`, `request_log_rotates_and_bounds_keep`, `request_log_stream_writes_perf_fields`) |
-| Dashboard plugin (`dashboard` spec in `PLUGINS`, Rust-only feature) | 9 plugin unit tests (counters — incl. the process resource metrics (CPU ms / disk bytes), `?since` range scoping, bucket pruning/coarsening, chart rendering, self-contained HTML) + 6 E2E tests |
+| Request log (`REQUEST_LOG*` env/flags or a `request_log` spec in `PLUGINS`, Rust-only feature) | 3 config tests + 14 plugin unit tests (section 11) + 5 E2E tests (`request_log_writes_xlf_record` — incl. the performance fields, `request_log_stream_request_counts_delivered_bytes`, `request_log_logs_failed_request_without_pipeline`, `request_log_rotates_and_bounds_keep`, `request_log_stream_writes_perf_fields`) |
+| Dashboard plugin (`dashboard` spec in `PLUGINS`, Rust-only feature) | 12 plugin unit tests (counters — incl. the process resource metrics (CPU ms / disk bytes / peak RAM), the `?backend` filter (index scopes + the `cached` scope for result-cache records), per-scope recent rings, `?since` range scoping, bucket pruning/coarsening, chart rendering, self-contained HTML) + 6 E2E tests |
 | KV cache save auto-retry (`SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS`, Rust-only feature) | `save_after_retries_until_success`, `save_after_retries_exhausted_propagates_error`, `save_after_retries_exhausted_500_returns_false`, `save_after_no_retry_when_retries_disabled` (unit), `save_retry_env_and_cli` (config) |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 **Suite health (2026-11-06).** 244/244 passing, clippy clean, ~4 s wall
@@ -101,14 +101,19 @@ unit `restore_prefers_kv_enabled_backend` /
 `kv_cache_disabled_backend_never_saves_or_restores` /
 `kv_cache_disabled_backend_skips_stream_save` /
 `kv_restore_prefers_kv_enabled_backend`.
-On 2026-11-11 the request log gained 3 cross-platform resource XLF
+On 2026-11-11 the request log gained 5 cross-platform resource XLF
 fields (`lpcache-cpu-ms`, `lpcache-disk-read-bytes`,
 `lpcache-disk-write-bytes` — the proxy process's own CPU time and disk
 I/O during the request, from process-wide counters sampled at request
-start and completion; the new `src/procsample` module uses
-`CLOCK_PROCESS_CPUTIME_ID` on Unix, `/proc/self/io` on Linux,
-`proc_pid_rusage` on macOS and `GetProcessTimes`/`GetProcessIoCounters`
-on Windows): 4 `procsample` unit tests, 1 plugin unit test
+start and completion — plus `lpcache-ram-bytes`,
+`lpcache-peak-ram-bytes`, its resident memory and peak resident memory
+when the request completed; the CPU/disk values are per-request deltas,
+the memory values point-in-time gauges; the `src/procsample` module
+uses `CLOCK_PROCESS_CPUTIME_ID` on Unix, `/proc/self/io` and
+`/proc/self/status` (`VmRSS`/`VmHWM`) on Linux, `proc_pid_rusage`
+(`rusage_info_v4`) on macOS and `GetProcessTimes`/
+`GetProcessIoCounters`/`GetProcessMemoryInfo` on Windows): 6
+`procsample` unit tests, 1 plugin unit test
 (`resource_fields_render_dash_when_sampling_unavailable`);
 `request_log_writes_xlf_record` now asserts the resource fields too.
 On 2026-11-02 the Qwen3Guard-Gen safety prefilter (built-in

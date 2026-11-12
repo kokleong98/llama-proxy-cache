@@ -74,9 +74,9 @@ use axum::routing::{get, post};
 use bytes::Bytes;
 use futures::StreamExt;
 use lpcache_plugins::{
-    BackendError, BackendStatus, Dashboard, JsonChat, LlamaBackend, Prefilter, PrefilterDecision,
-    PrefilterRequest, ProxyStatus, RequestLogRecord, RequestLogger, RestoreOutcome, ResultStore,
-    format_utc,
+    BackendError, BackendScope, BackendStatus, Dashboard, JsonChat, LlamaBackend, Prefilter,
+    PrefilterDecision, PrefilterRequest, ProxyStatus, RequestLogRecord, RequestLogger,
+    RestoreOutcome, ResultStore, format_utc,
 };
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -162,25 +162,59 @@ async fn dashboard_page(State(state): State<AppState>) -> Response {
 
 /// The dashboard stats API query: the page's time filter polls with
 /// `?since=<unix seconds>` to scope the plugin's aggregates to
-/// `[since, now]` (absent = the plugin's default aggregation). A bad
-/// value is a 400 (axum's `Query` extractor rejects it).
+/// `[since, now]` (absent = the plugin's default aggregation) and its
+/// backend filter polls with `?backend=<index>` to restrict them to one
+/// backend or with `?backend=cached` to restrict them to the records
+/// served from the result cache (absent = all backends — every
+/// statistic, the default). A bad `backend` value is a 400 (a bad
+/// `since` value is rejected by axum's `Query` extractor).
 #[derive(serde::Deserialize)]
 struct StatsQuery {
     since: Option<u64>,
+    backend: Option<String>,
+}
+
+/// Parse the `?backend` query value: a backend index, or the reserved
+/// word `cached` (the records served from the result cache — they never
+/// touch a backend). Anything else is bad.
+fn parse_backend_filter(v: &str) -> Option<BackendScope> {
+    if v == "cached" {
+        Some(BackendScope::Cached)
+    } else {
+        v.parse::<u64>()
+            .ok()
+            .map(|b| BackendScope::Backend(b as usize))
+    }
 }
 
 /// The dashboard stats API route (`{path}/api/stats`): the proxy's live
 /// [`ProxyStatus`] merged with the plugin's per-request aggregates,
-/// range-scoped by the optional `?since` query parameter.
+/// range-scoped by the optional `?since` query parameter and
+/// backend-scoped by the optional `?backend` query parameter
+/// (an index or `cached`).
 async fn dashboard_stats(
     State(state): State<AppState>,
     Query(q): Query<StatsQuery>,
-) -> impl IntoResponse {
+) -> Result<axum::Json<Value>, (StatusCode, axum::Json<Value>)> {
+    let scope = match &q.backend {
+        None => BackendScope::All,
+        Some(v) => match parse_backend_filter(v) {
+            Some(s) => s,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error": format!("bad backend filter {v:?}: use a backend index or \"cached\"")
+                    })),
+                ));
+            }
+        },
+    };
     let d = state
         .dashboard
         .as_ref()
         .expect("dashboard stats route only mounted when a dashboard is loaded");
-    axum::Json(d.stats(&capture_status(&state), q.since))
+    Ok(axum::Json(d.stats(&capture_status(&state), q.since, scope)))
 }
 
 /// Snapshot of the proxy's live state for a dashboard stats poll: slot
@@ -411,7 +445,8 @@ struct PendingRequestLog {
     t0: Instant,
     /// Process resource counters at request start (see the `procsample`
     /// module); the record's `lpcache-cpu-ms` / `lpcache-disk-*` fields
-    /// are the delta against a sample taken when the body is done.
+    /// are the delta against a sample taken when the body is done, and
+    /// the `lpcache-ram-*` fields the memory gauges at that sample.
     proc0: ProcSample,
     delivered: Arc<AtomicUsize>,
 }
@@ -465,6 +500,8 @@ impl Drop for PendingRequestLog {
             cpu_ms: proc.cpu_ms,
             disk_read_bytes: proc.disk_read_bytes,
             disk_write_bytes: proc.disk_write_bytes,
+            ram_bytes: proc.rss_bytes,
+            peak_ram_bytes: proc.peak_rss_bytes,
         };
         if let Some(logger) = &self.logger
             && let Err(e) = logger.log(&record)
@@ -529,7 +566,8 @@ async fn request_log_middleware(
     }
     let t0 = Instant::now();
     // Resource counters at request start (the record's `lpcache-cpu-ms`
-    // / `lpcache-disk-*` fields are the delta against completion).
+    // / `lpcache-disk-*` fields are the delta against completion; the
+    // `lpcache-ram-*` fields the memory gauges there).
     let proc0 = ProcSample::now();
     let method = req.method().to_string();
     let uri = req.uri().path_and_query().map(|pq| pq.as_str().to_string());

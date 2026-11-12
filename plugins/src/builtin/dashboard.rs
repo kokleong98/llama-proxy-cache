@@ -9,9 +9,14 @@
 //!   state (slots, backends, circuit breakers, coalesced groups, meta
 //!   files — a [`crate::api::ProxyStatus`] snapshot filled in by the
 //!   proxy on every poll) merged with the aggregates below. The endpoint
-//!   accepts an optional `?since=<unix seconds>` query parameter that
-//!   scopes the aggregates to `[since, now]`; without it the payload is
-//!   the lifetime counters plus the trailing `window_secs` series.
+//!   accepts two optional query parameters: `?since=<unix seconds>`
+//!   scopes the aggregates to `[since, now]` and `?backend=<index>`
+//!   restricts them to the records that ran on one backend, while
+//!   `?backend=cached` restricts them to the records served from the
+//!   result cache (they never touch a backend); absent = all backends
+//!   — no filtering, every statistic includes all of them; without
+//!   `?since` the payload is the lifetime counters plus
+//!   the trailing `window_secs` series.
 //!
 //! The proxy feeds the plugin one [`RequestLogRecord`] per finished
 //! request (success, error, rejection or disconnect — the same records
@@ -21,25 +26,38 @@
 //!
 //! - **counters** — total requests by status class, cache hits, KV
 //!   restores, big/streamed requests, coalesced followers, token totals,
-//!   process resource totals (CPU ms, disk bytes read/written — the
-//!   proxy's own per-request deltas), average duration /
-//!   time-to-first-token / generation rate;
+//!   process resource totals (CPU ms and disk bytes read/written — the
+//!   proxy's own per-request deltas — plus peak resident memory, a gauge
+//!   that is maxed rather than summed), average duration /
+//!   time-to-first-token / generation rate — kept for all backends and
+//!   per backend index (the `?backend` filter),
 //! - **time series** — one bucket of `bucket_secs` (full request
-//!   counters per bucket) covering the whole process lifetime, bounded
-//!   by `MAX_BUCKETS` (oldest dropped first); a range query over many
+//!   counters per bucket, plus per-backend sub-counters for the
+//!   `?backend` filter) covering the whole process lifetime, bounded by
+//!   `MAX_BUCKETS` (oldest dropped first); a range query over many
 //!   buckets is coarsened to at most `MAX_SERIES_POINTS` points before
 //!   it is served, so the payload stays small for long ranges;
 //! - **recent requests** — a ring buffer of the last `max_recent`
-//!   finished requests (status, duration, key, flags, tokens, timings).
+//!   finished requests (status, backend index, duration, key, flags,
+//!   tokens, timings); each backend scope (all backends, each backend
+//!   index and the `cached` scope) keeps its own ring, so selecting a
+//!   filter keeps showing that scope's recent rows even after they have
+//!   rotated out of the all-backends ring.
 //!
-//! The page polls the stats endpoint every `refresh_ms` and renders stat
-//! cards, throughput bar charts, the backend table, a per-slot occupancy
-//! grid and the recent-requests table. A time-filter dropdown, grouped
-//! into presets (30 seconds, 1 minute, 5 minutes, 15 minutes) and other
-//! (custom time, or all time), scopes the
-//! cards, charts and recent table to the selected range by polling with
-//! `?since=<unix seconds>`. All aggregates reset on proxy restart;
-//! nothing is persisted.
+//! The page polls the stats endpoint every `refresh_ms` and renders
+//! stat cards, a throughput bar-chart panel (requests, completion
+//! tokens and cached tokens per bucket), a resources bar-chart panel
+//! (the proxy's own CPU ms, disk bytes read/written and peak RAM per
+//! bucket), the backend table, a per-slot occupancy grid and the
+//! recent-requests table (with the backend index of each request). A
+//! time-filter dropdown, grouped into presets (30 seconds, 1 minute, 5
+//! minutes, 15 minutes) and other (custom time, or all time), and a
+//! backend-filter dropdown (default: all backends — no filtering; an
+//! index or the `cached` option for the records served from the result
+//! cache) scope
+//! the cards, charts and recent table to the selected range and backend
+//! by polling with `?since=<unix seconds>&backend=<index|cached>`. All
+//! aggregates reset on proxy restart; nothing is persisted.
 //!
 //! Params:
 //! - `path` (default `/dashboard`): page URL path (must start with `/`;
@@ -53,7 +71,7 @@
 //! - `max_recent` (default `100`, range 0..=10000; `0` = no recent
 //!   list): ring buffer size.
 
-use crate::api::{Dashboard, ProxyStatus, RequestLogRecord};
+use crate::api::{BackendScope, Dashboard, ProxyStatus, RequestLogRecord};
 use crate::registry::{PluginError, PluginFactory};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -70,7 +88,7 @@ pub const DEFAULT_REFRESH_MS: u64 = 2000;
 pub const DEFAULT_WINDOW_SECS: u64 = 300;
 /// Default time-series bucket size in seconds.
 pub const DEFAULT_BUCKET_SECS: u64 = 5;
-/// Default recent-requests ring size.
+/// Default recent-requests ring size (per backend scope).
 pub const DEFAULT_MAX_RECENT: usize = 100;
 /// Hard cap on the retained time-series buckets (oldest dropped first):
 /// bounds the memory of the lifetime series that backs the "all time"
@@ -114,7 +132,8 @@ pub struct DashboardParams {
     /// Time-series bucket size in seconds (1..=3600).
     #[serde(default = "default_bucket_secs")]
     pub bucket_secs: u64,
-    /// Recent-requests ring size (0..=10000; `0` = no recent list).
+    /// Recent-requests ring size per backend scope (0..=10000;
+    /// `0` = no recent list).
     #[serde(default = "default_max_recent")]
     pub max_recent: usize,
 }
@@ -177,6 +196,15 @@ pub struct Bucket {
     /// hits, restores, tokens and timing sums) — summing the buckets of
     /// a range yields the range's counters.
     pub c: Counters,
+    /// Per-backend sub-counters (index = backend index): the
+    /// backend-filtered view of the series. A record with no backend
+    /// index (rejected before slot acquisition) counts only into `c`.
+    /// Grown on demand as backend indices appear.
+    pub by_be: Vec<Counters>,
+    /// Cached-result sub-counters: the `?backend=cached` view of the
+    /// series (the records served from the result cache, which never
+    /// touch a backend).
+    pub cached: Counters,
 }
 
 impl Bucket {
@@ -184,12 +212,25 @@ impl Bucket {
         Self {
             t,
             c: Counters::default(),
+            by_be: Vec::new(),
+            cached: Counters::default(),
         }
     }
 
-    /// Fold one finished record into the bucket.
+    /// Fold one finished record into the bucket (total and, when the
+    /// record ran on a backend, that backend's sub-counters; when it was
+    /// served from the result cache, the cached-result sub-counters).
     fn add(&mut self, record: &RequestLogRecord) {
-        self.c.add(record)
+        self.c.add(record);
+        if let Some(be) = record.backend {
+            if be >= self.by_be.len() {
+                self.by_be.resize(be + 1, Counters::default());
+            }
+            self.by_be[be].add(record);
+        }
+        if record.cache_hit == Some(true) {
+            self.cached.add(record);
+        }
     }
 }
 
@@ -205,6 +246,9 @@ pub struct RecentRow {
     pub model: Option<String>,
     /// First 16 hex chars of the KV cache key.
     pub key: Option<String>,
+    /// The backend index the request ran on (`None` = no backend work —
+    /// e.g. a prefilter rejection).
+    pub backend: Option<usize>,
     pub stream: bool,
     /// A KV cache restore was attempted and succeeded.
     pub restored: bool,
@@ -225,6 +269,12 @@ pub struct RecentRow {
     pub disk_read_bytes: Option<u64>,
     /// Per-request disk bytes written (the proxy process's delta).
     pub disk_write_bytes: Option<u64>,
+    /// The proxy process's resident memory (bytes) when the request
+    /// completed (a gauge, not a delta).
+    pub ram_bytes: Option<u64>,
+    /// The process's peak resident memory (bytes, since process start)
+    /// when the request completed.
+    pub peak_ram_bytes: Option<u64>,
 }
 
 /// Lifetime aggregate counters.
@@ -259,6 +309,13 @@ pub struct Counters {
     pub disk_read_bytes: u64,
     /// Total disk bytes written by the proxy process (per-request deltas).
     pub disk_write_bytes: u64,
+    /// Peak resident memory (bytes) of the proxy process over the records
+    /// in the range — the max of the per-request RSS gauges (memory is a
+    /// gauge, not a monotonic counter, so it is maxed, not summed).
+    pub ram_max_bytes: u64,
+    /// The process's peak resident memory (the high-water mark since
+    /// process start, in bytes) as last seen in the range's records.
+    pub peak_ram_max_bytes: u64,
 }
 
 impl Counters {
@@ -311,34 +368,48 @@ impl Counters {
         }
         self.disk_read_bytes += record.disk_read_bytes.unwrap_or(0);
         self.disk_write_bytes += record.disk_write_bytes.unwrap_or(0);
+        if let Some(v) = record.ram_bytes {
+            self.ram_max_bytes = self.ram_max_bytes.max(v);
+        }
+        if let Some(v) = record.peak_ram_bytes {
+            self.peak_ram_max_bytes = self.peak_ram_max_bytes.max(v);
+        }
+    }
+
+    /// Merge another counter set into `self` (sums the counters, maxes
+    /// the memory gauges) — the union of two disjoint record sets.
+    fn merge(&mut self, other: &Counters) {
+        self.total += other.total;
+        self.ok += other.ok;
+        self.client_errors += other.client_errors;
+        self.server_errors += other.server_errors;
+        self.cache_hits += other.cache_hits;
+        self.restored += other.restored;
+        self.big_requests += other.big_requests;
+        self.streamed += other.streamed;
+        self.coalesced_followers += other.coalesced_followers;
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.duration_sum += other.duration_sum;
+        self.duration_n += other.duration_n;
+        self.ttft_sum += other.ttft_sum;
+        self.ttft_n += other.ttft_n;
+        self.gen_tps_sum += other.gen_tps_sum;
+        self.gen_tps_n += other.gen_tps_n;
+        self.prefill_tps_sum += other.prefill_tps_sum;
+        self.prefill_tps_n += other.prefill_tps_n;
+        self.cpu_ms_sum += other.cpu_ms_sum;
+        self.cpu_ms_n += other.cpu_ms_n;
+        self.disk_read_bytes += other.disk_read_bytes;
+        self.disk_write_bytes += other.disk_write_bytes;
+        self.ram_max_bytes = self.ram_max_bytes.max(other.ram_max_bytes);
+        self.peak_ram_max_bytes = self.peak_ram_max_bytes.max(other.peak_ram_max_bytes);
     }
 
     /// Add the counters held by one bucket to `self`.
     fn add_bucket(&mut self, b: &Bucket) {
-        self.total += b.c.total;
-        self.ok += b.c.ok;
-        self.client_errors += b.c.client_errors;
-        self.server_errors += b.c.server_errors;
-        self.cache_hits += b.c.cache_hits;
-        self.restored += b.c.restored;
-        self.big_requests += b.c.big_requests;
-        self.streamed += b.c.streamed;
-        self.coalesced_followers += b.c.coalesced_followers;
-        self.prompt_tokens += b.c.prompt_tokens;
-        self.completion_tokens += b.c.completion_tokens;
-        self.cached_tokens += b.c.cached_tokens;
-        self.duration_sum += b.c.duration_sum;
-        self.duration_n += b.c.duration_n;
-        self.ttft_sum += b.c.ttft_sum;
-        self.ttft_n += b.c.ttft_n;
-        self.gen_tps_sum += b.c.gen_tps_sum;
-        self.gen_tps_n += b.c.gen_tps_n;
-        self.prefill_tps_sum += b.c.prefill_tps_sum;
-        self.prefill_tps_n += b.c.prefill_tps_n;
-        self.cpu_ms_sum += b.c.cpu_ms_sum;
-        self.cpu_ms_n += b.c.cpu_ms_n;
-        self.disk_read_bytes += b.c.disk_read_bytes;
-        self.disk_write_bytes += b.c.disk_write_bytes;
+        self.merge(&b.c)
     }
 
     /// The sum of the counters held by the given buckets (the counters
@@ -347,6 +418,29 @@ impl Counters {
         let mut c = Counters::default();
         for b in buckets {
             c.add_bucket(b);
+        }
+        c
+    }
+
+    /// The sum of one backend's sub-counters over the given buckets
+    /// (the backend-filtered counters of the range they cover; a bucket
+    /// without traffic on that backend contributes nothing).
+    pub fn sum_for<'a>(buckets: impl Iterator<Item = &'a Bucket>, be: usize) -> Counters {
+        let mut c = Counters::default();
+        for b in buckets {
+            if let Some(x) = b.by_be.get(be) {
+                c.merge(x);
+            }
+        }
+        c
+    }
+
+    /// The sum of the cached-result sub-counters over the given buckets
+    /// (the `?backend=cached` counters of the range they cover).
+    pub fn sum_cached<'a>(buckets: impl Iterator<Item = &'a Bucket>) -> Counters {
+        let mut c = Counters::default();
+        for b in buckets {
+            c.merge(&b.cached);
         }
         c
     }
@@ -382,6 +476,8 @@ fn counters_json(c: &Counters) -> Value {
             "avg_cpu_ms": Counters::avg(c.cpu_ms_n, c.cpu_ms_sum),
             "disk_read_bytes": c.disk_read_bytes,
             "disk_write_bytes": c.disk_write_bytes,
+            "ram_max_bytes": c.ram_max_bytes,
+            "peak_ram_bytes": c.peak_ram_max_bytes,
         },
         "avg_duration_secs": Counters::avg(c.duration_n, c.duration_sum),
         "avg_ttft_ms": Counters::avg(c.ttft_n, c.ttft_sum),
@@ -390,27 +486,60 @@ fn counters_json(c: &Counters) -> Value {
     })
 }
 
-/// The slim chart point of one bucket (the fields the page's bar charts
-/// need; the full counters travel only in `counters` / `range`).
-fn bucket_point(b: &Bucket) -> Value {
+/// The slim chart point of one counter set (the fields the page's bar
+/// charts need; the full counters travel only in `counters` / `range`).
+fn counters_point(t: u64, c: &Counters) -> Value {
     json!({
-        "t": b.t,
-        "reqs": b.c.total,
-        "completions": b.c.completion_tokens,
-        "cached_tokens": b.c.cached_tokens,
-        "cpu_ms": b.c.cpu_ms_sum,
+        "t": t,
+        "reqs": c.total,
+        "completions": c.completion_tokens,
+        "cached_tokens": c.cached_tokens,
+        "cpu_ms": c.cpu_ms_sum,
+        "disk_read_bytes": c.disk_read_bytes,
+        "disk_write_bytes": c.disk_write_bytes,
+        "ram_bytes": c.ram_max_bytes,
     })
+}
+
+/// The counter set of one bucket for the selected backend scope
+/// (`All` = the bucket total; a backend with no traffic in the bucket
+/// has none; `Cached` = the bucket's cached-result sub-counters).
+fn bucket_counters(b: &Bucket, scope: BackendScope) -> Option<&Counters> {
+    match scope {
+        BackendScope::All => Some(&b.c),
+        BackendScope::Backend(i) => b.by_be.get(i),
+        BackendScope::Cached => Some(&b.cached),
+    }
 }
 
 /// The plugin's mutable state (counters, time series, recent ring).
 #[derive(Debug, Default)]
 pub struct Inner {
-    /// Lifetime counters.
+    /// Lifetime counters (all backends).
     pub counters: Counters,
+    /// Lifetime counters per backend index (parallel to `counters`):
+    /// the backend-filtered lifetime view. A record with no backend
+    /// index counts only into `counters`.
+    pub by_be: Vec<Counters>,
+    /// Lifetime cached-result counters (parallel to `counters`): the
+    /// `?backend=cached` lifetime view (the records served from the
+    /// result cache — they never touch a backend, so they never count
+    /// into `by_be`).
+    pub cached: Counters,
     /// Time-series buckets, oldest first, covering the trailing window.
     pub buckets: Vec<Bucket>,
-    /// The `max_recent` most recent finished requests, oldest first.
+    /// The `max_recent` most recent finished requests (all scopes),
+    /// oldest first.
     pub recent: Vec<RecentRow>,
+    /// The `max_recent` most recent result-cache hits, oldest first
+    /// (the `?backend=cached` recent view — the hits carry no backend
+    /// index, so they live in their own ring).
+    pub recent_cached: Vec<RecentRow>,
+    /// The `max_recent` most recent requests per backend index
+    /// (parallel to `by_be`, oldest first): the `?backend=<i>` recent
+    /// view. Each scope keeps its own ring, so a filter's rows are not
+    /// evicted by traffic on other backends.
+    pub recent_by_be: Vec<Vec<RecentRow>>,
 }
 
 impl Inner {
@@ -426,6 +555,15 @@ impl Inner {
         max_recent: usize,
     ) {
         self.counters.add(record);
+        if let Some(be) = record.backend {
+            if be >= self.by_be.len() {
+                self.by_be.resize(be + 1, Counters::default());
+            }
+            self.by_be[be].add(record);
+        }
+        if record.cache_hit == Some(true) {
+            self.cached.add(record);
+        }
         let t = (now / bucket_secs) * bucket_secs;
         match self.buckets.last_mut() {
             Some(b) if b.t == t => b.add(record),
@@ -442,12 +580,13 @@ impl Inner {
             self.buckets.remove(0);
         }
         if max_recent > 0 {
-            self.recent.push(RecentRow {
+            let row = RecentRow {
                 ts: now as f64,
                 status: record.status.unwrap_or(0),
                 duration_secs: record.duration_secs.unwrap_or(0.0),
                 model: record.model.clone(),
                 key: record.key.clone(),
+                backend: record.backend,
                 stream: record.stream.unwrap_or(false),
                 restored: record.restored == Some(true),
                 cache_hit: record.cache_hit == Some(true),
@@ -461,11 +600,32 @@ impl Inner {
                 cpu_ms: record.cpu_ms,
                 disk_read_bytes: record.disk_read_bytes,
                 disk_write_bytes: record.disk_write_bytes,
-            });
-            while self.recent.len() > max_recent {
-                self.recent.remove(0);
+                ram_bytes: record.ram_bytes,
+                peak_ram_bytes: record.peak_ram_bytes,
+            };
+            // Every scope keeps its own recent ring, so selecting a
+            // filter keeps showing that scope's rows even when they
+            // have rotated out of the all-backends ring.
+            push_recent(&mut self.recent, row.clone(), max_recent);
+            if record.cache_hit == Some(true) {
+                push_recent(&mut self.recent_cached, row.clone(), max_recent);
+            }
+            if let Some(be) = record.backend {
+                if be >= self.recent_by_be.len() {
+                    self.recent_by_be.resize(be + 1, Vec::new());
+                }
+                push_recent(&mut self.recent_by_be[be], row, max_recent);
             }
         }
+    }
+}
+
+/// Push a row onto a scope's recent ring, trimming the oldest row once
+/// the ring exceeds `max_recent`.
+fn push_recent(ring: &mut Vec<RecentRow>, row: RecentRow, max_recent: usize) {
+    ring.push(row);
+    while ring.len() > max_recent {
+        ring.remove(0);
     }
 }
 
@@ -520,42 +680,72 @@ impl DashboardPlugin {
     /// Coarsen `buckets` to at most [`MAX_SERIES_POINTS`] chart points:
     /// beyond the cap, consecutive buckets are merged into a step aligned
     /// to a multiple of `bucket_secs` (raw buckets are already aligned,
-    /// so every merged point keeps an exact start time). Returns the
-    /// effective step and the slim points.
-    fn series_points(buckets: &[Bucket], bucket_secs: u64) -> (u64, Vec<Value>) {
+    /// so every merged point keeps an exact start time). `scope` selects
+    /// the per-scope sub-counters (`All` = the bucket totals).
+    /// Returns the effective step and the slim points.
+    fn series_points(
+        buckets: &[Bucket],
+        bucket_secs: u64,
+        scope: BackendScope,
+    ) -> (u64, Vec<Value>) {
         if buckets.len() <= MAX_SERIES_POINTS {
-            return (bucket_secs, buckets.iter().map(bucket_point).collect());
+            let zeros = Counters::default();
+            return (
+                bucket_secs,
+                buckets
+                    .iter()
+                    .map(|b| counters_point(b.t, bucket_counters(b, scope).unwrap_or(&zeros)))
+                    .collect(),
+            );
         }
         let step = bucket_secs * buckets.len().div_ceil(MAX_SERIES_POINTS) as u64;
-        let mut merged: Vec<Bucket> = Vec::with_capacity(MAX_SERIES_POINTS);
+        let mut merged: Vec<(u64, Counters)> = Vec::with_capacity(MAX_SERIES_POINTS);
         for b in buckets {
             let t = (b.t / step) * step;
+            let zeros = Counters::default();
+            let c = bucket_counters(b, scope).unwrap_or(&zeros).clone();
             match merged.last_mut() {
-                Some(m) if m.t == t => m.c.add_bucket(b),
-                _ => {
-                    let mut m = Bucket::new(t);
-                    m.c.add_bucket(b);
-                    merged.push(m);
-                }
+                Some((mt, mc)) if *mt == t => mc.merge(&c),
+                _ => merged.push((t, c)),
             }
         }
-        (step, merged.iter().map(bucket_point).collect())
+        (
+            step,
+            merged.iter().map(|(t, c)| counters_point(*t, c)).collect(),
+        )
     }
 
     /// The stats payload: the proxy's live [`ProxyStatus`] merged with
     /// the plugin's aggregates, range-scoped by `since` (unix seconds,
-    /// from the `?since` query parameter):
+    /// from the `?since` query parameter) and backend-scoped by
+    /// `backend` (a backend index, from the `?backend` query parameter;
+    /// `None` = all backends — every statistic includes everything):
     ///
-    /// - `Some(s)` — `counters` stays lifetime; `range` carries the
-    ///   counters of `[s, now]` (the lifetime counters themselves when
-    ///   `s` is at or before the oldest retained bucket — exact while
-    ///   nothing has been dropped past [`MAX_BUCKETS`]) and `series`
-    ///   holds the range's buckets, coarsened to at most
-    ///   [`MAX_SERIES_POINTS`] points. The page's time filter uses this.
-    /// - `None` — the legacy shape: lifetime counters plus the trailing
-    ///   `window_secs` of the series (as of now) and its rates.
-    pub fn stats_inner(&self, proxy: &ProxyStatus, since: Option<u64>) -> Value {
+    /// - `Some(s)` — `counters` holds the lifetime counters of the
+    ///   selected backend scope; `range` carries the counters of
+    ///   `[s, now]` (the lifetime counters themselves when `s` is at
+    ///   or before the oldest retained bucket — exact while nothing has
+    ///   been dropped past [`MAX_BUCKETS`]) and `series` holds the
+    ///   range's buckets, coarsened to at most [`MAX_SERIES_POINTS`]
+    ///   points. The page's time filter uses this.
+    /// - `None` — the legacy shape: lifetime counters of the selected
+    ///   backend scope plus the trailing `window_secs` of the series
+    ///   (as of now) and its rates.
+    pub fn stats_inner(
+        &self,
+        proxy: &ProxyStatus,
+        since: Option<u64>,
+        scope: BackendScope,
+    ) -> Value {
         let inner = self.inner.lock().expect("dashboard lock poisoned");
+        // The lifetime counters of the selected scope: a selected backend
+        // that never got traffic yields zero counters (records with no
+        // backend index count only into the all-backends total).
+        let lifetime = match scope {
+            BackendScope::All => inner.counters.clone(),
+            BackendScope::Backend(b) => inner.by_be.get(b).cloned().unwrap_or_default(),
+            BackendScope::Cached => inner.cached.clone(),
+        };
         let payload = json!({
             "version": proxy.version,
             "uptime_secs": proxy.uptime_secs,
@@ -563,7 +753,7 @@ impl DashboardPlugin {
             "window_secs": self.window_secs,
             "refresh_ms": self.refresh_ms,
             "proxy": serde_json::to_value(proxy).unwrap_or(Value::Null),
-            "counters": counters_json(&inner.counters),
+            "counters": counters_json(&lifetime),
         });
         let mut payload = payload;
         match since {
@@ -574,11 +764,15 @@ impl DashboardPlugin {
                 let start = inner.buckets.partition_point(|b| b.t < s);
                 let range_buckets = &inner.buckets[start..];
                 let range_counters = if start == 0 {
-                    inner.counters.clone()
+                    lifetime.clone()
                 } else {
-                    Counters::sum(range_buckets.iter())
+                    match scope {
+                        BackendScope::All => Counters::sum(range_buckets.iter()),
+                        BackendScope::Backend(b) => Counters::sum_for(range_buckets.iter(), b),
+                        BackendScope::Cached => Counters::sum_cached(range_buckets.iter()),
+                    }
                 };
-                let (step, points) = Self::series_points(range_buckets, self.bucket_secs);
+                let (step, points) = Self::series_points(range_buckets, self.bucket_secs, scope);
                 payload["range"] = json!({
                     "since": s,
                     "counters": counters_json(&range_counters),
@@ -597,8 +791,19 @@ impl DashboardPlugin {
                     .iter()
                     .filter(|b| now.saturating_sub(b.t) < self.window_secs)
                     .collect();
-                let reqs_window: u64 = window.iter().map(|b| b.c.total).sum();
-                let toks_window: u64 = window.iter().map(|b| b.c.completion_tokens).sum();
+                let zeros = Counters::default();
+                let reqs_window: u64 = window
+                    .iter()
+                    .map(|b| bucket_counters(b, scope).unwrap_or(&zeros).total)
+                    .sum();
+                let toks_window: u64 = window
+                    .iter()
+                    .map(|b| {
+                        bucket_counters(b, scope)
+                            .unwrap_or(&zeros)
+                            .completion_tokens
+                    })
+                    .sum();
                 let w = self.window_secs as f64;
                 payload["series"] = json!({
                     "bucket_secs": self.bucket_secs,
@@ -606,11 +811,23 @@ impl DashboardPlugin {
                     "window_completions": toks_window,
                     "req_per_sec": reqs_window as f64 / w,
                     "tok_per_sec": toks_window as f64 / w,
-                    "buckets": window.iter().map(|b| bucket_point(b)).collect::<Vec<_>>(),
+                    "buckets": window
+                        .iter()
+                        .map(|b| counters_point(b.t, bucket_counters(b, scope).unwrap_or(&zeros)))
+                        .collect::<Vec<_>>(),
                 });
             }
         }
-        payload["recent"] = serde_json::to_value(&inner.recent).unwrap_or(Value::Null);
+        // The recent ring for the selected scope — each scope keeps its
+        // own ring, so a filter shows that scope's recent rows rather
+        // than filtering the all-backends ring (the page also re-applies
+        // the time filter client-side).
+        let recent: &[RecentRow] = match scope {
+            BackendScope::Backend(b) => inner.recent_by_be.get(b).map_or(&[], Vec::as_slice),
+            BackendScope::Cached => &inner.recent_cached,
+            BackendScope::All => &inner.recent,
+        };
+        payload["recent"] = serde_json::to_value(recent).unwrap_or(Value::Null);
         payload
     }
 }
@@ -630,8 +847,8 @@ impl Dashboard for DashboardPlugin {
             .replace("__STATS_PATH__", &self.stats_path())
     }
 
-    fn stats(&self, proxy: &ProxyStatus, since: Option<u64>) -> Value {
-        self.stats_inner(proxy, since)
+    fn stats(&self, proxy: &ProxyStatus, since: Option<u64>, scope: BackendScope) -> Value {
+        self.stats_inner(proxy, since, scope)
     }
 
     fn record(&self, record: &RequestLogRecord) -> Result<(), String> {
@@ -751,6 +968,8 @@ const PAGE_BODY: &str = r##"
       <input id="custom-secs" type="number" min="1" step="1" placeholder="seconds">
       <button type="button" id="custom-apply">apply</button>
     </span>
+    <span class="flbl">backend</span>
+    <select id="backend" class="fsel" aria-label="backend filter"><option value="">all</option></select>
   </section>
   <section class="cards">
     <div class="card"><div class="lbl">requests</div><div class="v" id="c-req-v">&ndash;</div><div class="s" id="c-req-s"></div></div>
@@ -768,13 +987,20 @@ const PAGE_BODY: &str = r##"
     <div class="card"><div class="lbl">avg cpu</div><div class="v" id="c-cpu-v">&ndash;</div><div class="s" id="c-cpu-s">proxy process</div></div>
     <div class="card"><div class="lbl">disk read</div><div class="v" id="c-dr-v">&ndash;</div><div class="s" id="c-dr-s">proxy process</div></div>
     <div class="card"><div class="lbl">disk write</div><div class="v" id="c-dw-v">&ndash;</div><div class="s" id="c-dw-s">proxy process</div></div>
+    <div class="card"><div class="lbl">peak ram</div><div class="v" id="c-ram-v">&ndash;</div><div class="s" id="c-ram-s">proxy process</div></div>
   </section>
   <section class="panel">
     <h2>throughput</h2>
     <div class="chartwrap"><div class="cap"><span>requests per bucket</span><span id="cap-req"></span></div><canvas id="chart-req"></canvas></div>
     <div class="chartwrap"><div class="cap"><span>completion tokens per bucket</span><span id="cap-tok"></span></div><canvas id="chart-tok"></canvas></div>
     <div class="chartwrap"><div class="cap"><span>cached (restored) prompt tokens per bucket</span><span id="cap-cached"></span></div><canvas id="chart-cached"></canvas></div>
+  </section>
+  <section class="panel">
+    <h2>resources</h2>
     <div class="chartwrap"><div class="cap"><span>cpu ms per bucket</span><span id="cap-cpu"></span></div><canvas id="chart-cpu"></canvas></div>
+    <div class="chartwrap"><div class="cap"><span>disk read bytes per bucket</span><span id="cap-dr"></span></div><canvas id="chart-dr"></canvas></div>
+    <div class="chartwrap"><div class="cap"><span>disk write bytes per bucket</span><span id="cap-dw"></span></div><canvas id="chart-dw"></canvas></div>
+    <div class="chartwrap"><div class="cap"><span>peak ram bytes per bucket</span><span id="cap-ram"></span></div><canvas id="chart-ram"></canvas></div>
   </section>
   <section class="panel"><h2>backends</h2><div id="backends"></div></section>
   <section class="panel"><h2>slots</h2><div id="slots" class="slots"></div></section>
@@ -794,6 +1020,10 @@ const $ = (id) => document.getElementById(id);
 // which goes empty once the proxy idles past it).
 let FILTER = "300";
 let CUSTOM_SECS = 600;
+// Backend filter: null = all backends (no filtering — every statistic
+// includes all backends); a number = one backend index; "cached" = the
+// records served from the result cache (they never touch a backend).
+let BE = null;
 function rangeSecs(){
   if(FILTER==="all") return null;
   if(FILTER==="custom") return CUSTOM_SECS;
@@ -806,9 +1036,14 @@ function rangeLabel(){
   return "last "+(m[FILTER] || FILTER+" s");
 }
 function statsUrl(){
-  if(FILTER==="all") return STATS+"?since=0";
-  const rs = rangeSecs();
-  return rs==null ? STATS : STATS+"?since="+Math.max(0, Math.floor(Date.now()/1000)-rs);
+  const q = [];
+  if(FILTER==="all") q.push("since=0");
+  else {
+    const rs = rangeSecs();
+    if(rs!=null) q.push("since="+Math.max(0, Math.floor(Date.now()/1000)-rs));
+  }
+  if(BE!=null) q.push("backend="+BE);
+  return q.length ? STATS+"?"+q.join("&") : STATS;
 }
 function fmtN(v){ return v==null ? "\u2013" : Math.round(v).toLocaleString(); }
 function fmtDur(v){ if(v==null) return "\u2013"; if(v<1) return Math.round(v*1000)+" ms"; if(v<120) return v.toFixed(1)+" s"; if(v<7200) return Math.floor(v/60)+" m "+Math.round(v%60)+" s"; return Math.floor(v/3600)+" h "+Math.floor((v%3600)/60)+" m"; }
@@ -827,11 +1062,11 @@ function fillSeries(buckets, bucketSecs){
   for(let t=first; t<=last; t+=bucketSecs){
     let b = null;
     for(const x of buckets){ if(x.t===t){ b=x; break; } }
-    out.push(b || {t:t, reqs:0, completions:0, cached_tokens:0, cpu_ms:0});
+    out.push(b || {t:t, reqs:0, completions:0, cached_tokens:0, cpu_ms:0, disk_read_bytes:0, disk_write_bytes:0, ram_bytes:0});
   }
   return out;
 }
-// ---- shared hover tooltip (one element for all three charts) ---------------
+// ---- shared hover tooltip (one element for all the charts) ---------------
 let tip = null;
 function ensureTip(){
   if(!tip){ tip = document.createElement("div"); tip.className = "bartip"; document.body.appendChild(tip); }
@@ -854,7 +1089,8 @@ function showTip(cx, cy, label, time, val, color){
 function hideTip(){ if(tip) tip.style.display = "none"; }
 
 // Draw one throughput bar chart. `series` are aligned bucket objects
-// ({t, reqs, completions, cached_tokens}); `key` picks the field to plot,
+// ({t, reqs, completions, cached_tokens, cpu_ms, disk_read_bytes,
+// disk_write_bytes, ram_bytes}); `key` picks the field to plot,
 // `label`/`color` feed the on-bar figures and the hover tooltip, and `hl` is
 // the currently hovered bar index (-1 for none). The figure of each bar is
 // drawn on top of it; an adaptive stride skips labels when buckets are dense
@@ -932,8 +1168,27 @@ function attachChart(cv){
     if(c && c.hl!==-1){ c.hl=-1; redrawChart(cv); }
   });
 }
+// Keep the backend filter's options in sync with the proxy's backend
+// list (rebuild only when the list changes; preserve a still-valid
+// selection and keep the BE state in step with the dropdown).
+function renderBackendSel(p){
+  const sel = $("backend");
+  const list = p.backends || [];
+  const sig = list.map(b=>b.url).join("\u0001");
+  if(sig !== sel._sig){
+    sel._sig = sig;
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">all</option>' +
+      list.map((b,i)=>'<option value="'+i+'">backend '+i+' \u00b7 '+esc(b.url)+'</option>').join("") +
+      '<option value="cached">cached results \u00b7 no backend</option>';
+    const valid = cur==="" || cur==="cached" || parseInt(cur,10) < list.length;
+    sel.value = valid ? cur : "";
+    BE = sel.value==="" ? null : (sel.value==="cached" ? "cached" : parseInt(sel.value, 10));
+  }
+}
 function render(d){
   const p=d.proxy, s=d.series;
+  renderBackendSel(p);
   // The selection scopes the cards/charts: with `?since` the payload
   // carries `range.counters` for the selected range (fall back to the
   // lifetime counters only if the server predates the range endpoint).
@@ -961,17 +1216,24 @@ function render(d){
   card("c-cpu", fmtMs(res.avg_cpu_ms), "total "+fmtMs(res.cpu_ms)+" \u00b7 proxy process");
   card("c-dr", fmtBytes(res.disk_read_bytes), "total \u00b7 "+rangeLabel());
   card("c-dw", fmtBytes(res.disk_write_bytes), "total \u00b7 "+rangeLabel());
+  card("c-ram", fmtBytes(res.ram_max_bytes), "max \u00b7 "+rangeLabel());
   const series = fillSeries(s.buckets, s.bucket_secs);
   drawBars($("chart-req"), series, "reqs", "requests", "#58a6ff", -1);
   drawBars($("chart-tok"), series, "completions", "completion tokens", "#3fb950", -1);
   drawBars($("chart-cached"), series, "cached_tokens", "cached tokens", "#d29922", -1);
   drawBars($("chart-cpu"), series, "cpu_ms", "cpu ms", "#bc8cff", -1);
+  drawBars($("chart-dr"), series, "disk_read_bytes", "disk bytes read", "#39c5cf", -1);
+  drawBars($("chart-dw"), series, "disk_write_bytes", "disk bytes written", "#db61a2", -1);
+  drawBars($("chart-ram"), series, "ram_bytes", "peak ram bytes", "#f85149", -1);
   const span = series.length ? series.length*s.bucket_secs : 0;
   const spanLabel = span ? (ranged ? rangeLabel() : span+" s window")+" \u00b7 "+s.bucket_secs+" s buckets" : "";
   $("cap-req").textContent = spanLabel;
   $("cap-tok").textContent = spanLabel;
   $("cap-cached").textContent = spanLabel;
   $("cap-cpu").textContent = spanLabel;
+  $("cap-dr").textContent = spanLabel;
+  $("cap-dw").textContent = spanLabel;
+  $("cap-ram").textContent = spanLabel;
   let bt = "<table><tr><th>url</th><th>state</th><th>cooldown</th><th>fail streak</th><th>slots</th></tr>";
   p.backends.forEach((b,i)=>{
     bt += "<tr><td>"+esc(b.url)+"</td><td>"+(b.down ? '<span class="badge b-err">DOWN</span>' : '<span class="badge b-ok">UP</span>')+"</td><td>"+(b.cooldown_secs>0 ? b.cooldown_secs.toFixed(0)+" s" : "\u2013")+"</td><td>"+(b.failure_streak||"\u2013")+"</td><td>"+b.busy_slots+" / "+b.n_slots+"</td></tr>";
@@ -991,7 +1253,7 @@ function render(d){
   if(ranged) rows = rows.filter(r=>r.ts >= (d.range.since==null ? 0 : d.range.since));
   if(!rows.length){ $("recent").innerHTML = '<div class="empty">no finished requests yet</div>'; }
   else {
-    let rt = "<table><tr><th>time</th><th>status</th><th>duration</th><th>model</th><th>key</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w</th><th>note</th></tr>";
+    let rt = "<table><tr><th>time</th><th>status</th><th>be</th><th>duration</th><th>model</th><th>key</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w</th><th>ram</th><th>note</th></tr>";
     rows.forEach(r=>{
       const flags = [];
       if(r.cache_hit) flags.push('<span class="badge b-acc">cache</span>');
@@ -1002,12 +1264,13 @@ function render(d){
       const toks = r.prompt_tokens!=null ? r.prompt_tokens+" / "+(r.completion_tokens!=null?r.completion_tokens:"?")+" / "+(r.cached_tokens!=null?r.cached_tokens:0) : "\u2013";
       const cpu = r.cpu_ms!=null ? r.cpu_ms.toFixed(1)+" ms" : "\u2013";
       const diow = (r.disk_read_bytes!=null || r.disk_write_bytes!=null) ? fmtBytes(r.disk_read_bytes||0)+" / "+fmtBytes(r.disk_write_bytes||0) : "\u2013";
-      rt += "<tr><td>"+when+"</td><td>"+statusBadge(r.status)+"</td><td>"+fmtDur(r.duration_secs)+"</td><td>"+esc(r.model)+"</td><td>"+(r.key?esc(r.key):"\u2013")+"</td><td>"+flags.join(" ")+"</td><td>"+toks+"</td><td>"+(r.ttft_ms!=null?Math.round(r.ttft_ms)+" ms":"\u2013")+"</td><td>"+(r.gen_tps!=null?r.gen_tps.toFixed(1):"\u2013")+"</td><td>"+cpu+"</td><td>"+diow+"</td><td>"+(r.reason?esc(r.reason):"")+"</td></tr>";
+      const ram = r.ram_bytes!=null ? fmtBytes(r.ram_bytes) : "\u2013";
+      rt += "<tr><td>"+when+"</td><td>"+statusBadge(r.status)+"</td><td>"+(r.backend==null?"\u2013":r.backend)+"</td><td>"+fmtDur(r.duration_secs)+"</td><td>"+esc(r.model)+"</td><td>"+(r.key?esc(r.key):"\u2013")+"</td><td>"+flags.join(" ")+"</td><td>"+toks+"</td><td>"+(r.ttft_ms!=null?Math.round(r.ttft_ms)+" ms":"\u2013")+"</td><td>"+(r.gen_tps!=null?r.gen_tps.toFixed(1):"\u2013")+"</td><td>"+cpu+"</td><td>"+diow+"</td><td>"+ram+"</td><td>"+(r.reason?esc(r.reason):"")+"</td></tr>";
     });
     rt += "</table>";
     $("recent").innerHTML = rt;
   }
-  $("foot").textContent = "filter "+rangeLabel()+" \u00b7 buckets "+s.bucket_secs+" s \u00b7 poll "+d.refresh_ms+" ms";
+  $("foot").textContent = "filter "+rangeLabel()+(BE==null?"":(BE==="cached"?" \u00b7 cached results":" \u00b7 backend "+BE))+" \u00b7 buckets "+s.bucket_secs+" s \u00b7 poll "+d.refresh_ms+" ms";
   $("live").textContent = "\u25cf live";
   $("live").className = "";
 }
@@ -1044,7 +1307,14 @@ function applyCustom(){
 }
 $("custom-apply").addEventListener("click", applyCustom);
 $("custom-secs").addEventListener("keydown", e=>{ if(e.key==="Enter") applyCustom(); });
-["chart-req","chart-tok","chart-cached","chart-cpu"].forEach(id=>attachChart($(id)));
+// Backend filter dropdown: the empty value means all backends (no
+// filtering); an index or the "cached" option re-renders immediately.
+$("backend").addEventListener("change", ()=>{
+  const v = $("backend").value;
+  BE = v==="" ? null : (v==="cached" ? "cached" : parseInt(v, 10));
+  poll();
+});
+["chart-req","chart-tok","chart-cached","chart-cpu","chart-dr","chart-dw","chart-ram"].forEach(id=>attachChart($(id)));
 tick();
 </script>
 </body>
@@ -1107,6 +1377,8 @@ mod tests {
             cpu_ms: Some(12.5),
             disk_read_bytes: Some(1024),
             disk_write_bytes: Some(2048),
+            ram_bytes: Some(1_048_576),
+            peak_ram_bytes: Some(2_097_152),
             ..Default::default()
         }
     }
@@ -1192,11 +1464,22 @@ mod tests {
         ))
         .unwrap();
         // t=100 -> bucket 100; t=109 -> still bucket 100; t=125 -> bucket 120
-        d.record_at(100.0, &record(200)).unwrap();
-        d.record_at(109.0, &record(200)).unwrap();
-        d.record_at(125.0, &record(400)).unwrap();
+        // (the RAM gauges vary per record to prove the max — not a sum —
+        // aggregation)
+        let mut r1 = record(200);
+        r1.ram_bytes = Some(100_000_000);
+        r1.peak_ram_bytes = Some(400_000_000);
+        d.record_at(100.0, &r1).unwrap();
+        let mut r2 = record(200);
+        r2.ram_bytes = Some(150_000_000);
+        r2.peak_ram_bytes = Some(400_000_000);
+        d.record_at(109.0, &r2).unwrap();
+        let mut r3 = record(400);
+        r3.ram_bytes = Some(120_000_000);
+        r3.peak_ram_bytes = Some(420_000_000);
+        d.record_at(125.0, &r3).unwrap();
         // `since=0` = the whole retained history (the "all time" filter).
-        let v = d.stats(&proxy(), Some(0));
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
         assert_eq!(v["counters"]["total"], 3);
         assert_eq!(v["counters"]["ok"], 2);
         assert_eq!(v["counters"]["client_errors"], 1);
@@ -1210,13 +1493,25 @@ mod tests {
         assert_eq!(v["counters"]["resources"]["avg_cpu_ms"], 12.5);
         assert_eq!(v["counters"]["resources"]["disk_read_bytes"], 3072);
         assert_eq!(v["counters"]["resources"]["disk_write_bytes"], 6144);
-        // the series carries the per-bucket cpu ms
+        // the memory gauges are maxed over the range, not summed
+        assert_eq!(v["counters"]["resources"]["ram_max_bytes"], 150_000_000);
+        assert_eq!(v["counters"]["resources"]["peak_ram_bytes"], 420_000_000);
+        // the series carries the per-bucket resource fields
         assert_eq!(v["series"]["buckets"][0]["cpu_ms"], 25.0);
         assert_eq!(v["series"]["buckets"][1]["cpu_ms"], 12.5);
+        assert_eq!(v["series"]["buckets"][0]["disk_read_bytes"], 2048);
+        assert_eq!(v["series"]["buckets"][0]["disk_write_bytes"], 4096);
+        assert_eq!(v["series"]["buckets"][1]["disk_read_bytes"], 1024);
+        assert_eq!(v["series"]["buckets"][1]["disk_write_bytes"], 2048);
+        // the series carries the per-bucket peak RAM (bucket 0 holds r1+r2)
+        assert_eq!(v["series"]["buckets"][0]["ram_bytes"], 150_000_000);
+        assert_eq!(v["series"]["buckets"][1]["ram_bytes"], 120_000_000);
         // the recent ring carries the per-request resource fields
         assert_eq!(v["recent"][0]["cpu_ms"], 12.5);
         assert_eq!(v["recent"][1]["disk_read_bytes"], 1024);
         assert_eq!(v["recent"][1]["disk_write_bytes"], 2048);
+        assert_eq!(v["recent"][0]["ram_bytes"], 150_000_000);
+        assert_eq!(v["recent"][1]["peak_ram_bytes"], 420_000_000);
         assert_eq!(v["series"]["buckets"].as_array().unwrap().len(), 2);
         assert_eq!(v["series"]["buckets"][0]["t"], 100);
         assert_eq!(v["series"]["buckets"][0]["reqs"], 2);
@@ -1244,15 +1539,21 @@ mod tests {
         rec.cpu_ms = None;
         rec.disk_read_bytes = None;
         rec.disk_write_bytes = None;
+        rec.ram_bytes = None;
+        rec.peak_ram_bytes = None;
         d.record_now(&rec).unwrap();
-        let v = d.stats(&proxy(), None);
+        let v = d.stats(&proxy(), None, BackendScope::All);
         assert_eq!(v["counters"]["resources"]["cpu_ms"], 0.0);
         assert!(v["counters"]["resources"]["avg_cpu_ms"].is_null());
         assert_eq!(v["counters"]["resources"]["disk_read_bytes"], 0);
         assert_eq!(v["counters"]["resources"]["disk_write_bytes"], 0);
+        assert_eq!(v["counters"]["resources"]["ram_max_bytes"], 0);
+        assert_eq!(v["counters"]["resources"]["peak_ram_bytes"], 0);
         assert!(v["recent"][0]["cpu_ms"].is_null());
         assert!(v["recent"][0]["disk_read_bytes"].is_null());
         assert!(v["recent"][0]["disk_write_bytes"].is_null());
+        assert!(v["recent"][0]["ram_bytes"].is_null());
+        assert!(v["recent"][0]["peak_ram_bytes"].is_null());
     }
 
     #[test]
@@ -1264,14 +1565,25 @@ mod tests {
         d.record_at(100.0, &record(200)).unwrap();
         d.record_at(200.0, &record(400)).unwrap();
         // `since=150` covers only the bucket at 200 (t=100 starts before it).
-        let v = d.stats(&proxy(), Some(150));
+        let v = d.stats(&proxy(), Some(150), BackendScope::All);
         assert_eq!(v["range"]["since"], 150);
         assert_eq!(v["range"]["counters"]["total"], 1);
         assert_eq!(v["range"]["counters"]["client_errors"], 1);
         // the resource totals are range-scoped like the other counters
         assert_eq!(v["range"]["counters"]["resources"]["cpu_ms"], 12.5);
         assert_eq!(v["range"]["counters"]["resources"]["disk_read_bytes"], 1024);
-        assert_eq!(v["range"]["counters"]["resources"]["disk_write_bytes"], 2048);
+        assert_eq!(
+            v["range"]["counters"]["resources"]["disk_write_bytes"],
+            2048
+        );
+        assert_eq!(
+            v["range"]["counters"]["resources"]["ram_max_bytes"],
+            1_048_576
+        );
+        assert_eq!(
+            v["range"]["counters"]["resources"]["peak_ram_bytes"],
+            2_097_152
+        );
         let buckets = v["series"]["buckets"].as_array().unwrap();
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0]["t"], 200);
@@ -1280,14 +1592,217 @@ mod tests {
         // counters are lifetime — still 2
         assert_eq!(v["counters"]["total"], 2);
         // `since` at or before the oldest bucket yields the lifetime counters
-        let v = d.stats(&proxy(), Some(0));
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
         assert_eq!(v["range"]["counters"]["total"], 2);
         assert_eq!(v["series"]["buckets"].as_array().unwrap().len(), 2);
         // a future `since` is an empty range
-        let v = d.stats(&proxy(), Some(2000));
+        let v = d.stats(&proxy(), Some(2000), BackendScope::All);
         assert_eq!(v["range"]["counters"]["total"], 0);
         assert!(v["range"]["counters"]["success_rate"].is_null());
         assert!(v["series"]["buckets"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn backend_filter_scopes_counters_series_and_recent() {
+        let d = DashboardPlugin::new(params(
+            json!({ "window_secs": 30, "bucket_secs": 10, "max_recent": 10 }),
+        ))
+        .unwrap();
+        // Two backends plus one record with no backend index (e.g. a
+        // prefilter rejection): be0 @100 and be1 @105 (bucket 100),
+        // be0 @125 (bucket 120), none @130 (bucket 130).
+        let mut r1 = record(200);
+        r1.backend = Some(0);
+        r1.ram_bytes = Some(100_000_000);
+        d.record_at(100.0, &r1).unwrap();
+        let mut r2 = record(200);
+        r2.backend = Some(1);
+        r2.ram_bytes = Some(150_000_000);
+        d.record_at(105.0, &r2).unwrap();
+        let mut r3 = record(400);
+        r3.backend = Some(0);
+        r3.ram_bytes = Some(120_000_000);
+        d.record_at(125.0, &r3).unwrap();
+        let r4 = record(200); // no backend
+        d.record_at(130.0, &r4).unwrap();
+
+        // Unfiltered (the default): everything, including the record
+        // with no backend index.
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        assert_eq!(v["counters"]["total"], 4);
+        assert_eq!(v["range"]["counters"]["total"], 4);
+        let buckets = v["series"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0]["reqs"], 2);
+        assert_eq!(buckets[1]["reqs"], 1);
+        assert_eq!(buckets[2]["reqs"], 1);
+        assert_eq!(v["recent"].as_array().unwrap().len(), 4);
+
+        // Backend 0: its records only — counters, series and recent.
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(0));
+        assert_eq!(v["counters"]["total"], 2);
+        assert_eq!(v["range"]["counters"]["total"], 2);
+        assert_eq!(v["range"]["counters"]["ok"], 1);
+        assert_eq!(v["range"]["counters"]["client_errors"], 1);
+        assert_eq!(v["range"]["counters"]["tokens"]["completion"], 100);
+        assert_eq!(
+            v["range"]["counters"]["resources"]["ram_max_bytes"],
+            120_000_000
+        );
+        let buckets = v["series"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0]["t"], 100);
+        assert_eq!(buckets[0]["reqs"], 1);
+        assert_eq!(buckets[0]["ram_bytes"], 100_000_000);
+        assert_eq!(buckets[1]["reqs"], 1);
+        assert_eq!(buckets[2]["reqs"], 0); // bucket 130: no be0 traffic
+        let recent = v["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["backend"], 0);
+        assert_eq!(recent[1]["backend"], 0);
+
+        // Backend 1: its single record.
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(1));
+        assert_eq!(v["counters"]["total"], 1);
+        assert_eq!(v["range"]["counters"]["total"], 1);
+        assert_eq!(
+            v["range"]["counters"]["resources"]["ram_max_bytes"],
+            150_000_000
+        );
+        assert_eq!(v["recent"].as_array().unwrap().len(), 1);
+        assert_eq!(v["recent"][0]["status"], 200);
+        assert_eq!(v["recent"][0]["backend"], 1);
+
+        // A backend that never got traffic: zero statistics (the series
+        // keeps the full timeline, all zero).
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(2));
+        assert_eq!(v["counters"]["total"], 0);
+        assert!(v["range"]["counters"]["success_rate"].is_null());
+        assert_eq!(v["range"]["counters"]["total"], 0);
+        let buckets = v["series"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3);
+        for b in buckets {
+            assert_eq!(b["reqs"], 0);
+        }
+        assert!(v["recent"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn backend_filter_cached_scope_selects_cache_hits_only() {
+        let d = DashboardPlugin::new(params(
+            json!({ "window_secs": 10, "bucket_secs": 10, "max_recent": 10 }),
+        ))
+        .unwrap();
+        // Two result-cache hits (no backend, cache_hit Some(true)), one
+        // backend-0 request and one prefilter reject (both cache_hit
+        // Some(false)).
+        let mut h1 = record(200);
+        h1.cache_hit = Some(true);
+        h1.backend = None;
+        d.record_at(100.0, &h1).unwrap();
+        let mut h2 = record(200);
+        h2.cache_hit = Some(true);
+        h2.backend = None;
+        d.record_at(105.0, &h2).unwrap();
+        let mut b0 = record(200);
+        b0.backend = Some(0);
+        d.record_at(125.0, &b0).unwrap();
+        let mut rej = record(429);
+        rej.backend = None;
+        rej.reason = Some("prefilter_reject".into());
+        d.record_at(130.0, &rej).unwrap();
+
+        // The cached scope selects the two cache hits only — lifetime
+        // counters, range counters, series (bucket 100 = 2, the rest 0)
+        // and the recent ring (both hits, no backend index).
+        let v = d.stats(&proxy(), Some(0), BackendScope::Cached);
+        assert_eq!(v["counters"]["total"], 2);
+        assert_eq!(v["range"]["counters"]["total"], 2);
+        let buckets = v["series"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0]["reqs"], 2);
+        assert_eq!(buckets[1]["reqs"], 0);
+        assert_eq!(buckets[2]["reqs"], 0);
+        let recent = v["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 2);
+        for r in recent {
+            assert_eq!(r["cache_hit"], true);
+            assert!(r["backend"].is_null());
+        }
+
+        // The backend scope excludes the cache hits (they carry no
+        // backend index); the all scope keeps everything.
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(0));
+        assert_eq!(v["counters"]["total"], 1);
+        assert!(
+            v["recent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["cache_hit"] == false)
+        );
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        assert_eq!(v["counters"]["total"], 4);
+    }
+
+    #[test]
+    fn recent_rings_are_kept_per_scope() {
+        // Regression: the recent table used to be a single shared ring
+        // filtered by scope, so a filter's rows "disappeared" as soon
+        // as they rotated out of the shared window (e.g. mostly
+        // cache-hit traffic evicting a quiet backend's rows). Each
+        // scope must keep its own `max_recent` rows.
+        let d = DashboardPlugin::new(params(
+            json!({ "window_secs": 30, "bucket_secs": 10, "max_recent": 2 }),
+        ))
+        .unwrap();
+        let mut mk = |be: Option<usize>, hit: bool, ts: f64| {
+            let mut r = record(200);
+            r.backend = be;
+            r.cache_hit = Some(hit);
+            d.record_at(ts, &r).unwrap();
+        };
+        // Interleave the three scopes so every ring evicts old rows.
+        mk(Some(0), false, 100.0);
+        mk(Some(1), false, 105.0);
+        mk(None, true, 110.0);
+        mk(Some(0), false, 115.0);
+        mk(Some(1), false, 120.0);
+        mk(None, true, 125.0);
+
+        // All scopes: only the two newest rows.
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        let recent = v["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["ts"], 120.0);
+        assert_eq!(recent[1]["ts"], 125.0);
+
+        // Backend 0: its two rows survive although both rotated out of
+        // the all-backends ring (the reported "rows disappear" bug).
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(0));
+        let recent = v["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["ts"], 100.0);
+        assert_eq!(recent[1]["ts"], 115.0);
+        assert_eq!(recent[1]["backend"], 0);
+
+        // Backend 1: its two rows.
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(1));
+        let recent = v["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["ts"], 105.0);
+        assert_eq!(recent[1]["ts"], 120.0);
+
+        // Cached: its two hits.
+        let v = d.stats(&proxy(), Some(0), BackendScope::Cached);
+        let recent = v["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["ts"], 110.0);
+        assert_eq!(recent[1]["ts"], 125.0);
+        for r in recent {
+            assert_eq!(r["cache_hit"], true);
+            assert!(r["backend"].is_null());
+        }
     }
 
     #[test]
@@ -1300,7 +1815,7 @@ mod tests {
         for t in 0..1000u64 {
             d.record_at(t as f64, &record(200)).unwrap();
         }
-        let v = d.stats(&proxy(), Some(0));
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
         assert_eq!(v["range"]["counters"]["total"], 1000);
         // step = 1 s * ceil(1000/360) = 3 s; groups 0, 3, ..., 999 -> 334
         assert_eq!(v["series"]["bucket_secs"], 3);
@@ -1343,6 +1858,14 @@ mod tests {
             assert!(page.contains(&format!("value=\"{r}\"")), "filter {r}");
         }
         assert!(page.contains("id=\"custom-secs\""));
+        // the backend filter dropdown (options are filled from the
+        // proxy's backend list at render time)
+        assert!(page.contains("<select id=\"backend\""));
+        assert!(page.contains("<option value=\"\">all</option>"));
+        assert!(page.contains("renderBackendSel(p);"));
+        // the `cached` option (records served from the result cache) is
+        // added to the dropdown at render time
+        assert!(page.contains("value=\"cached\""));
         // no external assets (the inline SVG's `xmlns` namespace is not a
         // load — strip it before checking)
         assert!(
@@ -1362,7 +1885,15 @@ mod tests {
         let d = DashboardPlugin::new(params(json!({}))).unwrap();
         let page = d.html();
         // one canvas per throughput series
-        for id in ["chart-req", "chart-tok", "chart-cached", "chart-cpu"] {
+        for id in [
+            "chart-req",
+            "chart-tok",
+            "chart-cached",
+            "chart-cpu",
+            "chart-dr",
+            "chart-dw",
+            "chart-ram",
+        ] {
             assert!(page.contains(&format!("canvas id=\"{id}\"")), "canvas {id}");
         }
         // per-bar figure with adaptive stride, drawn above each bar
@@ -1391,9 +1922,33 @@ mod tests {
         assert!(page.contains("function attachChart(cv)"));
         assert!(
             page.contains(
-                "[\"chart-req\",\"chart-tok\",\"chart-cached\",\"chart-cpu\"].forEach(id=>attachChart($(id)));"
+                "[\"chart-req\",\"chart-tok\",\"chart-cached\",\"chart-cpu\",\"chart-dr\",\"chart-dw\",\"chart-ram\"].forEach(id=>attachChart($(id)));"
             ),
-            "hover handlers attached to all four charts"
+            "hover handlers attached to all seven charts"
         );
+        // the resource charts (cpu / disk read / disk write / peak ram)
+        // live in their own panel, separate from the throughput panel
+        let i_thr = page.find("<h2>throughput</h2>").unwrap();
+        let i_res = page.find("<h2>resources</h2>").unwrap();
+        let i_be = page.find("<h2>backends</h2>").unwrap();
+        let thr = &page[i_thr..i_res];
+        let res = &page[i_res..i_be];
+        for id in ["chart-req", "chart-tok", "chart-cached"] {
+            assert!(
+                thr.contains(&format!("canvas id=\"{id}\"")),
+                "canvas {id} in throughput"
+            );
+        }
+        assert!(
+            !thr.contains("chart-cpu"),
+            "cpu chart in the resources panel"
+        );
+        for id in ["chart-cpu", "chart-dr", "chart-dw", "chart-ram"] {
+            assert!(
+                res.contains(&format!("canvas id=\"{id}\"")),
+                "canvas {id} in resources"
+            );
+        }
+        assert!(!res.contains("canvas id=\"chart-req\""));
     }
 }

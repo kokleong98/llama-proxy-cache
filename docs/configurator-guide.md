@@ -312,7 +312,7 @@ Behaviour and worked examples:
 | `path` | text | `lpcache-request.log` | log file location; relative paths resolve against the proxy's cwd |
 | `max_bytes` | int ≥ 0 | `10485760` | rotation threshold; 0 = no rotation |
 | `keep` | int ≥ 0 | `5` | rotated generations kept; 0 = keep all |
-| `fields` | string list | all 31 | ordered subset of the 31 known XLF field names; **blank / omitted = all 31** — an explicit `[]` or a repeated field is a startup error |
+| `fields` | string list | all 33 | ordered subset of the 33 known XLF field names; **blank / omitted = all 33** — an explicit `[]` or a repeated field is a startup error |
 
 #### `dashboard` — real-time statistics web dashboard (singleton)
 
@@ -326,7 +326,7 @@ rather than clamped**:
 | `refresh_ms` | int 100..=3600000 | `2000` | page polling interval |
 | `window_secs` | int 10..=86400 | `300` | trailing stats window |
 | `bucket_secs` | int 1..=3600 | `5` | time-series bucket size |
-| `max_recent` | int 0..=10000 | `100` | recent-requests ring size; 0 = no recent list |
+| `max_recent` | int 0..=10000 | `100` | recent-requests ring size per backend scope; 0 = no recent list |
 
 #### `llama` — backend client (created automatically)
 

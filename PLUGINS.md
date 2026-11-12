@@ -348,7 +348,7 @@ Live results ([§6.6](#66-qwen_guard-fail-open--fail-closed)): with the guard do
   #Date-format: %Y-%m-%dT%H:%M:%S.%fZ
   #Fields: datetime cs-method cs-uri ... lpcache-reason
   ```
-- **Fields:** W3C-standard (`datetime`, `cs-method`, `cs-uri`, `c-ip`, `cs(User-Agent)`, `cs-bytes`, `cs-time`, `sc-status`, `sc-bytes`) plus the lpcache pipeline fields (`lpcache-model`, `lpcache-stream`, `lpcache-key`, `lpcache-n-words`, `lpcache-is-big`, `lpcache-backend`, `lpcache-slot`, `lpcache-restored`, `lpcache-cache-hit`, `lpcache-coalesced`, `lpcache-reason`) and the performance fields (`lpcache-prompt-tokens`, `lpcache-completion-tokens`, `lpcache-cached-tokens`, `lpcache-prefill-ms`, `lpcache-gen-ms`, `lpcache-prefill-tps`, `lpcache-gen-tps`, `lpcache-ttft-ms`).
+- **Fields:** W3C-standard (`datetime`, `cs-method`, `cs-uri`, `c-ip`, `cs(User-Agent)`, `cs-bytes`, `cs-time`, `sc-status`, `sc-bytes`) plus the lpcache pipeline fields (`lpcache-model`, `lpcache-stream`, `lpcache-key`, `lpcache-n-words`, `lpcache-is-big`, `lpcache-backend`, `lpcache-slot`, `lpcache-restored`, `lpcache-cache-hit`, `lpcache-coalesced`, `lpcache-reason`), the performance fields (`lpcache-prompt-tokens`, `lpcache-completion-tokens`, `lpcache-cached-tokens`, `lpcache-prefill-ms`, `lpcache-gen-ms`, `lpcache-prefill-tps`, `lpcache-gen-tps`, `lpcache-ttft-ms`) and the resource fields (`lpcache-cpu-ms`, `lpcache-disk-read-bytes`, `lpcache-disk-write-bytes`, `lpcache-ram-bytes`, `lpcache-peak-ram-bytes` — the proxy process's own CPU and disk-I/O consumption during the request, plus its resident memory and peak resident memory when the request completed; the first three are counter deltas, the last two point-in-time gauges; `-` where the platform cannot sample them).
 - **Values:** space-separated; a missing value is `-`; a value with whitespace/quote/backslash, or starting with `-`/`"`, is double-quoted with `\"`, `\\`, CR and LF escaped (XLF escaping rules).
 - **Concurrency:** writes are serialized; concurrent requests never lose or corrupt a line.
 - **Rotation:** when the current file exceeds `max_bytes` it is renamed to `<path>.1`, the existing `<path>.1` → `<path>.2`, …; at most `keep` rotated generations are retained (`0` = keep all). The fresh current file restarts with the XLF header.
@@ -362,7 +362,7 @@ Live results ([§6.6](#66-qwen_guard-fail-open--fail-closed)): with the guard do
 | `path` | `lpcache-request.log` | Log file location (relative → cwd; parent dir created) |
 | `max_bytes` | `10485760` (10 MiB) | Rotation threshold; `0` = no rotation |
 | `keep` | `5` | Rotated generations kept; `0` = keep all |
-| `fields` | all 31 | Ordered subset of the known XLF fields; omitted = all 31 in the default order. An empty list, an unknown field name, or a repeated field is a startup error (the error lists the known fields) |
+| `fields` | all 33 | Ordered subset of the known XLF fields; omitted = all 33 in the default order. An empty list, an unknown field name, or a repeated field is a startup error (the error lists the known fields) |
 
 **Example.**
 
@@ -380,12 +380,12 @@ Live result ([§6.5](#65-request_log-xlf-request-log)): every request — includ
 - When loaded, the proxy mounts two routes:
   - `GET {path}` — the page;
   - `GET {path}/api/stats` — the JSON payload: the proxy's live state (a `ProxyStatus` snapshot — version, uptime, model id, port, coalescing, thresholds, meta files, in-flight slots, per-backend and per-slot status, circuit-breaker state) **merged** with the plugin's aggregates.
-- The stats endpoint accepts `?since=<unix seconds>` to scope the aggregates to `[since, now]`; without it the payload is the lifetime counters plus the trailing `window_secs` series.
+- The stats endpoint accepts `?since=<unix seconds>` to scope the aggregates to `[since, now]` and `?backend=<index>` to restrict them to the records that ran on one backend, or `?backend=cached` to restrict them to the records served from the result cache (they never touch a backend); absent = all backends (no filtering, the default); without `?since` the payload is the lifetime counters plus the trailing `window_secs` series.
 - The plugin keeps in memory:
-  - **counters** — requests by status class, cache hits / hit-rate, KV restores, big/streamed requests, coalesced followers, token totals, process resource totals (CPU ms, disk bytes read/written — the proxy's own per-request deltas), average duration / TTFT / generation rate;
-  - **time series** — one bucket of `bucket_secs` covering the process lifetime, bounded by a hard cap (oldest dropped first); a long range is coarsened to a bounded number of points;
-  - **recent requests** — a ring buffer of the last `max_recent` finished requests.
-- The page polls every `refresh_ms` and renders stat cards, throughput charts, the backend table, a per-slot occupancy grid and the recent-requests table; a time-filter dropdown (presets + custom/all-time) scopes the cards/charts/table via `?since`.
+  - **counters** — requests by status class, cache hits / hit-rate, KV restores, big/streamed requests, coalesced followers, token totals, process resource totals (CPU ms, disk bytes read/written, peak resident memory — the proxy's own per-request deltas / gauges), average duration / TTFT / generation rate — kept for all backends, per backend index and for the cached-result scope (for the `?backend` filter);
+  - **time series** — one bucket of `bucket_secs` (full counters per bucket, plus per-backend and cached-scope sub-counters) covering the process lifetime, bounded by a hard cap (oldest dropped first); a long range is coarsened to a bounded number of points;
+  - **recent requests** — a ring buffer of the last `max_recent` finished requests (incl. the backend index of each); each backend scope (all, each index, `cached`) keeps its own ring, so a selected filter keeps showing that scope's recent rows even when they have rotated out of the all-backends ring.
+- The page polls every `refresh_ms` and renders stat cards, a throughput panel (requests / completion tokens / cached tokens charts), a resources panel (CPU ms / disk read / disk write / peak RAM charts), the backend table, a per-slot occupancy grid and the recent-requests table (with the backend index); a time-filter dropdown (presets + custom/all-time) and a backend-filter dropdown (default: `all` — no filtering; an index or the `cached` option for the result-cache records) scope the cards/charts/table via `?since` and `?backend`.
 - **Its own routes are excluded:** the page and stats requests are neither logged nor fed into the aggregates, so polling never inflates the statistics.
 - **Nothing is persisted:** all aggregates reset on proxy restart. **At most one** dashboard plugin may be configured.
 - **Strict params:** the only built-in that rejects **unknown params** — a typo'd param name is a startup error, so a bad dashboard config fails loudly instead of silently falling back to defaults (see [§2.5](#25-parameter-validation-and-startup-errors)).
@@ -398,7 +398,7 @@ Live result ([§6.5](#65-request_log-xlf-request-log)): every request — includ
 | `refresh_ms` | `2000` | Page polling interval (100..=3600000 ms) |
 | `window_secs` | `300` | Trailing window for a stats poll without `?since` (10..=86400 s) |
 | `bucket_secs` | `5` | Time-series bucket size (1..=3600 s) |
-| `max_recent` | `100` | Recent-requests ring size (0..=10000; `0` = no recent list) |
+| `max_recent` | `100` | Recent-requests ring size per backend scope (0..=10000; `0` = no recent list) |
 
 **Example.**
 
@@ -406,7 +406,7 @@ Live result ([§6.5](#65-request_log-xlf-request-log)): every request — includ
 { "name": "dashboard", "params": { "path": "/dashboard" } }
 ```
 
-Live result ([§6.7](#67-dashboard)): `GET /dashboard` returns an ~85 KB self-contained page titled "lpcache dashboard" (headings: throughput / backends / slots / recent requests); `GET /dashboard/api/stats` returns JSON with a `counters` object (`ok`, `client_errors`, `cache_hits`, `cache_hit_rate`, `tokens`, `resources` — the process CPU ms and disk bytes read/written, …) plus the live `proxy` snapshot.
+Live result ([§6.7](#67-dashboard)): `GET /dashboard` returns an ~85 KB self-contained page titled "lpcache dashboard" (headings: throughput / resources / backends / slots / recent requests; filter bar with time presets + a backend filter that defaults to "all"); `GET /dashboard/api/stats` returns JSON with a `counters` object (`ok`, `client_errors`, `cache_hits`, `cache_hit_rate`, `tokens`, `resources` — the process CPU ms, disk bytes read/written and peak RAM, …) plus the live `proxy` snapshot.
 
 ---
 
@@ -584,7 +584,7 @@ Every finished request appends one line. The file begins with the XLF header, th
 #Software: lpcache-plugins/0.1.0
 #Version: 1.0
 #Date-format: %Y-%m-%dT%H:%M:%S.%fZ
-#Fields: datetime cs-method cs-uri c-ip cs(User-Agent) cs-bytes cs-time sc-status sc-bytes lpcache-model lpcache-stream lpcache-key lpcache-n-words lpcache-is-big lpcache-backend lpcache-slot lpcache-restored lpcache-cache-hit lpcache-coalesced lpcache-reason lpcache-prompt-tokens lpcache-completion-tokens lpcache-cached-tokens lpcache-prefill-ms lpcache-gen-ms lpcache-prefill-tps lpcache-gen-tps lpcache-ttft-ms
+#Fields: datetime cs-method cs-uri c-ip cs(User-Agent) cs-bytes cs-time sc-status sc-bytes lpcache-model lpcache-stream lpcache-key lpcache-n-words lpcache-is-big lpcache-backend lpcache-slot lpcache-restored lpcache-cache-hit lpcache-coalesced lpcache-reason lpcache-prompt-tokens lpcache-completion-tokens lpcache-cached-tokens lpcache-prefill-ms lpcache-gen-ms lpcache-prefill-tps lpcache-gen-tps lpcache-ttft-ms lpcache-cpu-ms lpcache-disk-read-bytes lpcache-disk-write-bytes lpcache-ram-bytes lpcache-peak-ram-bytes
 ```
 
 Selected fields from three requests — a `keyword` rejection, a `result_cache` miss, and a `result_cache` hit (miss + hit share key `2466479e…`):
@@ -595,7 +595,7 @@ Selected fields from three requests — a `keyword` rejection, a `result_cache` 
 | `…:41.415Z` | 200 | `2466479e…` | 0 | false | `-` |
 | `…:43.432Z` | 200 | `2466479e…` | `-` | **true** | `-` |
 
-The hit row shows the short-circuit: `lpcache-slot=-` (no slot was acquired) and `lpcache-cache-hit=true`. The rejection row shows `lpcache-reason=prefilter_reject`. A successful backend row also carries the performance fields (`lpcache-prompt-tokens`, `lpcache-gen-ms`, `lpcache-gen-tps`, …) taken from llama-server's `usage`/`timings`.
+The hit row shows the short-circuit: `lpcache-slot=-` (no slot was acquired) and `lpcache-cache-hit=true`. The rejection row shows `lpcache-reason=prefilter_reject`. A successful backend row also carries the performance fields (`lpcache-prompt-tokens`, `lpcache-gen-ms`, `lpcache-gen-tps`, …) taken from llama-server's `usage`/`timings`, and the resource fields (`lpcache-cpu-ms`, `lpcache-disk-read-bytes`, `lpcache-disk-write-bytes`, `lpcache-ram-bytes`, `lpcache-peak-ram-bytes`) sampled from the proxy process itself.
 
 ### 6.6 `qwen_guard`: fail-open & fail-closed
 

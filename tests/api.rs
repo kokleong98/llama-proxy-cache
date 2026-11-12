@@ -2849,12 +2849,18 @@ async fn request_log_writes_xlf_record() {
     assert_eq!(rec["lpcache-prefill-tps"], "400.0");
     assert_eq!(rec["lpcache-gen-tps"], "333.3");
     assert_eq!(rec["lpcache-ttft-ms"], "-", "non-streaming has no ttft");
-    // resource fields: the proxy process's own CPU time and disk I/O
-    // (numeric wherever the platform can sample; the disk counters fall
-    // back to `-` on systems where they are unavailable).
+    // resource fields: the proxy process's own CPU time, disk I/O and
+    // resident memory (numeric wherever the platform can sample; the
+    // disk and memory counters fall back to `-` on systems where they
+    // are unavailable; the memory fields are point-in-time gauges).
     let cpu_ms: f64 = rec["lpcache-cpu-ms"].parse().expect("cpu-ms");
     assert!(cpu_ms >= 0.0, "cpu-ms: {}", rec["lpcache-cpu-ms"]);
-    for f in ["lpcache-disk-read-bytes", "lpcache-disk-write-bytes"] {
+    for f in [
+        "lpcache-disk-read-bytes",
+        "lpcache-disk-write-bytes",
+        "lpcache-ram-bytes",
+        "lpcache-peak-ram-bytes",
+    ] {
         assert!(
             rec[f] == "-" || rec[f].parse::<u64>().is_ok(),
             "{f}: {}",
@@ -2960,7 +2966,7 @@ async fn request_log_logs_failed_request_without_pipeline() {
 
 #[tokio::test]
 async fn request_log_rotates_and_bounds_keep() {
-    // max_bytes small enough that a few records rotate the file (the 28
+    // max_bytes small enough that a few records rotate the file (the 33
     // field names make each file header large, so the threshold sits
     // between one and a few records); keep=2 caps the rotated generations.
     let (state, _mock, _td, log_path) = make_state_request_log(2048, 2).await;
@@ -3133,6 +3139,20 @@ async fn dashboard_page_and_stats_reachable() {
     );
     // No external assets: no CDN links or scripts.
     assert!(!html.contains("https://"), "self-contained page");
+    // The filter bar: the time presets plus the backend filter (the
+    // default "all" option = no filtering — all statistics).
+    assert!(html.contains("<select id=\"backend\""), "backend filter");
+    assert!(
+        html.contains("<option value=\"\">all</option>"),
+        "default backend option"
+    );
+    // The `cached` option (result-cache records, no backend) is added to
+    // the dropdown at render time by the page's JS.
+    assert!(html.contains("value=\"cached\""), "cached backend option");
+    // The resource charts (cpu / disk / ram) are grouped in their own
+    // panel, separate from the throughput panel.
+    assert!(html.contains("<h2>throughput</h2>"), "throughput panel");
+    assert!(html.contains("<h2>resources</h2>"), "resources panel");
 
     // Anything else under the dashboard path is a 404.
     let resp = app.oneshot(get_req("/dashboard/nope")).await.expect("resp");
@@ -3155,7 +3175,15 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
     let html = String::from_utf8(bytes.to_vec()).expect("utf8");
 
     // one canvas per throughput series
-    for id in ["chart-req", "chart-tok", "chart-cached", "chart-cpu"] {
+    for id in [
+        "chart-req",
+        "chart-tok",
+        "chart-cached",
+        "chart-cpu",
+        "chart-dr",
+        "chart-dw",
+        "chart-ram",
+    ] {
         assert!(html.contains(&format!("canvas id=\"{id}\"")), "canvas {id}");
     }
     // per-bar figure with adaptive stride, drawn above each bar
@@ -3181,10 +3209,35 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
     // hover handlers attached to every chart canvas
     assert!(
         html.contains(
-            "[\"chart-req\",\"chart-tok\",\"chart-cached\",\"chart-cpu\"].forEach(id=>attachChart($(id)));"
+            "[\"chart-req\",\"chart-tok\",\"chart-cached\",\"chart-cpu\",\"chart-dr\",\"chart-dw\",\"chart-ram\"].forEach(id=>attachChart($(id)));"
         ),
-        "hover handlers attached to all four charts"
+        "hover handlers attached to all seven charts"
     );
+    // the resource charts live in their own panel: the throughput panel
+    // holds only the request/token charts, the resources panel holds the
+    // cpu / disk read / disk write / peak ram charts
+    let i_thr = html.find("<h2>throughput</h2>").unwrap();
+    let i_res = html.find("<h2>resources</h2>").unwrap();
+    let i_be = html.find("<h2>backends</h2>").unwrap();
+    let thr = &html[i_thr..i_res];
+    let res = &html[i_res..i_be];
+    for id in ["chart-req", "chart-tok", "chart-cached"] {
+        assert!(
+            thr.contains(&format!("canvas id=\"{id}\"")),
+            "canvas {id} in throughput"
+        );
+    }
+    assert!(
+        !thr.contains("chart-cpu"),
+        "cpu chart in the resources panel"
+    );
+    for id in ["chart-cpu", "chart-dr", "chart-dw", "chart-ram"] {
+        assert!(
+            res.contains(&format!("canvas id=\"{id}\"")),
+            "canvas {id} in resources"
+        );
+    }
+    assert!(!res.contains("canvas id=\"chart-req\""));
 }
 
 #[tokio::test]
@@ -3222,28 +3275,40 @@ async fn dashboard_counters_update_after_requests() {
     assert_eq!(v["counters"]["success_rate"], 0.5);
     assert_eq!(v["counters"]["big_requests"], 0);
     assert_eq!(v["counters"]["streamed"], 0);
-    // Process resource metrics (CPU ms + disk bytes) are sampled per
-    // request by the proxy itself, so the totals are present.
+    // Process resource metrics (CPU ms + disk bytes + RAM gauges) are
+    // sampled per request by the proxy itself, so the totals are present.
     assert!(v["counters"]["resources"]["cpu_ms"].as_f64().unwrap() >= 0.0);
     assert!(v["counters"]["resources"]["avg_cpu_ms"].as_f64().is_some());
     assert!(v["counters"]["resources"]["disk_read_bytes"].is_u64());
     assert!(v["counters"]["resources"]["disk_write_bytes"].is_u64());
-    // The time series holds the bucket both requests fell in.
+    assert!(v["counters"]["resources"]["ram_max_bytes"].is_u64());
+    assert!(v["counters"]["resources"]["peak_ram_bytes"].is_u64());
+    // The time series holds the bucket both requests fell in, with the
+    // per-bucket resource fields (the proxy samples every request).
     let buckets = v["series"]["buckets"].as_array().unwrap();
     assert_eq!(buckets.len(), 1);
     assert_eq!(buckets[0]["reqs"], 2);
+    assert!(buckets[0]["cpu_ms"].as_f64().unwrap() >= 0.0);
+    assert!(buckets[0]["disk_read_bytes"].is_u64());
+    assert!(buckets[0]["disk_write_bytes"].is_u64());
+    // the per-bucket peak RAM gauge (the proxy samples RSS on Linux)
+    assert!(buckets[0]["ram_bytes"].is_u64());
     assert_eq!(v["series"]["window_reqs"], 2);
     assert!(v["series"]["req_per_sec"].as_f64().unwrap() > 0.0);
     // Recent requests, oldest first (the page reverses them for display);
-    // no `path` column: the 404 has no model, the chat request does.
+    // no `path` column: the 404 has no model, the chat request does. The
+    // backend index is present when a slot was acquired (the 404 never
+    // reached a backend).
     let recent = v["recent"].as_array().unwrap();
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0]["status"], 200);
     assert_eq!(recent[0]["model"], "m1");
     assert_eq!(recent[0]["stream"], false);
     assert!(recent[0]["duration_secs"].as_f64().unwrap() >= 0.0);
+    assert_eq!(recent[0]["backend"], 0);
     assert_eq!(recent[1]["status"], 404);
     assert!(recent[1]["model"].is_null());
+    assert!(recent[1]["backend"].is_null());
 
     // The configured refresh interval reached the rendered page.
     let resp = app
@@ -3333,10 +3398,77 @@ async fn dashboard_stats_since_scopes_the_range() {
     assert_eq!(v["counters"]["total"], 2);
     assert_eq!(v["recent"].as_array().unwrap().len(), 2);
 
+    // The backend filter scopes the aggregates to one backend: only the
+    // chat request ran on backend 0 (the 404 never acquired a slot), and
+    // the lifetime counters follow the filter as well.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats?since=0&backend=0"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["counters"]["total"], 1);
+    assert_eq!(v["range"]["counters"]["total"], 1);
+    assert_eq!(v["range"]["counters"]["ok"], 1);
+    assert_eq!(v["range"]["counters"]["client_errors"], 0);
+    let buckets = v["series"]["buckets"].as_array().unwrap();
+    let reqs: u64 = buckets.iter().map(|b| b["reqs"].as_u64().unwrap()).sum();
+    assert_eq!(reqs, 1);
+    let recent = v["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0]["backend"], 0);
+
+    // A backend that never got traffic yields zero statistics (the
+    // series keeps the full timeline, all zero).
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats?since=0&backend=7"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["counters"]["total"], 0);
+    assert_eq!(v["range"]["counters"]["total"], 0);
+    let buckets = v["series"]["buckets"].as_array().unwrap();
+    assert!(!buckets.is_empty());
+    for b in buckets {
+        assert_eq!(b["reqs"], 0);
+    }
+    assert!(v["recent"].as_array().unwrap().is_empty());
+
+    // The `cached` scope selects the records served from the result
+    // cache. None of this test's requests were cache hits (and the 404
+    // never ran on a backend), so the scope is empty: zero counters, an
+    // all-zero timeline, an empty recent ring.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats?since=0&backend=cached"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["counters"]["total"], 0);
+    assert_eq!(v["range"]["counters"]["total"], 0);
+    let buckets = v["series"]["buckets"].as_array().unwrap();
+    assert!(!buckets.is_empty());
+    for b in buckets {
+        assert_eq!(b["reqs"], 0);
+    }
+    assert!(v["recent"].as_array().unwrap().is_empty());
+
     // A bad `since` value is rejected with a 400.
     let resp = app
         .clone()
         .oneshot(get_req("/dashboard/api/stats?since=abc"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 400);
+    drain(resp).await;
+
+    // A bad `backend` value is rejected with a 400 too.
+    let resp = app
+        .oneshot(get_req("/dashboard/api/stats?backend=abc"))
         .await
         .expect("resp");
     assert_eq!(resp.status(), 400);

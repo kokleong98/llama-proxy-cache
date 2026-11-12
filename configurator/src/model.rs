@@ -126,7 +126,7 @@ pub struct RequestLogConfig {
     pub max_bytes: u64,
     /// `REQUEST_LOG_KEEP`: rotated generations retained (`0` = keep all).
     pub keep: usize,
-    /// `REQUEST_LOG_FIELDS`: ordered subset of XLF fields (`[]` = all 31).
+    /// `REQUEST_LOG_FIELDS`: ordered subset of XLF fields (`[]` = all 33).
     pub fields: Vec<String>,
 }
 

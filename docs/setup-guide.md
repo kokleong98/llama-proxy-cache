@@ -156,7 +156,7 @@ Expected startup logs:
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
 slot_manager n_backends=2 total_slots=2
-app_start version=0.8.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
+app_start version=0.9.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
 
@@ -191,7 +191,7 @@ listening on 0.0.0.0:8081
 | `REQUEST_LOG_PATH`      | `lpcache-request.log`      | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
 | `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB)        | rotation threshold in bytes (`<path>.1`, `<path>.2`, …); `0` = no rotation |
 | `REQUEST_LOG_KEEP`      | `5`                        | rotated generations retained (the oldest is dropped); `0` = keep them all |
-| `REQUEST_LOG_FIELDS`    | all 31 fields              | comma-separated ordered subset of the known XLF field names (W3C + `lpcache-*` pipeline/performance/resource fields) |
+| `REQUEST_LOG_FIELDS`    | all 33 fields              | comma-separated ordered subset of the known XLF field names (W3C + `lpcache-*` pipeline/performance/resource fields) |
 
 Every variable also has a command-line flag; explicit flags take
 precedence over environment variables, which take precedence over the
@@ -325,14 +325,16 @@ stream, key, n-words, is-big, backend, slot, restored, cache-hit,
 coalesced, reason) and the `lpcache-*` performance fields (prompt /
 completion / cached tokens, prefill and generation time and throughput
 from the backend's `usage`/`timings`, plus the proxy-side time to first
-token). Missing values render as `-`.
+token) and the `lpcache-*` resource fields (the proxy process's own CPU
+time and disk I/O during the request, plus its resident memory and peak
+resident memory when the request completed). Missing values render as `-`.
 
 - **Rotation**: when the file grows beyond `REQUEST_LOG_MAX_BYTES`
   (default 10 MiB) it is rotated (`<path>.1`, `<path>.2`, …, each fresh
   file starting with a new XLF header) and at most
   `REQUEST_LOG_KEEP` (default 5) generations are kept; `0` for either
   disables rotation / keeps all generations. `REQUEST_LOG_FIELDS`
-  selects an ordered subset of the 31 known fields.
+  selects an ordered subset of the 33 known fields.
 - Logging never breaks request serving: log I/O failures are logged and
   swallowed.
 - The full field list and format details are in the
@@ -350,26 +352,39 @@ external assets — nothing to fetch from a CDN, so it works on
 air-gapped boxes). The proxy mounts the page at the plugin's `path`
 (default `/dashboard`) and its JSON stats endpoint at
 `{path}/api/stats` (optionally `?since=<unix seconds>` to scope the
-aggregates to a time range); the page polls it every `refresh_ms`
+aggregates to a time range and `?backend=<index|cached>` to restrict
+them to one backend or to the result-cache records — absent = all
+backends, the default); the page polls it
+every `refresh_ms`
 (default 2000) and shows:
 
 - **Time filter**: a dropdown of ranges, grouped into *presets* (30
   seconds, 1 minute, 5 minutes, 15 minutes) and *other* (custom time —
   a number of seconds — and all time) — that scopes the KPIs, charts
   and recent table to the selected range (default 5 minutes).
+- **Backend filter**: a dropdown of the proxy's backends, the `cached`
+  scope (the records served from the result cache — they never touch a
+  backend) and the default *all* (no filtering — every statistic
+  includes all of them) — that scopes the KPIs, charts and
+  recent table to the selected backend or cache scope. Each scope keeps
+  its own recent-requests ring, so a selected filter keeps showing that
+  scope's rows even when they have rotated out of the all-backends ring.
 - **KPIs**: total requests and success rate, cache-hit and KV-restore
   counts, slots in flight, active coalesced groups, request rate and
   completion token rate over the selected time range, KV meta files on
   disk, average duration / TTFT / backend generation rate, and the
-  proxy's own resource usage — average CPU ms (with the total) and disk
-  bytes read/written over the range.
-- **Charts**: bar charts of requests, completion tokens, cached
-  (restored) prompt tokens and CPU ms per `bucket_secs` bucket (default
-  5 s; long ranges are coarsened to at most 360 points automatically).
+  proxy's own resource usage — average CPU ms (with the total), disk
+  bytes read/written and peak RAM over the range.
+- **Charts**: two panels of bar charts per `bucket_secs` bucket
+  (default 5 s; long ranges are coarsened to at most 360 points
+  automatically): *throughput* — requests, completion tokens, cached
+  (restored) prompt tokens; and *resources* — the proxy's own CPU ms,
+  disk bytes read/written and peak RAM.
 - **Tables**: per-backend status (URL, slots, busy slots, circuit
   breaker state), per-slot occupancy grid, and the recent-requests ring
-  (`max_recent`, default 100: status, model, stream, tokens, timing,
-  pipeline outcome), filtered to the selected time range.
+  (`max_recent` per backend scope, default 100: status, backend, model,
+  stream, tokens, timing, per-request CPU, disk I/O and RAM, pipeline
+  outcome), filtered to the selected time range and backend scope.
 
 Every finished request (success, error, rejection, disconnect — the same
 records the request log gets) feeds the aggregates; the live
