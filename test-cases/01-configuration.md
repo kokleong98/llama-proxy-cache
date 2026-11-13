@@ -1,14 +1,14 @@
-# 1. Configuration — `src/config.rs` (37)
+# 1. Configuration — `src/config.rs` (38)
 
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (244 tests) runs with
+1:1 to a test function; the full suite (290 tests) runs with
 `cargo test --workspace`.
 
 ## Module overview
 
-- **Target:** `lpcache` library — the `mod tests` at the bottom of [`src/config.rs`](../src/config.rs); 37 tests, all synchronous `#[test]`.
+- **Target:** `lpcache` library — the `mod tests` at the bottom of [`src/config.rs`](../src/config.rs); 38 tests, all synchronous `#[test]`.
 - **Fixtures & helpers:**
   - `vars()` builds a plain `HashMap<String, String>` env map — tests call `Config::from_env_map` on it, so no process env is ever mutated.
   - `base_cfg()` builds a minimal all-default `Config` for exercising the builder methods.
@@ -18,7 +18,7 @@ Part of the [lpcache regression test cases](README.md): every entry maps
 ## How to run
 
 ```sh
-cargo test --lib config::tests                         # all 37 configuration tests
+cargo test --lib config::tests                         # all 38 configuration tests
 cargo test --lib config::tests::defaults_when_empty    # one test, exact path
 cargo test --lib defaults_when_empty                   # one test, name substring
 ```
@@ -47,7 +47,7 @@ into `cargo test` as shown above.
 | 17 | `config::tests::cli_help_flags` | sync | [L1156](../src/config.rs#L1156) | `--help` / `-h`, also among other options | `help` flag set |
 | 18 | `config::tests::cli_version_flags` | sync | [L1172](../src/config.rs#L1172) | `--version` / `-V`, also among other options | `version` flag set |
 | 19 | `config::tests::version_string_is_crate_name_and_version` | sync | [L1189](../src/config.rs#L1189) | `version_string()` output | starts with `lpcache `, ends with the crate version |
-| 20 | `config::tests::cli_usage_lists_all_flags_and_env_vars` | sync | [L1196](../src/config.rs#L1196) | completeness of `--help` text | all 22 flags and 20 env vars listed |
+| 20 | `config::tests::cli_usage_lists_all_flags_and_env_vars` | sync | [L1196](../src/config.rs#L1196) | completeness of `--help` text | all 23 flags and 21 env vars listed |
 | 21 | `config::tests::coalesce_requests_flag` | sync | [L1257](../src/config.rs#L1257) | `COALESCE_REQUESTS` env + CLI | off by default; `true`/`1` on; `0`/invalid off; CLI overrides env |
 | 22 | `config::tests::stream_queue_size_env_and_cli` | sync | [L1398](../src/config.rs#L1398) | `STREAM_QUEUE_SIZE` env + CLI | default 16; env `64` applied; `0` / invalid → default; CLI `--stream-queue-size 8` overrides env; builder clamps below 1 to 1 |
 | 23 | `config::tests::prefilter_env_and_cli` | sync | [L1468](../src/config.rs#L1468) | `PREFILTER_BLOCKLIST` / `PREFILTER_CASE_INSENSITIVE` env + CLI | default disabled (empty list, case-insensitive); comma list trimmed with empty entries dropped; blank list = disabled; invalid bool → default; CLI wins over env; synthesized `keyword` spec params (`keywords`, `case_insensitive`) |
@@ -65,6 +65,7 @@ into `cargo test` as shown above.
 | 35 | `config::tests::request_log_spec_synthesized_when_enabled` | sync | [L1716](../src/config.rs#L1716) | `Config::with_request_log` + a legacy blocklist; `plugin_specs()` | two specs: `keyword` first, then a `request_log` spec carrying `path`/`max_bytes`/`keep`/`fields` params; disabled → no `request_log` spec at all |
 | 36 | `config::tests::request_log_spec_in_plugins_wins` | sync | [L1739](../src/config.rs#L1739) | a `request_log` spec in `PLUGINS` **and** enabled `REQUEST_LOG*` settings | the explicit spec is used verbatim — the synthesized one is not appended; the spec alone enables logging even with `REQUEST_LOG` unset |
 | 37 | `config::tests::backends_kv_cache_flag` | sync | [L1064](../src/config.rs#L1064) | per-backend `kv_cache` field in `BACKENDS` | omitted `kv_cache` defaults to `true`; an explicit `false` is honored |
+| 38 | `config::tests::slot_routing_policy_env_and_cli` | sync | [L1345](../src/config.rs#L1345) | `SLOT_ROUTING_POLICY` env + CLI | `lru` by default; `key_affinity` on (case-insensitive, `key-affinity` alias accepted); invalid → default with a warning; CLI wins over env |
 
 ## Coverage map — configuration surface → tests
 
@@ -79,6 +80,7 @@ into `cargo test` as shown above.
 | `LLAMA_API_KEY` | `api_key_env` |
 | CLI mechanics | `cli_parses_space_form`, `cli_parses_equals_form`, `cli_equals_form_keeps_extra_equals_in_value`, `cli_flag_twice_last_wins`, `cli_unknown_flag_errors`, `cli_missing_value_errors`, `cli_help_flags`, `cli_version_flags`, `version_string_is_crate_name_and_version`, `cli_usage_lists_all_flags_and_env_vars` |
 | `COALESCE_REQUESTS` | `coalesce_requests_flag` |
+| `SLOT_ROUTING_POLICY` | `slot_routing_policy_env_and_cli` |
 | `STREAM_QUEUE_SIZE` | `stream_queue_size_env_and_cli` |
 | `PREFILTER_BLOCKLIST` / `PREFILTER_CASE_INSENSITIVE` | `prefilter_env_and_cli` |
 | `PREFILTER_RESULT_CACHE_DIR` / `PREFILTER_RESULT_CACHE_TTL` | `prefilter_result_cache_env_and_cli` |

@@ -506,6 +506,9 @@ pub struct ProxyStatus {
     pub port: u16,
     /// Whether concurrent-request coalescing is enabled.
     pub coalesce_requests: bool,
+    /// The active slot routing policy (`SLOT_ROUTING_POLICY`): `lru` or
+    /// `key_affinity`.
+    pub slot_routing_policy: String,
     /// The big-request word threshold (`BIG_THRESHOLD_WORDS`).
     pub big_threshold_words: usize,
     /// KV cache words per block (`WORDS_PER_BLOCK`).
@@ -543,6 +546,16 @@ pub enum BackendScope {
     /// hit): they are replayed without any backend call, so they carry
     /// no backend index.
     Cached,
+    /// Only the coalesced followers (`lpcache-coalesced: follower`): the
+    /// requests that joined an in-flight group and received the leader's
+    /// result without any backend call, so they carry no backend index
+    /// (the leaders count in their backend's scope, not here).
+    Coalesced,
+    /// Every request that was part of a coalesced group — the leader and
+    /// its followers (`lpcache-coalesced` set to `leader` or `follower`).
+    /// The leader also counts in its backend's scope: the scopes are
+    /// views over the records, not a partition of them.
+    CoalescedGroups,
 }
 
 /// A dashboard adapter: serves the proxy's real-time statistics as a web
@@ -586,18 +599,20 @@ pub trait Dashboard: Send + Sync {
     /// The current stats payload, served as JSON from `{path}/api/stats`,
     /// optionally range-scoped by `since` (unix seconds) and
     /// backend-scoped by `scope` ([`BackendScope::Backend`], a backend
-    /// index, or [`BackendScope::Cached`], the records served from the
-    /// result cache — [`BackendScope::All`] is the default, every
-    /// statistic includes everything): the proxy's live
+    /// index; [`BackendScope::Cached`], the records served from the
+    /// result cache; [`BackendScope::Coalesced`], the coalesced
+    /// followers; or [`BackendScope::CoalescedGroups`], the leader and
+    /// followers of the coalesced groups — [`BackendScope::All`] is the
+    /// default, every statistic includes everything): the proxy's live
     /// [`ProxyStatus`] merged with the plugin's aggregates over
     /// `[since, now]` and, when `scope` is not [`BackendScope::All`],
     /// restricted to the records of that scope. `since` of `None`
     /// selects the plugin's default aggregation (the built-in dashboard:
     /// lifetime counters plus the trailing `window_secs` series). The
     /// built-in dashboard's page polls with
-    /// `?since=<unix seconds>&backend=<index|cached>` so its time and
-    /// backend filters can scope the KPIs, charts and recent-requests
-    /// table.
+    /// `?since=<unix seconds>&backend=<index|cached|coalesced|coalesced_groups>`
+    /// so its time and backend filters can scope the KPIs, charts and
+    /// recent-requests table.
     fn stats(&self, proxy: &ProxyStatus, since: Option<u64>, scope: BackendScope) -> Value;
 
     /// Feed one finished request into the plugin's aggregates. Called

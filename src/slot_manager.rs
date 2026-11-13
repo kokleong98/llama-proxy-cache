@@ -1,19 +1,28 @@
 //! Slot management (port of `slot_manager.py`).
 //!
 //! - `GSlot = (backend_id, local_slot_id)`
-//! - selection: free (never used) first, in insertion order; otherwise the
-//!   least recently used slot (smallest `last_used` timestamp)
+//! - selection, per the `SLOT_ROUTING_POLICY` setting:
+//!   - `lru` (default): free (never used) slots first, in insertion order;
+//!     otherwise the least recently used slot (smallest `last_used`
+//!     timestamp)
+//!   - `key_affinity`: for a request that carries a KV restore key, an
+//!     idle slot already running that key is preferred before the
+//!     free/LRU tiers — the restore then becomes a zero-wire-call skip
 //! - each slot is guarded by a `Semaphore(1)` — the Rust equivalent of the
 //!   per-slot `asyncio.Lock`
 //! - `acquire` waits up to `acquire_timeout` (default 300 s, same as the
 //!   `asyncio.wait_for` wrapper in `app.py`) and restores before chat when a
-//!   restore key is given
+//!   restore key is given. Every slot also tracks the last KV cache it is
+//!   known to be running (a successful restore or save): a restore into a
+//!   slot already running the requested key is skipped (no backend call).
 //! - `save_after` saves the KV cache and updates the LRU timestamp; a
 //!   failed save (backend 500 or network/other error) is retried up to
 //!   `SAVE_RETRIES` times, waiting `SAVE_RETRY_DELAY_MS` milliseconds
 //!   between attempts
 
-use crate::config::{BackendConf, DEFAULT_SAVE_RETRIES, DEFAULT_SAVE_RETRY_DELAY_MS};
+use crate::config::{
+    BackendConf, DEFAULT_SAVE_RETRIES, DEFAULT_SAVE_RETRY_DELAY_MS, RoutingPolicy,
+};
 use lpcache_plugins::{BackendError, LlamaBackend, RestoreOutcome};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -51,7 +60,11 @@ pub struct AcquireTimeout;
 /// `acquire_for_request`.
 pub struct SlotGuard {
     pub slot: GSlot,
-    /// `Some(outcome)` when a restore was attempted before the chat.
+    /// `Some(outcome)` when a restore was attempted before the chat — or
+    /// when the picked slot was already running the requested KV cache and
+    /// the restore was skipped (in which case the outcome is `Restored`:
+    /// the slot effectively holds the cache, so the meta LRU touch and the
+    /// request log's restored flag still apply).
     pub restored: Option<RestoreOutcome>,
     /// Holds the slot lock until the guard is dropped / released.
     #[allow(dead_code)]
@@ -63,10 +76,29 @@ impl SlotGuard {
     pub fn release(self) {}
 }
 
+/// The tier that won in slot selection (for observability and tests): the
+/// routing policy walks these tiers in order and stops at the first slot
+/// that matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickReason {
+    /// An idle slot already running the requested KV cache key (the
+    /// `KeyAffinity` policy, with a restore key).
+    KeyFree,
+    /// An idle never-used slot in insertion order.
+    Free,
+    /// The least recently used slot (an idle one wins the tie-break).
+    Lru,
+}
+
 pub struct SlotManager {
     clients: Vec<Arc<dyn LlamaBackend>>,
     all: Vec<GSlot>,
     last_used: Vec<AtomicU64>,
+    /// One entry per slot: the last KV cache key the slot is known to be
+    /// running — set by a successful restore or a successful save, cleared
+    /// after a failed restore (the slot's KV state is then unknown).
+    /// `None` = unknown (fresh slot, or state invalidated).
+    last_kv: Vec<std::sync::Mutex<Option<String>>>,
     sems: Vec<Arc<tokio::sync::Semaphore>>,
     acquire_timeout: Duration,
     /// One entry per backend: nanosecond deadline until which the backend is
@@ -87,6 +119,9 @@ pub struct SlotManager {
     /// `SAVE_RETRY_DELAY_MS`: delay in milliseconds between save retry
     /// attempts.
     save_retry_delay: Duration,
+    /// `SLOT_ROUTING_POLICY`: how slots are picked for a request (default
+    /// `Lru`; `KeyAffinity` adds the key-free tier before free/LRU).
+    policy: RoutingPolicy,
 }
 
 impl SlotManager {
@@ -103,6 +138,8 @@ impl SlotManager {
             .flat_map(|(be, c)| (0..c.n_slots).map(move |slot| GSlot { be, slot }))
             .collect();
         let last_used: Vec<AtomicU64> = all.iter().map(|_| AtomicU64::new(0)).collect();
+        let last_kv: Vec<std::sync::Mutex<Option<String>>> =
+            all.iter().map(|_| std::sync::Mutex::new(None)).collect();
         let sems: Vec<Arc<tokio::sync::Semaphore>> = all
             .iter()
             .map(|_| Arc::new(tokio::sync::Semaphore::new(1)))
@@ -121,6 +158,7 @@ impl SlotManager {
             clients,
             all,
             last_used,
+            last_kv,
             sems,
             acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
             down_until,
@@ -129,6 +167,7 @@ impl SlotManager {
             kv_enabled,
             save_retries: DEFAULT_SAVE_RETRIES,
             save_retry_delay: Duration::from_millis(DEFAULT_SAVE_RETRY_DELAY_MS),
+            policy: RoutingPolicy::default(),
         }
     }
 
@@ -150,6 +189,13 @@ impl SlotManager {
     pub fn with_save_retry(mut self, retries: usize, delay: Duration) -> Self {
         self.save_retries = retries;
         self.save_retry_delay = delay;
+        self
+    }
+
+    /// Set the slot routing policy (`SLOT_ROUTING_POLICY`; the default,
+    /// `Lru`, keeps the original free-first/LRU pick).
+    pub fn with_routing_policy(mut self, policy: RoutingPolicy) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -298,18 +344,45 @@ impl SlotManager {
         self.last_used[self.idx(g)].load(Ordering::SeqCst)
     }
 
+    /// The KV cache key `g` is currently known to be running, if any
+    /// (see `last_kv`). The lock is only held for the copy — never across
+    /// an `.await`.
+    fn slot_kv_key(&self, g: GSlot) -> Option<String> {
+        self.last_kv[self.idx(g)].lock().unwrap().clone()
+    }
+
+    /// Update the KV cache key `g` is considered to be running: `Some(key)`
+    /// after a successful restore or save of `key`, `None` to forget.
+    fn set_slot_kv_key(&self, g: GSlot, key: Option<&str>) {
+        *self.last_kv[self.idx(g)].lock().unwrap() = key.map(str::to_string);
+    }
+
+    /// Test hook: the KV cache key `g` is currently considered to be
+    /// running, if any.
+    #[cfg(test)]
+    pub(crate) fn last_kv_for_test(&self, g: GSlot) -> Option<String> {
+        self.slot_kv_key(g)
+    }
+
     /// Free (never used) slots first in insertion order; otherwise the
     /// least recently used one (port of `_get_free_or_oldest`). Panics only
     /// if the pool is empty (impossible: every backend has n_slots >= 1).
     fn pick(&self) -> GSlot {
-        self.pick_filtered(|_| true)
+        self.pick_filtered(|_| true, None)
+            .map(|(g, _)| g)
             .expect("at least one slot is eligible (fail-open)")
     }
 
     /// Slot selection core (used by [`pick`] and [`SlotManager::acquire_excluding`]).
     ///
-    /// Free (never used) slots first in insertion order; otherwise the
-    /// least recently used one (port of `_get_free_or_oldest`).
+    /// Tiers, in order:
+    /// - [`PickReason::KeyFree`] — only when `key_free` is `Some(key)` (the
+    ///   `key_affinity` routing policy with a restore key): an idle slot
+    ///   already running `key`, in insertion order. The post-pick restore is
+    ///   then a zero-wire-call skip.
+    /// - [`PickReason::Free`] — idle never-used slots in insertion order;
+    /// - [`PickReason::Lru`] — otherwise the least recently used one (port
+    ///   of `_get_free_or_oldest`).
     ///
     /// Circuit breaker: slots of backends still in cooldown are skipped —
     /// unless every backend is cooling down, in which case all slots are
@@ -324,7 +397,11 @@ impl SlotManager {
     ///
     /// `extra` is an additional per-slot filter (e.g. "not the backend
     /// that just failed"); `None` when nothing passes it.
-    fn pick_filtered<F: Fn(&GSlot) -> bool>(&self, extra: F) -> Option<GSlot> {
+    fn pick_filtered<F: Fn(&GSlot) -> bool>(
+        &self,
+        extra: F,
+        key_free: Option<&str>,
+    ) -> Option<(GSlot, PickReason)> {
         let now = now_nanos();
         let any_up = self.down_until.iter().any(|d| {
             let u = d.load(Ordering::SeqCst);
@@ -335,13 +412,27 @@ impl SlotManager {
             (u == 0 || now >= u || !any_up) && extra(g)
         };
         let idle = |g: &GSlot| self.sems[self.idx(*g)].available_permits() > 0;
+        // Tier 1: an idle slot already running the requested key. (A slot
+        // only knows a key after a successful restore/save, so it is by
+        // definition a used slot — the "never used" condition of the free
+        // tier would make this tier dead.)
+        if let Some(key) = key_free
+            && let Some(g) = self
+                .all
+                .iter()
+                .find(|g| eligible(g) && idle(g) && self.slot_kv_key(**g).as_deref() == Some(key))
+        {
+            return Some((*g, PickReason::KeyFree));
+        }
+        // Tier 2: idle never-used slots in insertion order.
         if let Some(g) = self
             .all
             .iter()
             .find(|g| eligible(g) && idle(g) && self.last_used_of(**g) == 0)
         {
-            return Some(*g);
+            return Some((*g, PickReason::Free));
         }
+        // Tier 3: least recently used, idle slots first.
         let mut best: Option<(GSlot, u64, bool)> = None;
         for &g in &self.all {
             if !eligible(&g) {
@@ -359,7 +450,7 @@ impl SlotManager {
                 _ => {}
             }
         }
-        best.map(|(g, _, _)| g)
+        best.map(|(g, _, _)| (g, PickReason::Lru))
     }
 
     /// Select the slot for an acquire that may carry a KV restore.
@@ -369,12 +460,17 @@ impl SlotManager {
     /// slot of an enabled backend is eligible, the restore key is dropped
     /// (warned) and a plain pick is made: the request runs a full prefill
     /// instead of failing.
+    ///
+    /// Under the `key_affinity` routing policy, the pick additionally
+    /// prefers an idle slot already running the key (the key-free tier), so
+    /// the restore becomes a zero-wire-call skip.
     fn pick_for_acquire<'a>(&self, restore_key: Option<&'a str>) -> (GSlot, Option<&'a str>) {
         let Some(key) = restore_key else {
             return (self.pick(), None);
         };
-        match self.pick_filtered(|g| self.kv_enabled[g.be]) {
-            Some(g) => (g, Some(key)),
+        let key_free = (self.policy == RoutingPolicy::KeyAffinity).then_some(key);
+        match self.pick_filtered(|g| self.kv_enabled[g.be], key_free) {
+            Some((g, _)) => (g, Some(key)),
             None => {
                 tracing::warn!("restore_skipped key={key} reason=no_kv_enabled_backend");
                 (self.pick(), None)
@@ -400,10 +496,17 @@ impl SlotManager {
     ) -> Result<SlotGuard, AcquireTimeout> {
         let (g, restore) = match restore_key {
             Some(key) => {
-                match self.pick_filtered(|c: &GSlot| c.be != exclude_be && self.kv_enabled[c.be]) {
-                    Some(g) => (g, Some(key)),
+                let key_free = (self.policy == RoutingPolicy::KeyAffinity).then_some(key);
+                match self.pick_filtered(
+                    |c: &GSlot| c.be != exclude_be && self.kv_enabled[c.be],
+                    key_free,
+                ) {
+                    Some((g, _)) => (g, Some(key)),
                     None => {
-                        let Some(g) = self.pick_filtered(|c: &GSlot| c.be != exclude_be) else {
+                        let Some(g) = self
+                            .pick_filtered(|c: &GSlot| c.be != exclude_be, None)
+                            .map(|(g, _)| g)
+                        else {
                             tracing::warn!(
                                 "acquire_excluding be={exclude_be} no other backend available"
                             );
@@ -415,7 +518,10 @@ impl SlotManager {
                 }
             }
             None => {
-                let Some(g) = self.pick_filtered(|c: &GSlot| c.be != exclude_be) else {
+                let Some(g) = self
+                    .pick_filtered(|c: &GSlot| c.be != exclude_be, None)
+                    .map(|(g, _)| g)
+                else {
                     tracing::warn!("acquire_excluding be={exclude_be} no other backend available");
                     return Err(AcquireTimeout);
                 };
@@ -453,13 +559,31 @@ impl SlotManager {
             permit,
         };
         if let Some(key) = restore_key {
-            let outcome = self.clients[g.be].restore_slot(g.slot, key).await;
-            tracing::info!(
-                "restore_before_chat g={g} key={} ok={}",
-                short(key),
-                matches!(outcome, RestoreOutcome::Restored)
-            );
-            guard.restored = Some(outcome);
+            // The slot is already running this exact KV cache (a previous
+            // restore or save left it there): skip the backend call entirely
+            // and count the acquire as restored, so the meta LRU touch and
+            // the request log's restored flag still apply.
+            if self.slot_kv_key(g).as_deref() == Some(key) {
+                tracing::info!(
+                    "restore_skipped g={g} key={} reason=already_running",
+                    short(key)
+                );
+                guard.restored = Some(RestoreOutcome::Restored);
+            } else {
+                let outcome = self.clients[g.be].restore_slot(g.slot, key).await;
+                tracing::info!(
+                    "restore_before_chat g={g} key={} ok={}",
+                    short(key),
+                    matches!(outcome, RestoreOutcome::Restored)
+                );
+                match outcome {
+                    RestoreOutcome::Restored => self.set_slot_kv_key(g, Some(key)),
+                    // Rejected/Failed: the slot's KV state is unknown now —
+                    // forget what we thought it was running.
+                    _ => self.set_slot_kv_key(g, None),
+                }
+                guard.restored = Some(outcome);
+            }
         }
         Ok(guard)
     }
@@ -474,6 +598,11 @@ impl SlotManager {
     /// all attempts, `Err` when every attempt errored (the caller maps that
     /// to a 500, as in the Python app). The slot is marked used on any
     /// `Ok` outcome (including `Ok(false)`), as before.
+    ///
+    /// On a successful save the slot's KV cache is exactly `key`, so the
+    /// per-slot tracking is updated to it (a later restore of the same key
+    /// into this slot is then skipped); a failed save leaves the tracking
+    /// untouched (the slot's KV is unchanged by a save attempt).
     pub async fn save_after(&self, g: GSlot, key: &str) -> Result<bool, BackendError> {
         let mut last = self.clients[g.be].save_slot(g.slot, key).await;
         let mut attempt = 0;
@@ -493,8 +622,17 @@ impl SlotManager {
             tokio::time::sleep(self.save_retry_delay).await;
             last = self.clients[g.be].save_slot(g.slot, key).await;
         }
-        if last.is_ok() {
-            self.last_used[self.idx(g)].store(now_nanos(), Ordering::SeqCst);
+        match &last {
+            Ok(true) => {
+                self.last_used[self.idx(g)].store(now_nanos(), Ordering::SeqCst);
+                self.set_slot_kv_key(g, Some(key));
+            }
+            Ok(false) => {
+                // backend 500: the slot is marked used as before, but the KV
+                // save did not land — the tracking stays as it was
+                self.last_used[self.idx(g)].store(now_nanos(), Ordering::SeqCst);
+            }
+            Err(_) => {}
         }
         last
     }
@@ -650,6 +788,33 @@ mod tests {
         (sm, raw)
     }
 
+    /// Like [`make`], but with the given slot routing policy.
+    fn make_policy(
+        n_backends: usize,
+        n_slots: usize,
+        policy: RoutingPolicy,
+    ) -> (Arc<SlotManager>, Vec<Arc<TestClient>>) {
+        let backends: Vec<BackendConf> = (0..n_backends)
+            .map(|i| BackendConf {
+                url: format!("http://b{i}"),
+                n_slots,
+                slot_save_path: None,
+                kv_cache: true,
+            })
+            .collect();
+        let raw: Vec<Arc<TestClient>> = (0..n_backends).map(|_| TestClient::new()).collect();
+        let clients: Vec<Arc<dyn LlamaBackend>> = raw
+            .iter()
+            .map(|c| Arc::clone(c) as Arc<dyn LlamaBackend>)
+            .collect();
+        let sm = Arc::new(
+            SlotManager::new(&backends, clients)
+                .with_save_retry(DEFAULT_SAVE_RETRIES, Duration::from_millis(1))
+                .with_routing_policy(policy),
+        );
+        (sm, raw)
+    }
+
     #[tokio::test]
     async fn free_slot_picked_first_in_order() {
         let (sm, _) = make(1, 3);
@@ -689,6 +854,76 @@ mod tests {
         assert_eq!(g.slot, GSlot { be: 1, slot: 0 });
         sm.release(g);
     }
+
+    /// Shared setup for the routing-policy tests: slot 0 runs "k" (older),
+    /// slot 1 runs "other" (younger) — under `lru`, a repeat of "k" would
+    /// be picked on slot 1 (the LRU slot) and need a real restore.
+    async fn two_slots_with_keys(sm: &Arc<SlotManager>) {
+        let g1 = sm.acquire(Some("k")).await.unwrap();
+        assert_eq!(g1.slot, GSlot { be: 0, slot: 0 });
+        let s1 = g1.slot;
+        sm.release(g1);
+        sm.mark_used(s1);
+        let g2 = sm.acquire(Some("other")).await.unwrap();
+        assert_eq!(g2.slot, GSlot { be: 0, slot: 1 });
+        let s2 = g2.slot;
+        sm.release(g2);
+        sm.mark_used(s2);
+        // make slot 1 the LRU pick (slot 0 is "newer")
+        sm.set_last_used_for_test(GSlot { be: 0, slot: 0 }, 1000);
+        sm.set_last_used_for_test(GSlot { be: 0, slot: 1 }, 500);
+    }
+
+    #[tokio::test]
+    async fn key_affinity_picks_idle_slot_running_key() {
+        let (sm, raw) = make_policy(1, 2, RoutingPolicy::KeyAffinity);
+        two_slots_with_keys(&sm).await;
+        // key_affinity: the idle slot running "k" wins before the LRU tier
+        let g = sm.acquire(Some("k")).await.unwrap();
+        assert_eq!(
+            g.slot,
+            GSlot { be: 0, slot: 0 },
+            "the key-affinity pick must prefer the slot running the key"
+        );
+        // the post-pick skip counts as restored...
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        // ...but issues no redundant restore wire call (2 = the two
+        // restores of the setup)
+        assert_eq!(raw[0].restores.lock().await.len(), 2);
+        sm.release(g);
+    }
+
+    #[tokio::test]
+    async fn lru_policy_ignores_key_on_pick() {
+        let (sm, raw) = make_policy(1, 2, RoutingPolicy::Lru);
+        two_slots_with_keys(&sm).await;
+        // lru (the default): the key never influences the pick — the
+        // oldest slot (slot 1, running "other") wins and the restore is
+        // actually issued there
+        let g = sm.acquire(Some("k")).await.unwrap();
+        assert_eq!(
+            g.slot,
+            GSlot { be: 0, slot: 1 },
+            "the lru pick must ignore the key"
+        );
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        assert_eq!(raw[0].restores.lock().await.len(), 3);
+        sm.release(g);
+    }
+
+    #[tokio::test]
+    async fn key_affinity_without_key_matches_lru_pick() {
+        // no restore key: the policy has no effect (free-first ordering)
+        let (sm, raw) = make_policy(1, 2, RoutingPolicy::KeyAffinity);
+        let g1 = sm.acquire(None).await.unwrap();
+        let s1 = g1.slot;
+        sm.release(g1);
+        sm.mark_used(s1);
+        let g2 = sm.acquire(None).await.unwrap();
+        assert_eq!(g2.slot, GSlot { be: 0, slot: 1 }, "free slot first");
+        assert!(raw[0].restores.lock().await.is_empty());
+        sm.release(g2);
+    }
     #[tokio::test]
     async fn restore_called_only_when_key_given() {
         let (sm, raw) = make(1, 2);
@@ -712,6 +947,90 @@ mod tests {
         let g = sm.acquire(Some("k2")).await.unwrap();
         assert_eq!(g.restored, Some(RestoreOutcome::Failed));
         sm.release(g);
+    }
+
+    #[tokio::test]
+    async fn restore_skipped_when_slot_already_running_key() {
+        let (sm, raw) = make(1, 2);
+        // first acquire: slot 0 does not run k1 yet -> the restore is issued
+        let g = sm.acquire(Some("k1")).await.unwrap();
+        assert_eq!(g.slot, GSlot { be: 0, slot: 0 });
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        sm.release(g);
+        // second acquire, same key: the slot is already running k1 (the
+        // successful restore recorded it) -> no second backend call, but the
+        // guard still reports the slot as restored
+        let g = sm.acquire(Some("k1")).await.unwrap();
+        assert_eq!(g.slot, GSlot { be: 0, slot: 0 });
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        sm.release(g);
+        assert_eq!(
+            *raw[0].restores.lock().await,
+            vec![(0usize, "k1".to_string())]
+        );
+        // a different key is never skipped
+        let g = sm.acquire(Some("k2")).await.unwrap();
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        sm.release(g);
+        assert_eq!(
+            *raw[0].restores.lock().await,
+            vec![(0usize, "k1".to_string()), (0usize, "k2".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn save_updates_last_kv_tracking() {
+        let (sm, raw) = make(1, 1);
+        // a successful save leaves the slot running exactly `key`
+        assert!(sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap());
+        assert_eq!(
+            sm.last_kv_for_test(GSlot { be: 0, slot: 0 }),
+            Some("k1".to_string())
+        );
+        // a later restore of the same key into the same slot is skipped
+        let g = sm.acquire(Some("k1")).await.unwrap();
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        sm.release(g);
+        assert!(raw[0].restores.lock().await.is_empty());
+        // ... but a different key is still restored
+        let g = sm.acquire(Some("k2")).await.unwrap();
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        sm.release(g);
+        assert_eq!(
+            *raw[0].restores.lock().await,
+            vec![(0usize, "k2".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_restore_forgets_last_kv_tracking() {
+        let (sm, raw) = make(1, 1);
+        // a failed restore leaves the slot's KV state unknown -> the
+        // tracking must be cleared so a later restore of the same key is
+        // not wrongly skipped
+        raw[0]
+            .restore_ok
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let g = sm.acquire(Some("k1")).await.unwrap();
+        assert_eq!(g.restored, Some(RestoreOutcome::Failed));
+        sm.release(g);
+        assert_eq!(sm.last_kv_for_test(GSlot { be: 0, slot: 0 }), None);
+        raw[0]
+            .restore_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let g = sm.acquire(Some("k1")).await.unwrap();
+        assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        sm.release(g);
+        // both attempts reached the backend (the first failed, the second
+        // was re-issued because the tracking had been cleared)
+        assert_eq!(
+            *raw[0].restores.lock().await,
+            vec![(0usize, "k1".to_string()), (0usize, "k1".to_string())]
+        );
+        assert_eq!(
+            sm.last_kv_for_test(GSlot { be: 0, slot: 0 }),
+            Some("k1".to_string())
+        );
     }
 
     #[tokio::test]

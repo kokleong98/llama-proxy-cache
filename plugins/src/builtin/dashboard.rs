@@ -13,8 +13,12 @@
 //!   scopes the aggregates to `[since, now]` and `?backend=<index>`
 //!   restricts them to the records that ran on one backend, while
 //!   `?backend=cached` restricts them to the records served from the
-//!   result cache (they never touch a backend); absent = all backends
-//!   — no filtering, every statistic includes all of them; without
+//!   result cache (they never touch a backend), `?backend=coalesced` to
+//!   the coalesced followers (they joined an in-flight group and never
+//!   touch a backend) and `?backend=coalesced_groups` to every request
+//!   of the coalesced groups (leader and followers); absent = all
+//!   backends — no filtering, every statistic includes all of them;
+//!   without
 //!   `?since` the payload is the lifetime counters plus
 //!   the trailing `window_secs` series.
 //!
@@ -40,7 +44,8 @@
 //! - **recent requests** — a ring buffer of the last `max_recent`
 //!   finished requests (status, backend index, duration, key, flags,
 //!   tokens, timings); each backend scope (all backends, each backend
-//!   index and the `cached` scope) keeps its own ring, so selecting a
+//!   index, the `cached` scope, the `coalesced` scope and the
+//!   `coalesced_groups` scope) keeps its own ring, so selecting a
 //!   filter keeps showing that scope's recent rows even after they have
 //!   rotated out of the all-backends ring.
 //!
@@ -53,10 +58,13 @@
 //! time-filter dropdown, grouped into presets (30 seconds, 1 minute, 5
 //! minutes, 15 minutes) and other (custom time, or all time), and a
 //! backend-filter dropdown (default: all backends — no filtering; an
-//! index or the `cached` option for the records served from the result
-//! cache) scope
+//! index, the `cached` option for the records served from the result
+//! cache, the `coalesced` option for the coalesced followers or the
+//! `coalesced_groups` option for the whole coalesced groups) scope
 //! the cards, charts and recent table to the selected range and backend
-//! by polling with `?since=<unix seconds>&backend=<index|cached>`. All
+//! by polling with
+//! `?since=<unix seconds>&backend=<index|cached|coalesced|coalesced_groups>`.
+//! All
 //! aggregates reset on proxy restart; nothing is persisted.
 //!
 //! Params:
@@ -205,6 +213,13 @@ pub struct Bucket {
     /// series (the records served from the result cache, which never
     /// touch a backend).
     pub cached: Counters,
+    /// Coalesced-follower sub-counters: the `?backend=coalesced` view of
+    /// the series (the records that joined an in-flight group and never
+    /// touch a backend).
+    pub coalesced: Counters,
+    /// Coalesced-group sub-counters: the `?backend=coalesced_groups`
+    /// view of the series (the leaders and followers of the groups).
+    pub coalesced_groups: Counters,
 }
 
 impl Bucket {
@@ -214,12 +229,16 @@ impl Bucket {
             c: Counters::default(),
             by_be: Vec::new(),
             cached: Counters::default(),
+            coalesced: Counters::default(),
+            coalesced_groups: Counters::default(),
         }
     }
 
     /// Fold one finished record into the bucket (total and, when the
     /// record ran on a backend, that backend's sub-counters; when it was
-    /// served from the result cache, the cached-result sub-counters).
+    /// served from the result cache, the cached-result sub-counters;
+    /// when it was a coalesced follower or part of a coalesced group,
+    /// those sub-counters).
     fn add(&mut self, record: &RequestLogRecord) {
         self.c.add(record);
         if let Some(be) = record.backend {
@@ -230,6 +249,12 @@ impl Bucket {
         }
         if record.cache_hit == Some(true) {
             self.cached.add(record);
+        }
+        if record.coalesced == Some("follower") {
+            self.coalesced.add(record);
+        }
+        if record.coalesced.is_some() {
+            self.coalesced_groups.add(record);
         }
     }
 }
@@ -445,6 +470,28 @@ impl Counters {
         c
     }
 
+    /// The sum of the coalesced-follower sub-counters over the given
+    /// buckets (the `?backend=coalesced` counters of the range they
+    /// cover).
+    pub fn sum_coalesced<'a>(buckets: impl Iterator<Item = &'a Bucket>) -> Counters {
+        let mut c = Counters::default();
+        for b in buckets {
+            c.merge(&b.coalesced);
+        }
+        c
+    }
+
+    /// The sum of the coalesced-group sub-counters over the given
+    /// buckets (the `?backend=coalesced_groups` counters of the range
+    /// they cover).
+    pub fn sum_coalesced_groups<'a>(buckets: impl Iterator<Item = &'a Bucket>) -> Counters {
+        let mut c = Counters::default();
+        for b in buckets {
+            c.merge(&b.coalesced_groups);
+        }
+        c
+    }
+
     fn avg(n: u64, sum: f64) -> Option<f64> {
         if n == 0 { None } else { Some(sum / n as f64) }
     }
@@ -503,12 +550,16 @@ fn counters_point(t: u64, c: &Counters) -> Value {
 
 /// The counter set of one bucket for the selected backend scope
 /// (`All` = the bucket total; a backend with no traffic in the bucket
-/// has none; `Cached` = the bucket's cached-result sub-counters).
+/// has none; `Cached` = the bucket's cached-result sub-counters;
+/// `Coalesced` = its coalesced-follower sub-counters;
+/// `CoalescedGroups` = its coalesced-group sub-counters).
 fn bucket_counters(b: &Bucket, scope: BackendScope) -> Option<&Counters> {
     match scope {
         BackendScope::All => Some(&b.c),
         BackendScope::Backend(i) => b.by_be.get(i),
         BackendScope::Cached => Some(&b.cached),
+        BackendScope::Coalesced => Some(&b.coalesced),
+        BackendScope::CoalescedGroups => Some(&b.coalesced_groups),
     }
 }
 
@@ -526,6 +577,16 @@ pub struct Inner {
     /// result cache — they never touch a backend, so they never count
     /// into `by_be`).
     pub cached: Counters,
+    /// Lifetime coalesced-follower counters (parallel to `counters`):
+    /// the `?backend=coalesced` lifetime view (the records that joined
+    /// an in-flight group — they never touch a backend, so they never
+    /// count into `by_be`).
+    pub coalesced: Counters,
+    /// Lifetime coalesced-group counters (parallel to `counters`): the
+    /// `?backend=coalesced_groups` lifetime view (the leaders and
+    /// followers of the groups; the leaders also count into their
+    /// backend's counters — the scopes are views, not a partition).
+    pub coalesced_groups: Counters,
     /// Time-series buckets, oldest first, covering the trailing window.
     pub buckets: Vec<Bucket>,
     /// The `max_recent` most recent finished requests (all scopes),
@@ -535,6 +596,14 @@ pub struct Inner {
     /// (the `?backend=cached` recent view — the hits carry no backend
     /// index, so they live in their own ring).
     pub recent_cached: Vec<RecentRow>,
+    /// The `max_recent` most recent coalesced followers, oldest first
+    /// (the `?backend=coalesced` recent view — the followers carry no
+    /// backend index, so they live in their own ring).
+    pub recent_coalesced: Vec<RecentRow>,
+    /// The `max_recent` most recent requests of coalesced groups (the
+    /// leaders and the followers), oldest first (the
+    /// `?backend=coalesced_groups` recent view).
+    pub recent_coalesced_groups: Vec<RecentRow>,
     /// The `max_recent` most recent requests per backend index
     /// (parallel to `by_be`, oldest first): the `?backend=<i>` recent
     /// view. Each scope keeps its own ring, so a filter's rows are not
@@ -563,6 +632,12 @@ impl Inner {
         }
         if record.cache_hit == Some(true) {
             self.cached.add(record);
+        }
+        if record.coalesced == Some("follower") {
+            self.coalesced.add(record);
+        }
+        if record.coalesced.is_some() {
+            self.coalesced_groups.add(record);
         }
         let t = (now / bucket_secs) * bucket_secs;
         match self.buckets.last_mut() {
@@ -609,6 +684,12 @@ impl Inner {
             push_recent(&mut self.recent, row.clone(), max_recent);
             if record.cache_hit == Some(true) {
                 push_recent(&mut self.recent_cached, row.clone(), max_recent);
+            }
+            if record.coalesced == Some("follower") {
+                push_recent(&mut self.recent_coalesced, row.clone(), max_recent);
+            }
+            if record.coalesced.is_some() {
+                push_recent(&mut self.recent_coalesced_groups, row.clone(), max_recent);
             }
             if let Some(be) = record.backend {
                 if be >= self.recent_by_be.len() {
@@ -745,6 +826,8 @@ impl DashboardPlugin {
             BackendScope::All => inner.counters.clone(),
             BackendScope::Backend(b) => inner.by_be.get(b).cloned().unwrap_or_default(),
             BackendScope::Cached => inner.cached.clone(),
+            BackendScope::Coalesced => inner.coalesced.clone(),
+            BackendScope::CoalescedGroups => inner.coalesced_groups.clone(),
         };
         let payload = json!({
             "version": proxy.version,
@@ -770,6 +853,10 @@ impl DashboardPlugin {
                         BackendScope::All => Counters::sum(range_buckets.iter()),
                         BackendScope::Backend(b) => Counters::sum_for(range_buckets.iter(), b),
                         BackendScope::Cached => Counters::sum_cached(range_buckets.iter()),
+                        BackendScope::Coalesced => Counters::sum_coalesced(range_buckets.iter()),
+                        BackendScope::CoalescedGroups => {
+                            Counters::sum_coalesced_groups(range_buckets.iter())
+                        }
                     }
                 };
                 let (step, points) = Self::series_points(range_buckets, self.bucket_secs, scope);
@@ -825,6 +912,8 @@ impl DashboardPlugin {
         let recent: &[RecentRow] = match scope {
             BackendScope::Backend(b) => inner.recent_by_be.get(b).map_or(&[], Vec::as_slice),
             BackendScope::Cached => &inner.recent_cached,
+            BackendScope::Coalesced => &inner.recent_coalesced,
+            BackendScope::CoalescedGroups => &inner.recent_coalesced_groups,
             BackendScope::All => &inner.recent,
         };
         payload["recent"] = serde_json::to_value(recent).unwrap_or(Value::Null);
@@ -1022,7 +1111,10 @@ let FILTER = "300";
 let CUSTOM_SECS = 600;
 // Backend filter: null = all backends (no filtering — every statistic
 // includes all backends); a number = one backend index; "cached" = the
-// records served from the result cache (they never touch a backend).
+// records served from the result cache (they never touch a backend);
+// "coalesced" = the coalesced followers (they joined an in-flight
+// group and never touch a backend); "coalesced_groups" = the leaders
+// and followers of the coalesced groups.
 let BE = null;
 function rangeSecs(){
   if(FILTER==="all") return null;
@@ -1180,10 +1272,12 @@ function renderBackendSel(p){
     const cur = sel.value;
     sel.innerHTML = '<option value="">all</option>' +
       list.map((b,i)=>'<option value="'+i+'">backend '+i+' \u00b7 '+esc(b.url)+'</option>').join("") +
-      '<option value="cached">cached results \u00b7 no backend</option>';
-    const valid = cur==="" || cur==="cached" || parseInt(cur,10) < list.length;
+      '<option value="cached">cached results \u00b7 no backend</option>' +
+      '<option value="coalesced">coalesced followers \u00b7 no backend</option>' +
+      '<option value="coalesced_groups">coalesced groups \u00b7 leader + followers</option>';
+    const valid = cur==="" || cur==="cached" || cur==="coalesced" || cur==="coalesced_groups" || parseInt(cur,10) < list.length;
     sel.value = valid ? cur : "";
-    BE = sel.value==="" ? null : (sel.value==="cached" ? "cached" : parseInt(sel.value, 10));
+    BE = sel.value==="" ? null : (["cached","coalesced","coalesced_groups"].indexOf(sel.value)>=0 ? sel.value : parseInt(sel.value, 10));
   }
 }
 function render(d){
@@ -1270,7 +1364,7 @@ function render(d){
     rt += "</table>";
     $("recent").innerHTML = rt;
   }
-  $("foot").textContent = "filter "+rangeLabel()+(BE==null?"":(BE==="cached"?" \u00b7 cached results":" \u00b7 backend "+BE))+" \u00b7 buckets "+s.bucket_secs+" s \u00b7 poll "+d.refresh_ms+" ms";
+  $("foot").textContent = "filter "+rangeLabel()+(BE==null?"":(BE==="cached"?" \u00b7 cached results":(BE==="coalesced"?" \u00b7 coalesced followers":(BE==="coalesced_groups"?" \u00b7 coalesced groups":" \u00b7 backend "+BE))))+" \u00b7 buckets "+s.bucket_secs+" s \u00b7 poll "+d.refresh_ms+" ms";
   $("live").textContent = "\u25cf live";
   $("live").className = "";
 }
@@ -1308,10 +1402,11 @@ function applyCustom(){
 $("custom-apply").addEventListener("click", applyCustom);
 $("custom-secs").addEventListener("keydown", e=>{ if(e.key==="Enter") applyCustom(); });
 // Backend filter dropdown: the empty value means all backends (no
-// filtering); an index or the "cached" option re-renders immediately.
+// filtering); an index or the "cached"/"coalesced"/"coalesced_groups"
+// options re-render immediately.
 $("backend").addEventListener("change", ()=>{
   const v = $("backend").value;
-  BE = v==="" ? null : (v==="cached" ? "cached" : parseInt(v, 10));
+  BE = v==="" ? null : (["cached","coalesced","coalesced_groups"].indexOf(v)>=0 ? v : parseInt(v, 10));
   poll();
 });
 ["chart-req","chart-tok","chart-cached","chart-cpu","chart-dr","chart-dw","chart-ram"].forEach(id=>attachChart($(id)));
@@ -1390,6 +1485,7 @@ mod tests {
             model_id: "llama.cpp".into(),
             port: 8081,
             coalesce_requests: true,
+            slot_routing_policy: "key_affinity".into(),
             big_threshold_words: 500,
             words_per_block: 100,
             meta_max: 10,
@@ -1743,6 +1839,87 @@ mod tests {
         );
         let v = d.stats(&proxy(), Some(0), BackendScope::All);
         assert_eq!(v["counters"]["total"], 4);
+    }
+
+    #[test]
+    fn backend_filter_coalesced_scopes_select_group_records() {
+        let d = DashboardPlugin::new(params(
+            json!({ "window_secs": 10, "bucket_secs": 10, "max_recent": 10 }),
+        ))
+        .unwrap();
+        // One coalesced group: the leader (ran on backend 0) and two
+        // followers (no backend), all in bucket 100; plus a solo
+        // backend-1 request (bucket 110) and a result-cache hit
+        // (bucket 120), neither in a group.
+        let mut leader = record(200);
+        leader.backend = Some(0);
+        leader.coalesced = Some("leader");
+        d.record_at(100.0, &leader).unwrap();
+        let mut f1 = record(200);
+        f1.backend = None;
+        d.record_at(101.0, &f1).unwrap(); // `record()` defaults to follower
+        let mut f2 = record(200);
+        f2.backend = None;
+        f2.stream = Some(true);
+        d.record_at(102.0, &f2).unwrap();
+        let mut solo = record(200);
+        solo.backend = Some(1);
+        solo.coalesced = None;
+        d.record_at(115.0, &solo).unwrap();
+        let mut hit = record(200);
+        hit.backend = None;
+        hit.cache_hit = Some(true);
+        hit.coalesced = None;
+        d.record_at(125.0, &hit).unwrap();
+
+        // The coalesced scope selects the two followers only — lifetime
+        // counters, range counters, series (bucket 100 = 2, the rest 0)
+        // and the recent ring (both followers, no backend index).
+        let v = d.stats(&proxy(), Some(0), BackendScope::Coalesced);
+        assert_eq!(v["counters"]["total"], 2);
+        assert_eq!(v["counters"]["coalesced_followers"], 2);
+        assert_eq!(v["range"]["counters"]["total"], 2);
+        let buckets = v["series"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0]["reqs"], 2);
+        assert_eq!(buckets[1]["reqs"], 0);
+        assert_eq!(buckets[2]["reqs"], 0);
+        let recent = v["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 2);
+        for r in recent {
+            assert_eq!(r["coalesced"], true);
+            assert!(r["backend"].is_null());
+        }
+
+        // The coalesced_groups scope selects the whole group (the leader
+        // plus its two followers); the leader is a backend-0 record too
+        // (the scopes are views, not a partition) but only the followers
+        // count into `coalesced_followers`.
+        let v = d.stats(&proxy(), Some(0), BackendScope::CoalescedGroups);
+        assert_eq!(v["counters"]["total"], 3);
+        assert_eq!(v["counters"]["coalesced_followers"], 2);
+        assert_eq!(v["range"]["counters"]["total"], 3);
+        assert_eq!(v["series"]["buckets"][0]["reqs"], 3);
+        let recent = v["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 3);
+        let backends: Vec<usize> = recent
+            .iter()
+            .filter_map(|r| r["backend"].as_u64().map(|b| b as usize))
+            .collect();
+        assert_eq!(backends, vec![0]); // only the leader carries an index
+
+        // The other scopes are unaffected: the leader counts in its
+        // backend's scope, the solo request in its own, the hit in the
+        // cached scope, and the all scope keeps everything.
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(0));
+        assert_eq!(v["counters"]["total"], 1);
+        assert_eq!(v["recent"][0]["coalesced"], false); // leader: not flagged
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(1));
+        assert_eq!(v["counters"]["total"], 1);
+        let v = d.stats(&proxy(), Some(0), BackendScope::Cached);
+        assert_eq!(v["counters"]["total"], 1);
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        assert_eq!(v["counters"]["total"], 5);
     }
 
     #[test]

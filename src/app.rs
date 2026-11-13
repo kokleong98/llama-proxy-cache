@@ -164,8 +164,10 @@ async fn dashboard_page(State(state): State<AppState>) -> Response {
 /// `?since=<unix seconds>` to scope the plugin's aggregates to
 /// `[since, now]` (absent = the plugin's default aggregation) and its
 /// backend filter polls with `?backend=<index>` to restrict them to one
-/// backend or with `?backend=cached` to restrict them to the records
-/// served from the result cache (absent = all backends — every
+/// backend, or with `?backend=cached` to restrict them to the records
+/// served from the result cache, `?backend=coalesced` to the coalesced
+/// followers and `?backend=coalesced_groups` to the leaders and
+/// followers of the coalesced groups (absent = all backends — every
 /// statistic, the default). A bad `backend` value is a 400 (a bad
 /// `since` value is rejected by axum's `Query` extractor).
 #[derive(serde::Deserialize)]
@@ -175,15 +177,20 @@ struct StatsQuery {
 }
 
 /// Parse the `?backend` query value: a backend index, or the reserved
-/// word `cached` (the records served from the result cache — they never
-/// touch a backend). Anything else is bad.
+/// words `cached` (the records served from the result cache — they
+/// never touch a backend), `coalesced` (the coalesced followers — they
+/// joined an in-flight group and never touch a backend) and
+/// `coalesced_groups` (the leaders and followers of the coalesced
+/// groups). Anything else is bad.
 fn parse_backend_filter(v: &str) -> Option<BackendScope> {
-    if v == "cached" {
-        Some(BackendScope::Cached)
-    } else {
-        v.parse::<u64>()
+    match v {
+        "cached" => Some(BackendScope::Cached),
+        "coalesced" => Some(BackendScope::Coalesced),
+        "coalesced_groups" => Some(BackendScope::CoalescedGroups),
+        _ => v
+            .parse::<u64>()
             .ok()
-            .map(|b| BackendScope::Backend(b as usize))
+            .map(|b| BackendScope::Backend(b as usize)),
     }
 }
 
@@ -191,7 +198,7 @@ fn parse_backend_filter(v: &str) -> Option<BackendScope> {
 /// [`ProxyStatus`] merged with the plugin's per-request aggregates,
 /// range-scoped by the optional `?since` query parameter and
 /// backend-scoped by the optional `?backend` query parameter
-/// (an index or `cached`).
+/// (an index, `cached`, `coalesced` or `coalesced_groups`).
 async fn dashboard_stats(
     State(state): State<AppState>,
     Query(q): Query<StatsQuery>,
@@ -204,7 +211,9 @@ async fn dashboard_stats(
                 return Err((
                     StatusCode::BAD_REQUEST,
                     axum::Json(json!({
-                        "error": format!("bad backend filter {v:?}: use a backend index or \"cached\"")
+                        "error": format!(
+                            "bad backend filter {v:?}: use a backend index or \"cached\"/\"coalesced\"/\"coalesced_groups\""
+                        )
                     })),
                 ));
             }
@@ -251,6 +260,7 @@ pub(crate) fn capture_status(state: &AppState) -> ProxyStatus {
         model_id: cfg.model_id.clone(),
         port: cfg.port,
         coalesce_requests: cfg.coalesce_requests,
+        slot_routing_policy: cfg.slot_routing_policy.as_str().to_string(),
         big_threshold_words: cfg.big_threshold_words,
         words_per_block: cfg.words_per_block,
         meta_max: cfg.meta_max,

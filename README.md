@@ -61,7 +61,11 @@ full prefill cost every time.
    files and looks for one with the same model and `wpb` whose block list
    shares the longest common prefix; if the LCP ratio is at least `LCP_TH`
    (default 0.1), that cache is restored into the chosen slot *before* the
-   chat is dispatched. A backend entry in `BACKENDS` can set
+   chat is dispatched. If the chosen slot is already running that KV cache
+   (the proxy tracks the last key each slot loaded, via a successful
+   restore or save), the restore call is skipped entirely
+   (`restore_skipped ... reason=already_running`) — llama.cpp keeps the
+   slot's KV across requests. A backend entry in `BACKENDS` can set
    `"kv_cache": false` (default `true`) to opt out: restores are only ever
    issued to slots of `kv_cache`-enabled backends, and a request served by
    a disabled backend neither saves its KV cache nor writes a meta file —
@@ -69,8 +73,11 @@ full prefill cost every time.
    llama-server < 1.05.40).
 5. **Slot management** — every llama.cpp slot is guarded by a lock.
    The proxy picks a never-used slot first, otherwise the
-   least recently used one, waits up to 300 s for it (`503 all slots busy`
-   on timeout), and releases it when the response is fully handled.
+   least recently used one (or, with
+   `SLOT_ROUTING_POLICY=key_affinity`, an idle slot already running the
+   request's KV cache key first), waits up to 300 s for it
+   (`503 all slots busy` on timeout), and releases it when the
+   response is fully handled.
 6. **Streaming** — SSE responses are passed through byte-for-byte via a
    background reader task; the reader's cleanup step always saves the KV
    cache and writes the meta file, then releases the slot.
@@ -116,6 +123,7 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `LOG_LEVEL`         | `INFO`              | log level (`RUST_LOG` overrides it)            |
 | `STREAM_QUEUE_SIZE` | `16`                | per-request SSE channel capacity (must be >= 1) |
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
+| `SLOT_ROUTING_POLICY` | `lru`             | slot pick policy: `lru` (free-first, then LRU) or `key_affinity` (prefer an idle slot already running the request's KV key, so the restore is a no-op) |
 | `PLUGINS` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables below) and `dashboard` (the real-time statistics web page, at most one); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent prefilter specs (when set, `PLUGINS` takes precedence over them) |
 | `REQUEST_LOG` | `false` | when true, one W3C-XLF record per finished request is appended to the request-log file (the built-in `request_log` plugin) |
 | `REQUEST_LOG_PATH` | `lpcache-request.log` | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
@@ -374,13 +382,16 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
 - **Coalescing / single-flight** (`coalesce.rs`, 4): leader/follower entry,
   group forget, finish waking waiters with the outcome, ordered SSE append/
   drain.
-- **Slot management** (`slot_manager.rs`, 24): slot selection and ordering
+- **Slot management** (`slot_manager.rs`, 27): slot selection and ordering
   (free-first, used-then-oldest, multi-backend, idle-aware), restore
   targeting and retry-slot exclusion (only `kv_cache`-enabled backends),
-  save semantics with auto-retry (500 vs other errors, retries until
-  success / exhausted / disabled), per-slot locking and acquire timeout, and
-  the circuit breaker (skip while others up, all-down fail-open, cooldown
-  expiry, escalating backoff, success/probe recovery).
+  per-slot last-KV tracking (a restore is skipped when the picked slot
+  already runs the requested key; the tracking is updated by successful
+  restores/saves and cleared by failed restores), save semantics with
+  auto-retry (500 vs other errors, retries until success / exhausted /
+  disabled), per-slot locking and acquire timeout, and the circuit breaker
+  (skip while others up, all-down fail-open, cooldown expiry, escalating
+  backoff, success/probe recovery).
 - **Process sampling** (`procsample.rs`, 6): `/proc` status/io parsing
   (the memory gauges and disk counters; other/malformed lines ignored),
   saturating per-field delta, and live-sampling monotonicity.

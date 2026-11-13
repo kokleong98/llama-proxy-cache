@@ -8,25 +8,25 @@ documents every test with its exact runnable filter, sync/async kind and
 source line, plus the module's fixtures/helpers, how to run just that
 module, and a coverage map of the surface it exercises.
 
-**Total: 255 test cases** — 90 lpcache unit + 92 lpcache-plugins
-unit + 58 API integration + 15 client integration.
+**Total: 260 test cases** — 94 lpcache unit + 92 lpcache-plugins
+unit + 59 API integration + 15 client integration.
 
 | # | Suite | Location | Tests | Kinds |
 |---|-------|----------|-------|-------|
-| 1 | [Configuration (env vars, CLI, precedence, `PLUGINS` specs)](01-configuration.md) | `src/config.rs` | 37 | 37 sync |
+| 1 | [Configuration (env vars, CLI, precedence, `PLUGINS` specs)](01-configuration.md) | `src/config.rs` | 38 | 38 sync |
 | 2 | [Prefilter plugins (keyword, chain)](02-prefilter-plugins.md) | `plugins/src/builtin/keyword.rs`, `chain.rs` | 14 | 10 async + 4 sync |
 | 3 | [Hashing, meta files, pruning](03-hashing.md) | `src/hashing.rs` | 19 | 19 sync |
 | 4 | [Request coalescing (`SingleFlight`)](04-coalescing.md) | `src/coalesce.rs` | 4 | 3 sync + 1 async |
 | 5 | [llama backend client plugin](05-llama-backend-plugin.md) | `plugins/src/builtin/llama.rs` | 5 | 4 sync + 1 async |
-| 6 | [Slot management (selection, locks, breaker)](06-slot-management.md) | `src/slot_manager.rs` | 24 | 24 async |
-| 7 | [API end-to-end (proxy ↔ mock llama.cpp)](07-api-e2e.md) | `tests/api.rs` | 58 | 58 async |
+| 6 | [Slot management (selection, locks, breaker)](06-slot-management.md) | `src/slot_manager.rs` | 30 | 30 async |
+| 7 | [API end-to-end (proxy ↔ mock llama.cpp)](07-api-e2e.md) | `tests/api.rs` | 59 | 59 async |
 | 8 | [Backend client — HTTP behavior](08-backend-client.md) | `tests/client.rs` | 15 | 15 async |
 | 9 | [Result cache plugin](09-result-cache-plugin.md) | `plugins/src/builtin/result_cache.rs` | 20 | 9 sync + 11 async |
 | 10 | [Plugin registry (specs, loading, chaining)](10-plugin-registry.md) | `plugins/src/registry.rs` | 10 | 10 sync |
 | 11 | [Request log plugin (W3C-XLF format, rotation)](11-request-log-plugin.md) | `plugins/src/builtin/request_log.rs` | 14 | 14 sync |
 | 12 | [Qwen guard prefilter (Qwen3Guard-Gen safety check)](12-qwen-guard-plugin.md) | `plugins/src/builtin/qwen_guard.rs` | 17 | 8 sync + 9 async |
 
-The module pages catalog 237 of the 255 cases; the remaining 18 (the
+The module pages catalog 245 of the 263 cases; the remaining 18 (the
 12 `dashboard` plugin unit tests and the 6 `procsample` unit tests,
 which have no dedicated module pages) run
 in the same suites and pass under `cargo test --workspace`.
@@ -34,10 +34,10 @@ in the same suites and pass under `cargo test --workspace`.
 ## How to run
 
 ```sh
-cargo test --workspace        # full regression suite (282 tests incl. 1 doctest, ~4 s)
-cargo test --lib              # 90 lpcache unit tests only
+cargo test --workspace        # full regression suite (290 tests incl. 1 doctest, ~4 s)
+cargo test --lib              # 97 lpcache unit tests only
 cargo test -p lpcache-plugins # 92 plugin library unit tests
-cargo test --test api         # 58 API integration tests
+cargo test --test api         # 59 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test -p lpcache-config  # 26 configurator unit tests
 cargo test <name-substring>   # run a single test by name filter
@@ -74,12 +74,53 @@ client-disconnect behaviour.
 | Result cache plugin (Rust-only feature) | 20 plugin unit + 8 E2E tests (7 result-cache, incl. `cache_streaming` and `no-cache` header bypass + 1 blocklist-over-cache chain) |
 | Plugin system (`PLUGINS` env/flag, `lpcache-plugins` registry) | 6 `PLUGINS` config tests + 10 registry tests + 8 plugin `factory_*` tests; E2E state is built via `load_prefilters` / `load_request_loggers` |
 | Per-backend `kv_cache` flag (Rust-only feature) | `backends_kv_cache_flag` (config), `acquire_excluding_respects_kv_flag` / `restore_prefers_kv_enabled_backend` / `restore_skipped_when_no_kv_enabled_backend` (unit), `kv_cache_disabled_backend_never_saves_or_restores` / `kv_cache_disabled_backend_skips_stream_save` / `kv_restore_prefers_kv_enabled_backend` (E2E) |
+| Skip redundant restores — per-slot last-KV tracking (Rust-only feature) | `restore_skipped_when_slot_already_running_key` / `save_updates_last_kv_tracking` / `failed_restore_forgets_last_kv_tracking` (unit) + the E2E assertions in `dead_backend_traffic_fails_over_to_live_backend`, `kv_restore_prefers_kv_enabled_backend`, `restore_works_after_prune_and_pruned_key_falls_back`, `restore_touches_lru_timestamp_so_prune_keeps_hot_entry` and `restore_rejected_cleans_up_stale_meta` |
 | Request log (`REQUEST_LOG*` env/flags or a `request_log` spec in `PLUGINS`, Rust-only feature) | 3 config tests + 14 plugin unit tests (section 11) + 5 E2E tests (`request_log_writes_xlf_record` — incl. the performance fields, `request_log_stream_request_counts_delivered_bytes`, `request_log_logs_failed_request_without_pipeline`, `request_log_rotates_and_bounds_keep`, `request_log_stream_writes_perf_fields`) |
 | Dashboard plugin (`dashboard` spec in `PLUGINS`, Rust-only feature) | 12 plugin unit tests (counters — incl. the process resource metrics (CPU ms / disk bytes / peak RAM), the `?backend` filter (index scopes + the `cached` scope for result-cache records), per-scope recent rings, `?since` range scoping, bucket pruning/coarsening, chart rendering, self-contained HTML) + 6 E2E tests |
 | KV cache save auto-retry (`SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS`, Rust-only feature) | `save_after_retries_until_success`, `save_after_retries_exhausted_propagates_error`, `save_after_retries_exhausted_500_returns_false`, `save_after_no_retry_when_retries_disabled` (unit), `save_retry_env_and_cli` (config) |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
-**Suite health (2026-11-06).** 244/244 passing, clippy clean, ~4 s wall
+**Suite health (2026-11-13).** 290/290 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
+On 2026-11-13 the `SLOT_ROUTING_POLICY` setting (`lru` default,
+`key_affinity` opt-in) made the slot pick key-aware (+5 cases): under
+`key_affinity`, a request that carries a KV restore key is picked on an
+**idle** slot already running that key (a new key-free tier before the
+free/LRU tiers), turning the existing post-pick restore skip into a
+zero-wire-call no-op; the default `lru` policy is byte-identical to the
+previous behaviour. The pick core is `pick_filtered(extra, key_free)`
+returning the winning tier (`PickReason::KeyFree` / `Free` / `Lru`).
+Cases: `slot_routing_policy_env_and_cli` (config: parse,
+case-insensitivity, the `key-affinity` alias, invalid → default with a
+warning, CLI > env), `key_affinity_picks_idle_slot_running_key` /
+`lru_policy_ignores_key_on_pick` /
+`key_affinity_without_key_matches_lru_pick` (slot manager: the
+key-affinity pick prefers the idle slot running the key and issues no
+redundant restore; `lru` picks the oldest slot and issues the restore;
+keyless acquires are unaffected) and
+`key_affinity_avoids_redundant_restore` (E2E: A, B, A on 3 slots — 1
+restore wire call under `lru`, 0 under `key_affinity`). The dashboard's
+`proxy` status now exposes the active policy
+(`slot_routing_policy`).
+On 2026-11-13 the slot manager gained per-slot last-KV tracking
+(+3 cases): it records the last KV cache key each slot is known to be
+running (set by a successful restore or save, cleared by a failed
+restore) and skips the backend restore call when the picked slot already
+runs the requested key (`restore_skipped ... reason=already_running` —
+the acquire still counts as restored, so the meta LRU touch and the
+request-log flag still apply); llama.cpp keeps a slot's KV across
+requests, so the restore would be redundant. Unit tests:
+`restore_skipped_when_slot_already_running_key`,
+`save_updates_last_kv_tracking`, `failed_restore_forgets_last_kv_tracking`.
+Five E2E assertions updated where slots already ran the key:
+`dead_backend_traffic_fails_over_to_live_backend` (live-backend restores
+now 0), `kv_restore_prefers_kv_enabled_backend` (be0 now has 2 slots so
+the restore lands on a fresh slot), `restore_works_after_prune_and_pruned_key_falls_back`
+(gained an exact-B step that forces a real restore on the other slot),
+`restore_touches_lru_timestamp_so_prune_keeps_hot_entry` (the B+tail
+restore is skipped; the LRU touch still fires) and
+`restore_rejected_cleans_up_stale_meta` (the final step first rotates
+both slots off key2 with two unrelated big prompts, since their saves
+would otherwise skip the rejected restore the cleanup needs).
 On 2026-11-05 the result cache gained two params and the backends a
 per-backend `kv_cache` flag (+15 cases).
 `cache_streaming` (aggregate a completed streaming result into a

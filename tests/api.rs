@@ -675,18 +675,22 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
         statuses.push(resp.status().as_u16());
         let _ = to_bytes(resp.into_body(), usize::MAX).await;
     }
-    // req1 -> (0,0) live -> 200 (save stamps slot (0,0) used)
-    // req2 -> (1,0) free -> chat: connection refused -> breaker(be1) ->
-    //        retried on (0,0) live -> 200 (transparent failover; the retry
-    //        re-restores the key there)
-    // req3/4 -> be1 in cooldown -> (0,0) -> 200
+    // req1 -> (0,0) live -> 200 (the save stamps slot (0,0) used and records
+    //        the key as running there)
+    // req2 -> (1,0) free -> restore fails (backend dead) -> chat: connection
+    //        refused -> breaker(be1) -> retried on (0,0) live -> 200
+    //        (transparent failover; the retry's restore is skipped — the
+    //        slot is already running the key from req1's save)
+    // req3/4 -> be1 in cooldown -> (0,0) -> restore skipped (already running)
     assert_eq!(statuses, vec![200, 200, 200, 200]);
     // all chats (including the retry) landed on the live backend
     let saves = mock.state.saves().await;
     assert_eq!(saves.len(), 4);
-    // req2's retry + req3 + req4 restored on the live backend
+    // the only restore attempt was req2's doomed one on the dead backend
+    // (unrecorded); the live backend's slot was already running the key, so
+    // every restore targeting it was skipped
     let restores = mock.state.restores().await;
-    assert_eq!(restores.len(), 3);
+    assert!(restores.is_empty(), "restores: {restores:?}");
 }
 
 #[tokio::test]
@@ -1178,8 +1182,11 @@ async fn kv_restore_prefers_kv_enabled_backend() {
     let cfg = Config::new(
         vec![
             BackendConf {
+                // two slots: request 2's restore lands on the fresh (0,1)
+                // (the single free slot of a kv-enabled backend) instead of
+                // (0,0), which already runs the key after request 1's save
                 url: mock0.url(),
-                n_slots: 1,
+                n_slots: 2,
                 slot_save_path: Some(kv0.path().to_string_lossy().into_owned()),
                 kv_cache: true,
             },
@@ -1329,8 +1336,10 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
     assert!(!kv.path().join(&key_a).exists());
     assert!(kv.path().join(&key_b).exists());
 
-    // (a) the surviving entry B is still restorable after the prune:
-    // B + a short tail -> LCP ratio 5/6 >= 0.6 -> restore key_b
+    // (a) the surviving entry B is still matched after the prune: B + a
+    // short tail -> LCP ratio 5/6 >= 0.6 -> restore candidate key_b. The
+    // LRU pick lands on the slot that already runs key_b (B's own save),
+    // so the restore is skipped — no backend restore call is made.
     let pb_tail = format!("{pb} tail x y z");
     let body = json!({
         "model": "m1",
@@ -1341,7 +1350,10 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
     assert_eq!(resp.status(), 200);
     let _ = to_bytes(resp.into_body(), usize::MAX).await;
     let calls = mock.state.calls.lock().await;
-    assert_eq!(calls.restores, vec![(1usize, key_b.clone())]);
+    assert!(
+        calls.restores.is_empty(),
+        "restore skipped: slot already runs key_b"
+    );
     drop(calls);
     // the post-save prune kept the bound at META_MAX
     let n_meta = std::fs::read_dir(td.path())
@@ -1350,6 +1362,22 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".meta.json"))
         .count();
     assert!(n_meta <= 2, "meta bound exceeded: {n_meta}");
+
+    // (a2) the exact prompt B again: candidate key_b at ratio 1.0 (the
+    // highest, so uniquely best). The LRU pick is the *other* slot (still
+    // running C's key), so the restore is actually issued there — restore
+    // keeps working after the prune.
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": pb }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    let calls = mock.state.calls.lock().await;
+    assert_eq!(calls.restores, vec![(0usize, key_b.clone())]);
+    drop(calls);
 
     // (b) the pruned entry A: no meta -> no restore candidate -> full
     // prefill; the response is still 200 and A is re-saved (meta + KV
@@ -1364,7 +1392,7 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
     let _ = to_bytes(resp.into_body(), usize::MAX).await;
     let calls = mock.state.calls.lock().await;
     // no new restore happened for the pruned key A
-    assert_eq!(calls.restores, vec![(1usize, key_b)]);
+    assert_eq!(calls.restores, vec![(0usize, key_b)]);
     drop(calls);
     assert!(
         td.path().join(format!("{key_a}.meta.json")).exists(),
@@ -1380,13 +1408,110 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
 }
 
 #[tokio::test]
+async fn key_affinity_avoids_redundant_restore() {
+    // A, B, A traffic on 3 slots. Under the default `lru` policy the
+    // repeat of A is picked on the free slot 2 (running nothing) and
+    // issues a redundant restore call; under `key_affinity` it is picked
+    // on the idle slot that already runs A's key, so the restore becomes
+    // a zero-wire-call skip.
+    async fn build(
+        policy: lpcache::config::RoutingPolicy,
+    ) -> (AppState, MockLlama, tempfile::TempDir, tempfile::TempDir) {
+        let kv = tempfile::tempdir().expect("kv dir");
+        let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv.path()).await;
+        let td = tempfile::tempdir().expect("meta dir");
+        let cfg = Config::new(
+            vec![BackendConf {
+                url: mock.url(),
+                n_slots: 3,
+                slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+                kv_cache: true,
+            }],
+            100, // words per block
+            500, // big threshold words
+            0.6, // LCP threshold
+            td.path().to_path_buf(),
+            Duration::from_secs(30),
+            "llama.cpp".to_string(),
+            0,
+        )
+        .with_slot_routing_policy(policy);
+        let client = Arc::new(
+            LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+        );
+        let clients: Vec<Arc<dyn LlamaBackend>> =
+            vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+        let sm =
+            Arc::new(SlotManager::new(&cfg.backends, clients.clone()).with_routing_policy(policy));
+        let (prefilter, result_store) = load_prefilter(&cfg);
+        let state = AppState {
+            config: Arc::new(cfg),
+            clients,
+            sm,
+            sf: Arc::new(SingleFlight::new()),
+            prefilter,
+            result_store,
+            request_log: None,
+            dashboard: None,
+        };
+        (state, mock, kv, td)
+    }
+
+    async fn chat(app: &axum::Router, prompt: &str) {
+        let body = json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{ "role": "user", "content": prompt }]
+        });
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    }
+
+    let pa = format!("promptA {}", words(518));
+    let pb = format!("promptB {}", words(518));
+
+    // default `lru`: the repeat of A lands on free slot 2 -> one restore
+    let (state, mock, kv, td) = build(lpcache::config::RoutingPolicy::Lru).await;
+    let app = router(state);
+    chat(&app, &pa).await; // saved on slot 0
+    chat(&app, &pb).await; // saved on slot 1 (first free slot)
+    chat(&app, &pa).await; // picked on free slot 2 -> redundant restore
+    let calls = mock.state.calls.lock().await;
+    assert_eq!(
+        calls.restores.len(),
+        1,
+        "lru: the repeat of A needs a restore wire call"
+    );
+    drop(calls);
+    drop((kv, td));
+
+    // `key_affinity`: the repeat of A lands on the idle slot running A
+    // -> the restore is skipped, no wire call at all
+    let (state, mock, kv, td) = build(lpcache::config::RoutingPolicy::KeyAffinity).await;
+    let app = router(state);
+    chat(&app, &pa).await;
+    chat(&app, &pb).await;
+    chat(&app, &pa).await;
+    let calls = mock.state.calls.lock().await;
+    assert!(
+        calls.restores.is_empty(),
+        "key_affinity: the repeat of A must not issue a restore"
+    );
+    drop(calls);
+    drop((kv, td));
+}
+
+#[tokio::test]
 async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
-    // META_MAX=2: saves A, B, C prune A. Then B+tail restores B and saves
-    // the new key B'. The successful restore must bump B's LRU timestamp
-    // (README: pruning is by last save/restore time), so B's own post-save
-    // prune evicts C — the true oldest — and NOT the just-restored B.
-    // (Without the touch, B — the oldest by last *save* — would be evicted
-    // by the very request that just restored it.)
+    // META_MAX=2: saves A, B, C prune A. Then B+tail matches B and saves the
+    // new key B'. The LRU pick is the slot that already runs B (B's own
+    // save), so the restore is skipped — but the acquire still counts as
+    // restored and must bump B's LRU meta timestamp (README: pruning is by
+    // last save/restore time), so B's own post-save prune evicts C — the
+    // true oldest — and NOT the just-restored B. (Without the touch, B —
+    // the oldest by last *save* — would be evicted by the very request that
+    // just used it.)
     let kv = tempfile::tempdir().expect("kv dir");
     let mock = MockLlama::start_with_save_dir(BACKEND_MODEL, kv.path()).await;
     let td = tempfile::tempdir().expect("meta dir");
@@ -1446,7 +1571,9 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
     let key_c = expected_key(&pc);
     assert!(!td.path().join(format!("{key_a}.meta.json")).exists());
 
-    // B + a short tail -> restores B (ratio 5/6) and saves new key B'
+    // B + a short tail -> candidate key_b; the LRU pick is the slot that
+    // already runs key_b (B's own save) -> the restore is skipped (no
+    // backend restore call), and B' is saved
     let pb_tail = format!("{pb} tail x y z");
     let body = json!({
         "model": "m1",
@@ -1456,9 +1583,9 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
     let resp = app.oneshot(post_json(&body)).await.expect("resp");
     assert_eq!(resp.status(), 200);
     let _ = to_bytes(resp.into_body(), usize::MAX).await;
-    assert_eq!(
-        mock.state.calls.lock().await.restores,
-        vec![(1usize, key_b.clone())]
+    assert!(
+        mock.state.calls.lock().await.restores.is_empty(),
+        "restore skipped: the picked slot already runs key_b"
     );
 
     // the restore bumped B's timestamp -> the post-save prune evicts C
@@ -2590,10 +2717,25 @@ async fn restore_rejected_cleans_up_stale_meta() {
         "meta with a present KV file must be kept on a rejected restore"
     );
 
-    // 5) orphan key2 as well: a *different* prompt matching key2 triggers
-    //    the cleanup, which removes key2's stale meta (the request itself
-    //    then saves a fresh entry, key3)
+    // 5) orphan key2 as well. Both slots run key2 right now (their saves
+    //    recorded it), so a restore of key2 would be skipped and the
+    //    cleanup (which needs a *rejected* restore) could not fire: first
+    //    rotate both slots off key2 with two unrelated big prompts, then a
+    //    key2-matching request hits a slot that does not run key2 ->
+    //    rejected restore -> the cleanup removes key2's stale meta (the
+    //    request itself then saves a fresh entry, key3)
     std::fs::remove_file(kv.path().join(&key2)).expect("rm kv");
+    for p in ["promptU", "promptV"] {
+        let filler = format!("{p} {}", words(518));
+        let body = json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{ "role": "user", "content": filler }]
+        });
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    }
     let tail3 = format!("{tail} more words");
     let key3 = expected_key(&tail3);
     let body3 = json!({
@@ -3103,6 +3245,7 @@ async fn dashboard_page_and_stats_reachable() {
     assert_eq!(p["total_slots"], 2);
     assert_eq!(p["in_flight"], 0);
     assert_eq!(p["active_groups"], 0);
+    assert_eq!(p["slot_routing_policy"], "lru");
     assert_eq!(p["backends"][0]["url"], mock.url());
     assert_eq!(p["backends"][0]["n_slots"], 2);
     assert_eq!(p["backends"][0]["down"], false);
@@ -3466,6 +3609,21 @@ async fn dashboard_stats_since_scopes_the_range() {
     assert_eq!(resp.status(), 400);
     drain(resp).await;
 
+    // The `coalesced` and `coalesced_groups` scopes are accepted like
+    // `cached`. Nothing in this test coalesced, so both are empty.
+    for scope in ["coalesced", "coalesced_groups"] {
+        let resp = app
+            .clone()
+            .oneshot(get_req(&format!("/dashboard/api/stats?since=0&backend={scope}")))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), 200, "backend={scope} accepted");
+        let v = read_body(resp).await;
+        assert_eq!(v["counters"]["total"], 0, "scope {scope}");
+        assert_eq!(v["range"]["counters"]["total"], 0, "scope {scope}");
+        assert!(v["recent"].as_array().unwrap().is_empty(), "scope {scope}");
+    }
+
     // A bad `backend` value is rejected with a 400 too.
     let resp = app
         .oneshot(get_req("/dashboard/api/stats?backend=abc"))
@@ -3473,6 +3631,124 @@ async fn dashboard_stats_since_scopes_the_range() {
         .expect("resp");
     assert_eq!(resp.status(), 400);
     drain(resp).await;
+}
+
+#[tokio::test]
+async fn dashboard_coalesced_scopes_track_group_records() {
+    // A dashboard with coalescing enabled: two concurrent identical
+    // requests form one group (a leader on backend 0 plus a follower).
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("tempdir");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+            kv_cache: true,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_coalesce_requests(true);
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> =
+        vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let spec = lpcache::plugins::PluginSpec::new("dashboard", json!({}));
+    let dashboard = lpcache::plugins::load_dashboard(
+        &lpcache::plugins::Registry::with_builtins(),
+        std::slice::from_ref(&spec),
+    )
+    .expect("load dashboard")
+    .expect("dashboard spec present");
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter: None,
+        result_store: None,
+        request_log: None,
+        dashboard: Some(dashboard),
+    };
+    let app = router(state);
+
+    // Slow the backend so the two requests overlap, then fire them
+    // concurrently: one leader, one follower, ONE backend call.
+    mock.state.set_chat_body_delay(Duration::from_millis(400));
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "coalesce please" }]
+    });
+    let (r1, r2) = tokio::join!(
+        app.clone().oneshot(post_json(&body)),
+        app.clone().oneshot(post_json(&body))
+    );
+    let r1 = r1.expect("resp");
+    let r2 = r2.expect("resp");
+    assert_eq!(r1.status().as_u16(), 200);
+    assert_eq!(r2.status().as_u16(), 200);
+    to_bytes(r1.into_body(), usize::MAX).await.expect("body");
+    to_bytes(r2.into_body(), usize::MAX).await.expect("body");
+    assert_eq!(mock.state.calls.lock().await.chat_bodies.len(), 1);
+
+    // `?backend=coalesced`: the single follower only (no backend index).
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats?backend=coalesced"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["counters"]["total"], 1);
+    assert_eq!(v["counters"]["coalesced_followers"], 1);
+    let recent = v["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0]["coalesced"], true);
+    assert!(recent[0]["backend"].is_null());
+
+    // `?backend=coalesced_groups`: the whole group — the leader (backend
+    // 0, unflagged) plus the follower (no backend, flagged).
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats?backend=coalesced_groups"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["counters"]["total"], 2);
+    assert_eq!(v["counters"]["coalesced_followers"], 1);
+    let recent = v["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    let followers = recent.iter().filter(|r| r["coalesced"] == true).count();
+    let leaders = recent.iter().filter(|r| r["coalesced"] == false).count();
+    assert_eq!(followers, 1, "exactly one follower row");
+    assert_eq!(leaders, 1, "exactly one leader row");
+    for r in recent {
+        if r["coalesced"] == true {
+            assert!(r["backend"].is_null());
+        } else {
+            assert_eq!(r["backend"], 0);
+        }
+    }
+
+    // The unfiltered view keeps both requests and the follower count.
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats"))
+        .await
+        .expect("resp");
+    let v = read_body(resp).await;
+    assert_eq!(v["counters"]["total"], 2);
+    assert_eq!(v["counters"]["coalesced_followers"], 1);
 }
 
 #[tokio::test]

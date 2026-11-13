@@ -18,6 +18,10 @@
 //! - `COALESCE_REQUESTS` (`false`; when true, concurrent requests with the
 //!   same KV cache key are grouped into a single backend call regardless of
 //!   generation parameters — see the `coalesce` module)
+//! - `SLOT_ROUTING_POLICY` (`lru`; the slot pick policy — `key_affinity`
+//!   prefers, for a request that carries a KV restore key, an idle slot
+//!   already running that key, so the restore becomes a zero-wire-call skip;
+//!   unknown values fall back to the default with a warning)
 //! - `SAVE_RETRIES` (3) and `SAVE_RETRY_DELAY_MS` (1000): a failed KV cache
 //!   save (backend 500 or network/other error) is retried by the slot
 //!   manager up to `SAVE_RETRIES` times, waiting `SAVE_RETRY_DELAY_MS`
@@ -126,6 +130,33 @@ pub fn version_string() -> String {
     format!("{} {}", env!("CARGO_PKG_NAME"), VERSION)
 }
 
+/// The slot routing policy (`SLOT_ROUTING_POLICY`): which slot a request
+/// runs on, among the eligible ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoutingPolicy {
+    /// The original policy: an idle never-used slot in insertion order
+    /// first, otherwise the least recently used slot. The restore key (if
+    /// any) never influences the pick — a picked slot that already runs the
+    /// key is detected after the pick and the restore is skipped.
+    #[default]
+    Lru,
+    /// Key-affinity routing: before the free/LRU tiers, prefer an idle slot
+    /// already running the requested KV cache key, so the restore becomes a
+    /// zero-wire-call skip instead of a redundant backend call.
+    KeyAffinity,
+}
+
+impl RoutingPolicy {
+    /// The canonical short name (logs, the dashboard proxy status, config
+    /// files).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoutingPolicy::Lru => "lru",
+            RoutingPolicy::KeyAffinity => "key_affinity",
+        }
+    }
+}
+
 /// One llama.cpp backend (an entry of the `BACKENDS` JSON array).
 #[derive(Debug, Clone, Deserialize)]
 pub struct BackendConf {
@@ -176,6 +207,8 @@ pub struct Config {
     /// key into a single backend call, regardless of generation parameters
     /// (followers receive the leader's result — see the `coalesce` module).
     pub coalesce_requests: bool,
+    /// The slot routing policy (`SLOT_ROUTING_POLICY`; default `Lru`).
+    pub slot_routing_policy: RoutingPolicy,
     /// `PLUGINS`: raw JSON array of plugin specs
     /// (`[{"name": "...", "params": {...}}]`). When set, the prefilter
     /// plugins are loaded from it via the `lpcache-plugins` registry and
@@ -256,6 +289,8 @@ pub struct Cli {
     pub stream_queue_size: Option<String>,
     /// Maps to `COALESCE_REQUESTS` (`true`/`false`, or `1`/`0`).
     pub coalesce_requests: Option<String>,
+    /// Maps to `SLOT_ROUTING_POLICY` (`lru` or `key_affinity`).
+    pub slot_routing_policy: Option<String>,
     /// Maps to `PLUGINS` (JSON array of plugin specs; when set, the legacy
     /// `PREFILTER_*` settings are ignored).
     pub plugins: Option<String>,
@@ -311,6 +346,7 @@ impl Config {
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             stream_queue_size: DEFAULT_STREAM_QUEUE_SIZE,
             coalesce_requests: false,
+            slot_routing_policy: RoutingPolicy::default(),
             plugins: None,
             prefilter_blocklist: Vec::new(),
             prefilter_case_insensitive: DEFAULT_PREFILTER_CASE_INSENSITIVE,
@@ -336,6 +372,12 @@ impl Config {
     /// (`COALESCE_REQUESTS`).
     pub fn with_coalesce_requests(mut self, on: bool) -> Self {
         self.coalesce_requests = on;
+        self
+    }
+
+    /// Override the slot routing policy (`SLOT_ROUTING_POLICY`).
+    pub fn with_slot_routing_policy(mut self, policy: RoutingPolicy) -> Self {
+        self.slot_routing_policy = policy;
         self
     }
 
@@ -563,6 +605,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string()),
             stream_queue_size: env_stream_queue_size(vars),
             coalesce_requests: env_bool(vars, "COALESCE_REQUESTS", false),
+            slot_routing_policy: env_routing_policy(vars),
             // Raw JSON array of plugin specs; parsed by `plugin_specs`.
             // Unset = synthesize the specs from the PREFILTER_* settings.
             plugins: vars.get("PLUGINS").cloned(),
@@ -706,6 +749,30 @@ fn env_bool(vars: &HashMap<String, String>, key: &str, default: bool) -> bool {
     }
 }
 
+/// Parse a `SLOT_ROUTING_POLICY` value (`lru`, `key_affinity`;
+/// case-insensitive, `key-affinity` accepted as an alias). Unknown values
+/// log a warning and fall back to the default.
+fn parse_routing_policy(v: &str) -> RoutingPolicy {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "lru" => RoutingPolicy::Lru,
+        "key_affinity" | "key-affinity" => RoutingPolicy::KeyAffinity,
+        other => {
+            tracing::warn!(
+                "env SLOT_ROUTING_POLICY={other:?} is not a routing policy (lru, key_affinity), using lru"
+            );
+            RoutingPolicy::Lru
+        }
+    }
+}
+
+/// `SLOT_ROUTING_POLICY` from env vars; unset = the default policy.
+fn env_routing_policy(vars: &HashMap<String, String>) -> RoutingPolicy {
+    match vars.get("SLOT_ROUTING_POLICY") {
+        Some(v) => parse_routing_policy(v),
+        None => RoutingPolicy::default(),
+    }
+}
+
 impl Cli {
     /// Parse the process command line (everything after the program name).
     pub fn from_args() -> Result<Self, String> {
@@ -761,6 +828,7 @@ impl Cli {
                 "--log-level" => cli.log_level = Some(value),
                 "--stream-queue-size" => cli.stream_queue_size = Some(value),
                 "--coalesce-requests" => cli.coalesce_requests = Some(value),
+                "--slot-routing-policy" => cli.slot_routing_policy = Some(value),
                 "--plugins" => cli.plugins = Some(value),
                 "--prefilter-blocklist" => cli.prefilter_blocklist = Some(value),
                 "--prefilter-case-insensitive" => cli.prefilter_case_insensitive = Some(value),
@@ -804,6 +872,7 @@ Options:
   --log-level <LEVEL>           LOG_LEVEL            TRACE..ERROR (default INFO; RUST_LOG overrides)
   --stream-queue-size <N>       STREAM_QUEUE_SIZE    per-request SSE channel capacity (default 16, must be >= 1)
   --coalesce-requests <BOOL>    COALESCE_REQUESTS    group concurrent same-key requests into one backend call (default false)
+  --slot-routing-policy <POL>   SLOT_ROUTING_POLICY  slot pick policy: lru (free-first, then least recently used) or key_affinity (for a request with a KV restore key, prefer an idle slot already running that key so the restore is a no-op) (default lru)
   --plugins <JSON>              PLUGINS              JSON array of plugin specs [{"name": "...", "params": {...}}] selecting the prefilter plugins (built-ins: keyword, chain, result_cache) plus optional request_log and dashboard plugins; when set, the legacy PREFILTER_* settings are ignored (default: synthesized from them)
   --prefilter-blocklist <LIST>  PREFILTER_BLOCKLIST  (legacy: keyword plugin) comma-separated keywords; matching requests are rejected (400) before the backend (default: disabled)
   --prefilter-case-insensitive <BOOL>  PREFILTER_CASE_INSENSITIVE  keyword matching is case-insensitive (default true)
@@ -879,6 +948,7 @@ Notes:
             ("LOG_LEVEL", &self.log_level),
             ("STREAM_QUEUE_SIZE", &self.stream_queue_size),
             ("COALESCE_REQUESTS", &self.coalesce_requests),
+            ("SLOT_ROUTING_POLICY", &self.slot_routing_policy),
             ("PLUGINS", &self.plugins),
             ("PREFILTER_BLOCKLIST", &self.prefilter_blocklist),
             (
@@ -1212,6 +1282,7 @@ mod tests {
             "--log-level",
             "--stream-queue-size",
             "--coalesce-requests",
+            "--slot-routing-policy",
             "--plugins",
             "--prefilter-blocklist",
             "--prefilter-case-insensitive",
@@ -1241,6 +1312,7 @@ mod tests {
             "LOG_LEVEL",
             "STREAM_QUEUE_SIZE",
             "COALESCE_REQUESTS",
+            "SLOT_ROUTING_POLICY",
             "PLUGINS",
             "PREFILTER_BLOCKLIST",
             "PREFILTER_CASE_INSENSITIVE",
@@ -1267,6 +1339,40 @@ mod tests {
         let cli = Cli::parse(vec!["--coalesce-requests".to_string(), "false".to_string()]).unwrap();
         let merged = cli.merged_env(&vars(&[("COALESCE_REQUESTS", "1")]));
         assert!(!Config::from_env_map(&merged).coalesce_requests);
+    }
+
+    #[test]
+    fn slot_routing_policy_env_and_cli() {
+        // default
+        assert_eq!(
+            Config::from_env_map(&HashMap::new()).slot_routing_policy,
+            RoutingPolicy::Lru
+        );
+        // env: both values, case-insensitive, hyphen alias accepted
+        for raw in ["lru", "LRU", "key_affinity", "KEY_AFFINITY", "key-affinity"] {
+            let expect = if raw.eq_ignore_ascii_case("lru") {
+                RoutingPolicy::Lru
+            } else {
+                RoutingPolicy::KeyAffinity
+            };
+            assert_eq!(
+                Config::from_env_map(&vars(&[("SLOT_ROUTING_POLICY", raw)])).slot_routing_policy,
+                expect,
+                "SLOT_ROUTING_POLICY={raw}"
+            );
+        }
+        // invalid -> default
+        assert_eq!(
+            Config::from_env_map(&vars(&[("SLOT_ROUTING_POLICY", "random")])).slot_routing_policy,
+            RoutingPolicy::Lru
+        );
+        // CLI wins over env
+        let cli = Cli::parse(vec!["--slot-routing-policy".to_string(), "lru".to_string()]).unwrap();
+        let merged = cli.merged_env(&vars(&[("SLOT_ROUTING_POLICY", "key_affinity")]));
+        assert_eq!(
+            Config::from_env_map(&merged).slot_routing_policy,
+            RoutingPolicy::Lru
+        );
     }
 
     #[test]

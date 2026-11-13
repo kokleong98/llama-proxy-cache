@@ -179,6 +179,7 @@ listening on 0.0.0.0:8081
 | `LOG_LEVEL`           | `INFO`                     | `TRACE..ERROR`; `RUST_LOG` overrides it             |
 | `STREAM_QUEUE_SIZE`   | `16`                       | capacity of the per-request SSE channel that buffers streamed bytes between the background reader and the HTTP response (must be >= 1; smaller values backpressure the backend faster) |
 | `COALESCE_REQUESTS`   | `false`                    | group concurrent same-cache-key requests into one backend call (Rust-only) |
+| `SLOT_ROUTING_POLICY`   | `lru`                      | slot pick policy: `lru` (free-first, then least recently used) or `key_affinity` (for a request with a KV restore key, prefer an idle slot already running that key so the restore is a no-op) |
 | `LLAMA_API_KEY`       | —                          | sent to the backend as `Authorization: Bearer <key>` (llama-server `--api-key`); unset = no auth |
 | `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables) and `dashboard` (the real-time statistics web page, at most one). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
 | `PREFILTER_BLOCKLIST` | —                          | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
@@ -215,6 +216,7 @@ built-in defaults. `--help` prints the full list with defaults:
 | `--log-level <LEVEL>`         | `LOG_LEVEL`         |
 | `--stream-queue-size <N>`     | `STREAM_QUEUE_SIZE` |
 | `--coalesce-requests <BOOL>`  | `COALESCE_REQUESTS` |
+| `--slot-routing-policy <POL>`  | `SLOT_ROUTING_POLICY` |
 | `--plugins <JSON>`            | `PLUGINS`           |
 | `--prefilter-blocklist <LIST>`    | `PREFILTER_BLOCKLIST` (legacy) |
 | `--prefilter-case-insensitive <BOOL>` | `PREFILTER_CASE_INSENSITIVE` (legacy) |
@@ -437,6 +439,12 @@ after_acquire g=(0, 0) restored=Some(Restored)
 json_done g=(0, 0) key=... saved=true is_big=true dur_ms=...
 ```
 
+(If the chosen slot is already running the matched KV cache — e.g. it
+saved it on an earlier request — the log shows
+`restore_skipped g=(...) key=... reason=already_running` instead of a
+`restore_before_chat` line: the backend call is skipped and the restore
+is counted as successful.)
+
 Check the artifacts on disk:
 
 ```bash
@@ -583,6 +591,7 @@ journalctl -u lpcache -f
 | Repeated non-streaming prompt returns instantly with no `dispatch`/`json_done` (a `prefilter_serve filter=result_cache` / `result_cache_hit` line instead) | `PREFILTER_RESULT_CACHE_DIR` is set and a fresh (non-expired) cached result for that key exists in the dir; the proxy served it without touching the backend. Expected behaviour — unset `PREFILTER_RESULT_CACHE_DIR` (or lower `PREFILTER_RESULT_CACHE_TTL`) to force fresh backend calls. |
 | `502` `provider non-JSON body` | The backend answered 200 but with a JSON body that is not an object (e.g. an array); the response is unusable. |
 | 200 response with `{"object":"error", ...}` payload | The backend answered 200 with a non-JSON body; the raw snippet is included. |
-| Logs too quiet | `LOG_LEVEL=DEBUG` (or `RUST_LOG=lpcache=debug`). Key lines: `before_acquire`, `after_acquire`, `dispatch`, `restore_candidate`, `restore_before_chat`, `json_done`, `stream_reader_done`. With `COALESCE_REQUESTS` on, also `coalesce_lead`/`coalesce_join`; with a prefilter enabled, `prefilter_accept`/`prefilter_reject`/`prefilter_serve` and (result cache) `result_cache_hit`/`result_cache_expired`. |
+| Logs too quiet | `LOG_LEVEL=DEBUG` (or `RUST_LOG=lpcache=debug`). Key lines: `before_acquire`, `after_acquire`, `dispatch`, `restore_candidate`, `restore_before_chat`, `restore_skipped`, `json_done`, `stream_reader_done`. With `COALESCE_REQUESTS` on, also `coalesce_lead`/`coalesce_join`; with a prefilter enabled, `prefilter_accept`/`prefilter_reject`/`prefilter_serve` and (result cache) `result_cache_hit`/`result_cache_expired`. |
+| Repeated requests show `restore_skipped ... reason=already_running` and never a `restore_before_chat` | The chosen slot is already running the matched KV cache (it restored or saved it earlier and llama.cpp keeps it), so the proxy skips the redundant backend restore. Expected behaviour — the slot still counts as restored (meta LRU touch and request-log flag included). |
 
 
