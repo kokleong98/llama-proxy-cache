@@ -1184,6 +1184,10 @@ async fn run_pipeline(
                     }
                 } else {
                     sm.report_success(g);
+                    // No save happens for this backend, so stamp `last_used`
+                    // here — otherwise its slots stay "never used" and the
+                    // free-tier pick pins all traffic to the first one.
+                    sm.mark_used(g);
                     tracing::info!(
                         "kv_save_skipped g={g} key={} reason=backend_kv_cache_disabled",
                         short16(&key2)
@@ -1317,6 +1321,10 @@ async fn run_pipeline(
                     // dict is still a dict, so big requests run the same save +
                     // write-meta path before the 200.
                     state.sm.report_success(g);
+                    // The slot served a request (small requests never save, so
+                    // without this it would stay "never used" and the free-tier
+                    // pick would pin all traffic to the first slot forever).
+                    state.sm.mark_used(g);
                     let save_ok = if is_big {
                         if state.config.backends[g.be].kv_cache {
                             match save_big(state, g, key, prefix, blocks, backend_model_id).await {
@@ -1360,6 +1368,12 @@ async fn run_pipeline(
                 }
                 Ok(JsonChat::Object(out)) => {
                     state.sm.report_success(g);
+                    // The slot served a request. Big requests also stamp
+                    // `last_used` in `save_after`; small requests never save, so
+                    // without this explicit mark a small-request-only workload
+                    // would keep the first slot in the "never used" free tier
+                    // and pin all traffic to it.
+                    state.sm.mark_used(g);
                     let save_ok = if is_big {
                         if state.config.backends[g.be].kv_cache {
                             match save_big(state, g, key, prefix, blocks, backend_model_id).await {
@@ -1435,10 +1449,16 @@ fn err_outcome(status: u16, msg: impl std::fmt::Display) -> (Response, SharedOut
 }
 
 /// Wait for the leader's terminal result.
+///
+/// The wakeup interest must be registered (`enable`) **before** the outcome
+/// check: `Notify::notified()` only registers on the future's first poll, so
+/// a `finish()` landing between an un-poll'ed `notified()` and that first
+/// poll would otherwise be lost and the follower would hang forever.
 async fn wait_outcome(flight: &Flight) -> SharedOutcome {
     loop {
         let notified = flight.notified();
         tokio::pin!(notified);
+        notified.as_mut().enable();
         if let Some(o) = flight.outcome() {
             return o;
         }
@@ -1467,6 +1487,7 @@ async fn follower_response(
     loop {
         let notified = flight.notified();
         tokio::pin!(notified);
+        notified.as_mut().enable();
         if let Some(o) = flight.outcome() {
             perf_from_outcome(perf.as_ref(), &o);
             return render_stream_follower_terminal(&o, client_model);
@@ -1484,6 +1505,7 @@ async fn follower_response(
         loop {
             let notified = flight2.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
             let chunk = flight2.drain_sse_from(&mut pos);
             if !chunk.is_empty() && tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                 return; // client went away

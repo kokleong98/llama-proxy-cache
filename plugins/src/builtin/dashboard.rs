@@ -53,7 +53,8 @@
 //! stat cards, a throughput bar-chart panel (requests, completion
 //! tokens and cached tokens per bucket), a resources bar-chart panel
 //! (the proxy's own CPU ms, disk bytes read/written and peak RAM per
-//! bucket), the backend table, a per-slot occupancy grid and the
+//! bucket), the backend table, a per-backend slot occupancy grid
+//! (each backend's slots grouped under its label) and the
 //! recent-requests table (with the backend index of each request). A
 //! time-filter dropdown, grouped into presets (30 seconds, 1 minute, 5
 //! minutes, 15 minutes) and other (custom time, or all time), and a
@@ -980,6 +981,7 @@ const PAGE_HEAD: &str = r##"<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lpcache dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230d1117'/%3E%3Crect x='1' y='1' width='14' height='14' rx='2.5' fill='none' stroke='%2358a6ff' stroke-width='1.5'/%3E%3Ctext x='8' y='12' font-family='monospace' font-size='10' font-weight='bold' text-anchor='middle' fill='%2358a6ff'%3E%CE%BB%3C/text%3E%3C/svg%3E">
 <style>
 :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#e6edf3; --dim:#8b949e; --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; --err:#f85149; }
 * { box-sizing: border-box; }
@@ -1008,7 +1010,10 @@ tr:last-child td { border-bottom:none; }
 .b-err { background:rgba(248,81,73,.15); color:var(--err); }
 .b-dim { background:rgba(139,148,158,.15); color:var(--dim); }
 .b-acc { background:rgba(88,166,255,.15); color:var(--accent); }
-.slots { display:flex; flex-wrap:wrap; gap:6px; }
+.slotgroups { display:flex; flex-direction:column; gap:10px; }
+.slotgroup { display:flex; align-items:center; gap:10px; }
+.slotlabel { flex:none; max-width:340px; font-size:11px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.slotgroup .slots { display:flex; flex-wrap:wrap; gap:6px; }
 .slot { width:42px; height:42px; border-radius:6px; border:1px solid var(--border); background:#21262d; display:flex; align-items:center; justify-content:center; font-size:11px; color:var(--dim); cursor:default; }
 .slot.busy { background:rgba(210,153,34,.3); border-color:var(--warn); color:var(--text); }
 .slot.down { background:rgba(248,81,73,.25); border-color:var(--err); color:var(--text); }
@@ -1092,7 +1097,7 @@ const PAGE_BODY: &str = r##"
     <div class="chartwrap"><div class="cap"><span>peak ram bytes per bucket</span><span id="cap-ram"></span></div><canvas id="chart-ram"></canvas></div>
   </section>
   <section class="panel"><h2>backends</h2><div id="backends"></div></section>
-  <section class="panel"><h2>slots</h2><div id="slots" class="slots"></div></section>
+  <section class="panel"><h2>slots</h2><div id="slots" class="slotgroups"></div></section>
   <section class="panel"><h2>recent requests</h2><div id="recent"></div></section>
 </main>
 <footer id="foot"></footer>
@@ -1335,19 +1340,30 @@ function render(d){
   bt += "</table>";
   $("backends").innerHTML = bt;
   let sl = "";
-  p.slots.forEach(g=>{
-    const be = p.backends[g.be];
-    const down = be && be.down;
-    const cls = down ? "slot down" : (g.busy ? "slot busy" : "slot");
-    const age = g.last_used_secs==null ? "never used" : ("used "+Math.round(g.last_used_secs)+" s ago");
-    sl += '<div class="'+cls+'" title="backend '+g.be+" slot "+g.slot+" \u00b7 "+(g.busy?"busy":"idle")+" \u00b7 "+age+'">'+g.slot+'</div>';
-  });
+  {
+    // Group the slot cells under their parent backend: one row per backend
+    // (label = "backend <i> · <url>") followed by that backend's slots.
+    const cellsByBe = {};
+    p.slots.forEach(g=>{
+      const be = p.backends[g.be];
+      const down = be && be.down;
+      const cls = down ? "slot down" : (g.busy ? "slot busy" : "slot");
+      const age = g.last_used_secs==null ? "never used" : ("used "+Math.round(g.last_used_secs)+" s ago");
+      cellsByBe[g.be] = (cellsByBe[g.be]||"") + '<div class="'+cls+'" title="backend '+g.be+" slot "+g.slot+" \u00b7 "+(g.busy?"busy":"idle")+" \u00b7 "+age+'">'+g.slot+'</div>';
+    });
+    const beIdx = [...new Set(p.backends.map((b,i)=>i).concat(Object.keys(cellsByBe).map(Number)))].sort((a,b)=>a-b);
+    beIdx.forEach(i=>{
+      const b = p.backends[i];
+      const label = b ? "backend "+i+" \u00b7 "+esc(b.url) : "backend "+i;
+      sl += '<div class="slotgroup"><div class="slotlabel" title="'+(b?esc(b.url):"")+'">'+label+'</div><div class="slots">'+(cellsByBe[i]||"")+'</div></div>';
+    });
+  }
   $("slots").innerHTML = sl || '<div class="empty">no slots</div>';
   let rows = (d.recent||[]).slice().reverse();
   if(ranged) rows = rows.filter(r=>r.ts >= (d.range.since==null ? 0 : d.range.since));
   if(!rows.length){ $("recent").innerHTML = '<div class="empty">no finished requests yet</div>'; }
   else {
-    let rt = "<table><tr><th>time</th><th>status</th><th>be</th><th>duration</th><th>model</th><th>key</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w</th><th>ram</th><th>note</th></tr>";
+    let rt = "<table><tr><th>time</th><th>status</th><th>backend</th><th>duration</th><th>model</th><th>key</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w</th><th>ram</th><th>note</th></tr>";
     rows.forEach(r=>{
       const flags = [];
       if(r.cache_hit) flags.push('<span class="badge b-acc">cache</span>');
@@ -2040,6 +2056,9 @@ mod tests {
         assert!(page.contains("<select id=\"backend\""));
         assert!(page.contains("<option value=\"\">all</option>"));
         assert!(page.contains("renderBackendSel(p);"));
+        // inline favicon (prevents the browser's automatic /favicon.ico
+        // request from surfacing as a 404 in the stats and request log)
+        assert!(page.contains("<link rel=\"icon\" href=\"data:image/svg+xml"));
         // the `cached` option (records served from the result cache) is
         // added to the dropdown at render time
         assert!(page.contains("value=\"cached\""));

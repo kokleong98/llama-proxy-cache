@@ -320,14 +320,17 @@ impl SlotManager {
         recovered
     }
 
-    /// Mark the slot as used even though the request failed, so the
-    /// free-slot-first selection does not keep pinning all traffic to a
-    /// slot whose requests keep failing.
+    /// Mark the slot as used so the free-slot-first selection moves on to the
+    /// next never-used slot.
     ///
-    /// Deliberate deviation from the Python original: `last_used` only
-    /// advances on a successful save, so a slot (or a slot whose backend
-    /// rejects every request) stayed "free" forever and intercepted all
-    /// traffic.
+    /// Called on every completed request — success and failure paths alike
+    /// (plus `save_after` stamps it too, redundantly, for saved big/streaming
+    /// requests). Deliberate deviation from the Python original, where
+    /// `last_used` only advanced on a successful save: a slot whose requests
+    /// keep failing — or, since small JSON requests never save at all, a slot
+    /// serving only small requests — would otherwise stay "free" forever and
+    /// intercept all traffic (the free tier scans in insertion order, so it
+    /// is always the first slot).
     pub fn mark_used(&self, g: GSlot) {
         self.last_used[self.idx(g)].store(now_nanos(), Ordering::SeqCst);
     }

@@ -276,6 +276,32 @@ async fn nonstream_small_request_no_save_no_meta() {
 }
 
 #[tokio::test]
+async fn small_requests_move_on_to_the_next_free_slot() {
+    // Regression: a successful small JSON request never saves, so without an
+    // explicit `mark_used` on the success path the first slot stayed in the
+    // "never used" free tier forever (the tier scans in insertion order) and
+    // intercepted every small request — all other slots sat idle.
+    let (app, mock, _td) = make_app().await; // 1 backend, 2 slots
+    for i in 0..3 {
+        let body = json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{ "role": "user", "content": format!("small prompt {i}") }]
+        });
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    }
+    let calls = mock.state.calls.lock().await;
+    assert_eq!(calls.chat_bodies.len(), 3);
+    // free tier: the never-used slots in insertion order, then LRU rotation
+    assert_eq!(calls.chat_bodies[0]["options"]["slot_id"], 0);
+    assert_eq!(calls.chat_bodies[1]["options"]["slot_id"], 1);
+    assert_eq!(calls.chat_bodies[2]["options"]["slot_id"], 0); // LRU: slot 0 is oldest
+    assert!(calls.saves.is_empty(), "small requests never save");
+}
+
+#[tokio::test]
 async fn nonstream_big_request_saves_and_writes_meta() {
     let (app, mock, td) = make_app().await;
     let content = words(600); // > 500 -> "big"
