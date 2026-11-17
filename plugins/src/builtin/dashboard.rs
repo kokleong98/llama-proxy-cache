@@ -1092,9 +1092,9 @@ const PAGE_BODY: &str = r##"
   <section class="panel">
     <h2>resources</h2>
     <div class="chartwrap"><div class="cap"><span>cpu ms per bucket</span><span id="cap-cpu"></span></div><canvas id="chart-cpu"></canvas></div>
-    <div class="chartwrap"><div class="cap"><span>disk read bytes per bucket</span><span id="cap-dr"></span></div><canvas id="chart-dr"></canvas></div>
-    <div class="chartwrap"><div class="cap"><span>disk write bytes per bucket</span><span id="cap-dw"></span></div><canvas id="chart-dw"></canvas></div>
-    <div class="chartwrap"><div class="cap"><span>peak ram bytes per bucket</span><span id="cap-ram"></span></div><canvas id="chart-ram"></canvas></div>
+    <div class="chartwrap"><div class="cap"><span>disk read (MB) per bucket</span><span id="cap-dr"></span></div><canvas id="chart-dr"></canvas></div>
+    <div class="chartwrap"><div class="cap"><span>disk write (MB) per bucket</span><span id="cap-dw"></span></div><canvas id="chart-dw"></canvas></div>
+    <div class="chartwrap"><div class="cap"><span>peak ram (MB) per bucket</span><span id="cap-ram"></span></div><canvas id="chart-ram"></canvas></div>
   </section>
   <section class="panel"><h2>backends</h2><div id="backends"></div></section>
   <section class="panel"><h2>slots</h2><div id="slots" class="slotgroups"></div></section>
@@ -1144,7 +1144,10 @@ function statsUrl(){
 }
 function fmtN(v){ return v==null ? "\u2013" : Math.round(v).toLocaleString(); }
 function fmtDur(v){ if(v==null) return "\u2013"; if(v<1) return Math.round(v*1000)+" ms"; if(v<120) return v.toFixed(1)+" s"; if(v<7200) return Math.floor(v/60)+" m "+Math.round(v%60)+" s"; return Math.floor(v/3600)+" h "+Math.floor((v%3600)/60)+" m"; }
-function fmtBytes(v){ if(v==null) return "\u2013"; if(v<1024) return v+" B"; if(v<1048576) return (v/1024).toFixed(1)+" KB"; if(v<1073741824) return (v/1048576).toFixed(1)+" MB"; return (v/1073741824).toFixed(2)+" GB"; }
+function fmtMB(v){ if(v==null) return "\u2013"; return (v/1048576).toFixed(2)+" MB"; }
+// Suffix-less MB figure for the byte charts (the chart caption already
+// carries the "(MB)" unit — keeps the on-bar figures short and uncluttered).
+function fmtMBn(v){ if(v==null) return "\u2013"; return (v/1048576).toFixed(2); }
 function fmtMs(v){ if(v==null) return "\u2013"; if(v<1000) return (v<10 ? v.toFixed(2) : v.toFixed(1))+" ms"; return (v/1000).toFixed(2)+" s"; }
 function fmtUp(v){ if(v==null) return "\u2013"; const s=Math.floor(v); if(s<3600) return Math.floor(s/60)+" m "+(s%60)+" s"; if(s<86400) return Math.floor(s/3600)+" h "+Math.floor((s%3600)/60)+" m"; return Math.floor(s/86400)+" d "+Math.floor((s%86400)/3600)+" h"; }
 function pct(v){ return v==null ? "\u2013" : (v*100).toFixed(1)+" %"; }
@@ -1188,12 +1191,15 @@ function hideTip(){ if(tip) tip.style.display = "none"; }
 // Draw one throughput bar chart. `series` are aligned bucket objects
 // ({t, reqs, completions, cached_tokens, cpu_ms, disk_read_bytes,
 // disk_write_bytes, ram_bytes}); `key` picks the field to plot,
-// `label`/`color` feed the on-bar figures and the hover tooltip, and `hl` is
-// the currently hovered bar index (-1 for none). The figure of each bar is
+// `label`/`color` feed the on-bar figures and the hover tooltip, `fmt`
+// formats the figures and tooltip value (default `fmtVal`; the byte
+// charts pass `fmtMBn` so the figures read as plain MB numbers — the
+// caption carries the unit), and `hl` is the
+// currently hovered bar index (-1 for none). The figure of each bar is
 // drawn on top of it; an adaptive stride skips labels when buckets are dense
 // so the figures never overlap. Chart geometry is cached on the canvas
 // (cv._chart) so the hover handlers can re-render on mousemove.
-function drawBars(cv, series, key, label, color, hl){
+function drawBars(cv, series, key, label, color, hl, fmt){ fmt = fmt || fmtVal;
   const dpr = window.devicePixelRatio || 1;
   const w = cv.clientWidth || 700, h = cv.clientHeight || 132;
   cv.width = w*dpr; cv.height = h*dpr;
@@ -1218,7 +1224,7 @@ function drawBars(cv, series, key, label, color, hl){
     ctx.fillRect(x, baseY-bh, bwid, bh);
     if(hov && bh>0){ ctx.save(); ctx.globalAlpha=.28; ctx.fillStyle="#ffffff"; ctx.fillRect(x, baseY-bh, bwid, bh); ctx.restore(); }
     if((i % stride === 0 && v>0) || hov){
-      const txt = fmtVal(v);
+      const txt = fmt(v);
       ctx.font = (hov ? "700 " : "")+"10px sans-serif";
       const tw = ctx.measureText(txt).width;
       const lx = Math.max(1, Math.min(w-tw-1, x + bwid/2 - tw/2));
@@ -1235,15 +1241,15 @@ function drawBars(cv, series, key, label, color, hl){
   }
   ctx.font = "11px sans-serif";
   ctx.fillStyle = "#8b949e";
-  ctx.fillText("max "+fmtVal(max), 2, 12);
+  ctx.fillText("max "+fmt(max), 2, 12);
   ctx.strokeStyle = "#30363d";
   ctx.beginPath(); ctx.moveTo(0,h-3.5); ctx.lineTo(w,h-3.5); ctx.stroke();
-  cv._chart = { series, key, label, color, w, h, bw, baseY, maxH, max, hl: hl==null?-1:hl };
+  cv._chart = { series, key, label, color, w, h, bw, baseY, maxH, max, hl: hl==null?-1:hl, fmt };
 }
 function redrawChart(cv){
   const c = cv._chart;
   if(!c) return;
-  drawBars(cv, c.series, c.key, c.label, c.color, c.hl);
+  drawBars(cv, c.series, c.key, c.label, c.color, c.hl, c.fmt);
 }
 // Wire up hover + tooltip on a chart canvas (call once per canvas).
 function attachChart(cv){
@@ -1257,7 +1263,7 @@ function attachChart(cv){
     if(i!==c.hl){ c.hl = i; redrawChart(cv); }
     const b = c.series[i];
     const val = (b==null || b[c.key]==null) ? 0 : b[c.key];
-    showTip(e.clientX, e.clientY, c.label, new Date(b.t*1000).toLocaleTimeString(), fmtVal(val), c.color);
+    showTip(e.clientX, e.clientY, c.label, new Date(b.t*1000).toLocaleTimeString(), (c.fmt || fmtVal)(val), c.color);
   });
   cv.addEventListener("mouseleave", ()=>{
     hideTip();
@@ -1313,17 +1319,17 @@ function render(d){
   card("c-gtps", c.avg_gen_tps==null ? "\u2013" : c.avg_gen_tps.toFixed(1));
   const res = c.resources || {};
   card("c-cpu", fmtMs(res.avg_cpu_ms), "total "+fmtMs(res.cpu_ms)+" \u00b7 proxy process");
-  card("c-dr", fmtBytes(res.disk_read_bytes), "total \u00b7 "+rangeLabel());
-  card("c-dw", fmtBytes(res.disk_write_bytes), "total \u00b7 "+rangeLabel());
-  card("c-ram", fmtBytes(res.ram_max_bytes), "max \u00b7 "+rangeLabel());
+  card("c-dr", fmtMB(res.disk_read_bytes), "total \u00b7 "+rangeLabel());
+  card("c-dw", fmtMB(res.disk_write_bytes), "total \u00b7 "+rangeLabel());
+  card("c-ram", fmtMB(res.ram_max_bytes), "max \u00b7 "+rangeLabel());
   const series = fillSeries(s.buckets, s.bucket_secs);
   drawBars($("chart-req"), series, "reqs", "requests", "#58a6ff", -1);
   drawBars($("chart-tok"), series, "completions", "completion tokens", "#3fb950", -1);
   drawBars($("chart-cached"), series, "cached_tokens", "cached tokens", "#d29922", -1);
   drawBars($("chart-cpu"), series, "cpu_ms", "cpu ms", "#bc8cff", -1);
-  drawBars($("chart-dr"), series, "disk_read_bytes", "disk bytes read", "#39c5cf", -1);
-  drawBars($("chart-dw"), series, "disk_write_bytes", "disk bytes written", "#db61a2", -1);
-  drawBars($("chart-ram"), series, "ram_bytes", "peak ram bytes", "#f85149", -1);
+  drawBars($("chart-dr"), series, "disk_read_bytes", "disk read (MB)", "#39c5cf", -1, fmtMBn);
+  drawBars($("chart-dw"), series, "disk_write_bytes", "disk write (MB)", "#db61a2", -1, fmtMBn);
+  drawBars($("chart-ram"), series, "ram_bytes", "peak ram (MB)", "#f85149", -1, fmtMBn);
   const span = series.length ? series.length*s.bucket_secs : 0;
   const spanLabel = span ? (ranged ? rangeLabel() : span+" s window")+" \u00b7 "+s.bucket_secs+" s buckets" : "";
   $("cap-req").textContent = spanLabel;
@@ -1363,7 +1369,7 @@ function render(d){
   if(ranged) rows = rows.filter(r=>r.ts >= (d.range.since==null ? 0 : d.range.since));
   if(!rows.length){ $("recent").innerHTML = '<div class="empty">no finished requests yet</div>'; }
   else {
-    let rt = "<table><tr><th>time</th><th>status</th><th>backend</th><th>duration</th><th>model</th><th>key</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w</th><th>ram</th><th>note</th></tr>";
+    let rt = "<table><tr><th>time</th><th>status</th><th>backend</th><th>duration</th><th>model</th><th>key</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w (MB)</th><th>ram (MB)</th><th>note</th></tr>";
     rows.forEach(r=>{
       const flags = [];
       if(r.cache_hit) flags.push('<span class="badge b-acc">cache</span>');
@@ -1373,8 +1379,8 @@ function render(d){
       const when = new Date(r.ts*1000).toLocaleTimeString();
       const toks = r.prompt_tokens!=null ? r.prompt_tokens+" / "+(r.completion_tokens!=null?r.completion_tokens:"?")+" / "+(r.cached_tokens!=null?r.cached_tokens:0) : "\u2013";
       const cpu = r.cpu_ms!=null ? r.cpu_ms.toFixed(1)+" ms" : "\u2013";
-      const diow = (r.disk_read_bytes!=null || r.disk_write_bytes!=null) ? fmtBytes(r.disk_read_bytes||0)+" / "+fmtBytes(r.disk_write_bytes||0) : "\u2013";
-      const ram = r.ram_bytes!=null ? fmtBytes(r.ram_bytes) : "\u2013";
+      const diow = (r.disk_read_bytes!=null || r.disk_write_bytes!=null) ? fmtMB(r.disk_read_bytes||0)+" / "+fmtMB(r.disk_write_bytes||0) : "\u2013";
+      const ram = r.ram_bytes!=null ? fmtMB(r.ram_bytes) : "\u2013";
       rt += "<tr><td>"+when+"</td><td>"+statusBadge(r.status)+"</td><td>"+(r.backend==null?"\u2013":r.backend)+"</td><td>"+fmtDur(r.duration_secs)+"</td><td>"+esc(r.model)+"</td><td>"+(r.key?esc(r.key):"\u2013")+"</td><td>"+flags.join(" ")+"</td><td>"+toks+"</td><td>"+(r.ttft_ms!=null?Math.round(r.ttft_ms)+" ms":"\u2013")+"</td><td>"+(r.gen_tps!=null?r.gen_tps.toFixed(1):"\u2013")+"</td><td>"+cpu+"</td><td>"+diow+"</td><td>"+ram+"</td><td>"+(r.reason?esc(r.reason):"")+"</td></tr>";
     });
     rt += "</table>";
