@@ -198,6 +198,22 @@ fn prompt_key(cfg: &mut LpcacheConfig, key: &str) -> Result<bool, String> {
             Some(i) => levels[i].to_string(),
             None => return Ok(false), // Esc keeps the current value
         }
+    } else if key == "proxy.slot_routing_policy" {
+        let policies = ["lru", "key_affinity"];
+        let def = policies
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case(&cur))
+            .unwrap_or(0);
+        match Select::with_theme(&theme())
+            .with_prompt(key)
+            .items(&policies)
+            .default(def)
+            .interact_opt()
+            .map_err(aborted)?
+        {
+            Some(i) => policies[i].to_string(),
+            None => return Ok(false), // Esc keeps the current value
+        }
     } else if cur == "true" || cur == "false" {
         Confirm::with_theme(&theme())
             .with_prompt(key)
@@ -904,7 +920,7 @@ mod tests {
 
     #[test]
     fn section_keys_match_the_model() {
-        assert_eq!(section_keys("proxy").len(), 7);
+        assert_eq!(section_keys("proxy").len(), 8);
         assert_eq!(section_keys("kv_cache").len(), 8);
         assert_eq!(section_keys("prefilter").len(), 4);
         assert_eq!(section_keys("request_log").len(), 5);

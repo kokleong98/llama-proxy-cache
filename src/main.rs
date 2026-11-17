@@ -167,10 +167,12 @@ async fn main() {
     }
 
     let sm = Arc::new(
-        SlotManager::new(&config.backends, clients.clone()).with_save_retry(
-            config.save_retries,
-            std::time::Duration::from_millis(config.save_retry_delay_ms),
-        ),
+        SlotManager::new(&config.backends, clients.clone())
+            .with_save_retry(
+                config.save_retries,
+                std::time::Duration::from_millis(config.save_retry_delay_ms),
+            )
+            .with_routing_policy(config.slot_routing_policy),
     );
     let state = AppState {
         config: Arc::new(config.clone()),

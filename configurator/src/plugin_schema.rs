@@ -46,7 +46,7 @@ pub struct Param {
     /// Runtime refuses to start without it (missing **or** empty).
     pub required: bool,
     /// The runtime rejects an **empty** list for this optional param
-    /// (`request_log.fields`: omitted = all 31 fields, but an explicit
+    /// (`request_log.fields`: omitted = all 33 fields, but an explicit
     /// `[]` is a startup error).
     pub error_if_empty: bool,
     /// The runtime rejects repeated list items (`request_log.fields`).
@@ -111,7 +111,7 @@ fn category_alias_ok(raw: &str) -> bool {
     )
 }
 
-/// The 28 W3C-XLF field names the request log accepts (`KNOWN_FIELDS`).
+/// The 33 W3C-XLF field names the request log accepts (`KNOWN_FIELDS`).
 pub const XLF_FIELDS: &[&str] = &[
     "datetime",
     "cs-method",
@@ -141,6 +141,11 @@ pub const XLF_FIELDS: &[&str] = &[
     "lpcache-prefill-tps",
     "lpcache-gen-tps",
     "lpcache-ttft-ms",
+    "lpcache-cpu-ms",
+    "lpcache-disk-read-bytes",
+    "lpcache-disk-write-bytes",
+    "lpcache-ram-bytes",
+    "lpcache-peak-ram-bytes",
 ];
 
 const FAIL_ACTIONS: &[&str] = &["accept", "reject", "allow", "block"];
@@ -337,7 +342,7 @@ fn build() -> Vec<Plugin> {
                     .ch(XLF_FIELDS)
                     .no_empty()
                     .no_dup()
-                    .help("ordered subset of the known XLF field names (blank = all 31; an explicit empty list or a repeated field is a startup error)"),
+                    .help("ordered subset of the known XLF field names (blank = all 33; an explicit empty list or a repeated field is a startup error)"),
             ],
         )
         .unique()

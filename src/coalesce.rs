@@ -102,8 +102,14 @@ impl Flight {
         self.sse.lock().unwrap().clone()
     }
 
-    /// Register a wakeup interest **before** checking the condition (the
-    /// check-then-wait pattern; see the `tokio::sync::Notify` docs).
+    /// A wakeup interest in this flight's notifications.
+    ///
+    /// NOTE: constructing the returned future does **not** register the
+    /// interest — `tokio::sync::Notify` registers it on the future's first
+    /// poll (or an explicit `enable()`). Callers that use the
+    /// check-then-wait pattern must call `enable()` *before* checking the
+    /// condition; otherwise a notification landing in that gap is lost and
+    /// the waiter hangs forever (see `early_finish_does_not_lose_the_wakeup`).
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
@@ -211,6 +217,37 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         f.finish(SharedOutcome::Json(200, json!({ "ok": true })));
         let o = waiter.await.unwrap();
+        assert_eq!(o, SharedOutcome::Json(200, json!({ "ok": true })));
+    }
+
+    /// Regression for a lost-wakeup hang: the follower's check-then-wait
+    /// pattern only holds if the wakeup interest is registered (`enable()`)
+    /// **before** the condition check. `Notify::notified()` alone registers
+    /// on the first poll, so a `finish()` landing between the un-poll'ed
+    /// `notified()` and that first poll was lost — the follower (and its
+    /// client) hung forever while the group leaked in the map.
+    #[tokio::test]
+    async fn early_finish_does_not_lose_the_wakeup() {
+        let f = Arc::new(Flight::new());
+        let f2 = Arc::clone(&f);
+        let waiter = tokio::spawn(async move {
+            loop {
+                let n = f2.notified();
+                tokio::pin!(n);
+                n.as_mut().enable(); // register BEFORE the outcome check
+                if let Some(o) = f2.outcome() {
+                    return o;
+                }
+                n.await;
+            }
+        });
+        // No sleep: `finish` may land before or after the waiter's check;
+        // both orders must deliver the outcome, never hang.
+        f.finish(SharedOutcome::Json(200, json!({ "ok": true })));
+        let o = tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+            .await
+            .expect("waiter must not hang")
+            .unwrap();
         assert_eq!(o, SharedOutcome::Json(200, json!({ "ok": true })));
     }
 

@@ -156,7 +156,7 @@ Expected startup logs:
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
 slot_manager n_backends=2 total_slots=2
-app_start version=0.8.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
+app_start version=0.9.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
 
@@ -179,6 +179,7 @@ listening on 0.0.0.0:8081
 | `LOG_LEVEL`           | `INFO`                     | `TRACE..ERROR`; `RUST_LOG` overrides it             |
 | `STREAM_QUEUE_SIZE`   | `16`                       | capacity of the per-request SSE channel that buffers streamed bytes between the background reader and the HTTP response (must be >= 1; smaller values backpressure the backend faster) |
 | `COALESCE_REQUESTS`   | `false`                    | group concurrent same-cache-key requests into one backend call (Rust-only) |
+| `SLOT_ROUTING_POLICY`   | `lru`                      | slot pick policy: `lru` (free-first, then least recently used) or `key_affinity` (for a request with a KV restore key, prefer an idle slot already running that key so the restore is a no-op) |
 | `LLAMA_API_KEY`       | —                          | sent to the backend as `Authorization: Bearer <key>` (llama-server `--api-key`); unset = no auth |
 | `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables) and `dashboard` (the real-time statistics web page, at most one). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
 | `PREFILTER_BLOCKLIST` | —                          | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
@@ -191,7 +192,7 @@ listening on 0.0.0.0:8081
 | `REQUEST_LOG_PATH`      | `lpcache-request.log`      | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
 | `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB)        | rotation threshold in bytes (`<path>.1`, `<path>.2`, …); `0` = no rotation |
 | `REQUEST_LOG_KEEP`      | `5`                        | rotated generations retained (the oldest is dropped); `0` = keep them all |
-| `REQUEST_LOG_FIELDS`    | all 31 fields              | comma-separated ordered subset of the known XLF field names (W3C + `lpcache-*` pipeline/performance/resource fields) |
+| `REQUEST_LOG_FIELDS`    | all 33 fields              | comma-separated ordered subset of the known XLF field names (W3C + `lpcache-*` pipeline/performance/resource fields) |
 
 Every variable also has a command-line flag; explicit flags take
 precedence over environment variables, which take precedence over the
@@ -215,6 +216,7 @@ built-in defaults. `--help` prints the full list with defaults:
 | `--log-level <LEVEL>`         | `LOG_LEVEL`         |
 | `--stream-queue-size <N>`     | `STREAM_QUEUE_SIZE` |
 | `--coalesce-requests <BOOL>`  | `COALESCE_REQUESTS` |
+| `--slot-routing-policy <POL>`  | `SLOT_ROUTING_POLICY` |
 | `--plugins <JSON>`            | `PLUGINS`           |
 | `--prefilter-blocklist <LIST>`    | `PREFILTER_BLOCKLIST` (legacy) |
 | `--prefilter-case-insensitive <BOOL>` | `PREFILTER_CASE_INSENSITIVE` (legacy) |
@@ -325,14 +327,16 @@ stream, key, n-words, is-big, backend, slot, restored, cache-hit,
 coalesced, reason) and the `lpcache-*` performance fields (prompt /
 completion / cached tokens, prefill and generation time and throughput
 from the backend's `usage`/`timings`, plus the proxy-side time to first
-token). Missing values render as `-`.
+token) and the `lpcache-*` resource fields (the proxy process's own CPU
+time and disk I/O during the request, plus its resident memory and peak
+resident memory when the request completed). Missing values render as `-`.
 
 - **Rotation**: when the file grows beyond `REQUEST_LOG_MAX_BYTES`
   (default 10 MiB) it is rotated (`<path>.1`, `<path>.2`, …, each fresh
   file starting with a new XLF header) and at most
   `REQUEST_LOG_KEEP` (default 5) generations are kept; `0` for either
   disables rotation / keeps all generations. `REQUEST_LOG_FIELDS`
-  selects an ordered subset of the 31 known fields.
+  selects an ordered subset of the 33 known fields.
 - Logging never breaks request serving: log I/O failures are logged and
   swallowed.
 - The full field list and format details are in the
@@ -350,26 +354,39 @@ external assets — nothing to fetch from a CDN, so it works on
 air-gapped boxes). The proxy mounts the page at the plugin's `path`
 (default `/dashboard`) and its JSON stats endpoint at
 `{path}/api/stats` (optionally `?since=<unix seconds>` to scope the
-aggregates to a time range); the page polls it every `refresh_ms`
+aggregates to a time range and `?backend=<index|cached>` to restrict
+them to one backend or to the result-cache records — absent = all
+backends, the default); the page polls it
+every `refresh_ms`
 (default 2000) and shows:
 
 - **Time filter**: a dropdown of ranges, grouped into *presets* (30
   seconds, 1 minute, 5 minutes, 15 minutes) and *other* (custom time —
   a number of seconds — and all time) — that scopes the KPIs, charts
   and recent table to the selected range (default 5 minutes).
+- **Backend filter**: a dropdown of the proxy's backends, the `cached`
+  scope (the records served from the result cache — they never touch a
+  backend) and the default *all* (no filtering — every statistic
+  includes all of them) — that scopes the KPIs, charts and
+  recent table to the selected backend or cache scope. Each scope keeps
+  its own recent-requests ring, so a selected filter keeps showing that
+  scope's rows even when they have rotated out of the all-backends ring.
 - **KPIs**: total requests and success rate, cache-hit and KV-restore
   counts, slots in flight, active coalesced groups, request rate and
   completion token rate over the selected time range, KV meta files on
   disk, average duration / TTFT / backend generation rate, and the
-  proxy's own resource usage — average CPU ms (with the total) and disk
-  bytes read/written over the range.
-- **Charts**: bar charts of requests, completion tokens, cached
-  (restored) prompt tokens and CPU ms per `bucket_secs` bucket (default
-  5 s; long ranges are coarsened to at most 360 points automatically).
+  proxy's own resource usage — average CPU ms (with the total), disk
+  bytes read/written and peak RAM over the range.
+- **Charts**: two panels of bar charts per `bucket_secs` bucket
+  (default 5 s; long ranges are coarsened to at most 360 points
+  automatically): *throughput* — requests, completion tokens, cached
+  (restored) prompt tokens; and *resources* — the proxy's own CPU ms,
+  disk bytes read/written and peak RAM.
 - **Tables**: per-backend status (URL, slots, busy slots, circuit
   breaker state), per-slot occupancy grid, and the recent-requests ring
-  (`max_recent`, default 100: status, model, stream, tokens, timing,
-  pipeline outcome), filtered to the selected time range.
+  (`max_recent` per backend scope, default 100: status, backend, model,
+  stream, tokens, timing, per-request CPU, disk I/O and RAM, pipeline
+  outcome), filtered to the selected time range and backend scope.
 
 Every finished request (success, error, rejection, disconnect — the same
 records the request log gets) feeds the aggregates; the live
@@ -421,6 +438,12 @@ restore_candidate basename=... ratio=1.000
 after_acquire g=(0, 0) restored=Some(Restored)
 json_done g=(0, 0) key=... saved=true is_big=true dur_ms=...
 ```
+
+(If the chosen slot is already running the matched KV cache — e.g. it
+saved it on an earlier request — the log shows
+`restore_skipped g=(...) key=... reason=already_running` instead of a
+`restore_before_chat` line: the backend call is skipped and the restore
+is counted as successful.)
 
 Check the artifacts on disk:
 
@@ -568,6 +591,7 @@ journalctl -u lpcache -f
 | Repeated non-streaming prompt returns instantly with no `dispatch`/`json_done` (a `prefilter_serve filter=result_cache` / `result_cache_hit` line instead) | `PREFILTER_RESULT_CACHE_DIR` is set and a fresh (non-expired) cached result for that key exists in the dir; the proxy served it without touching the backend. Expected behaviour — unset `PREFILTER_RESULT_CACHE_DIR` (or lower `PREFILTER_RESULT_CACHE_TTL`) to force fresh backend calls. |
 | `502` `provider non-JSON body` | The backend answered 200 but with a JSON body that is not an object (e.g. an array); the response is unusable. |
 | 200 response with `{"object":"error", ...}` payload | The backend answered 200 with a non-JSON body; the raw snippet is included. |
-| Logs too quiet | `LOG_LEVEL=DEBUG` (or `RUST_LOG=lpcache=debug`). Key lines: `before_acquire`, `after_acquire`, `dispatch`, `restore_candidate`, `restore_before_chat`, `json_done`, `stream_reader_done`. With `COALESCE_REQUESTS` on, also `coalesce_lead`/`coalesce_join`; with a prefilter enabled, `prefilter_accept`/`prefilter_reject`/`prefilter_serve` and (result cache) `result_cache_hit`/`result_cache_expired`. |
+| Logs too quiet | `LOG_LEVEL=DEBUG` (or `RUST_LOG=lpcache=debug`). Key lines: `before_acquire`, `after_acquire`, `dispatch`, `restore_candidate`, `restore_before_chat`, `restore_skipped`, `json_done`, `stream_reader_done`. With `COALESCE_REQUESTS` on, also `coalesce_lead`/`coalesce_join`; with a prefilter enabled, `prefilter_accept`/`prefilter_reject`/`prefilter_serve` and (result cache) `result_cache_hit`/`result_cache_expired`. |
+| Repeated requests show `restore_skipped ... reason=already_running` and never a `restore_before_chat` | The chosen slot is already running the matched KV cache (it restored or saved it earlier and llama.cpp keeps it), so the proxy skips the redundant backend restore. Expected behaviour — the slot still counts as restored (meta LRU touch and request-log flag included). |
 
 

@@ -102,6 +102,7 @@ footer{padding:10px 20px;color:var(--dim);font-size:12px;border-top:1px solid va
         <label>Stream queue size (STREAM_QUEUE_SIZE)<input id="f_stream_queue" type="number" min="1"></label>
         <label>Backend API key (LLAMA_API_KEY)<input id="f_api_key" type="password" placeholder="(none)"></label>
         <label class="check"><input id="f_coalesce" type="checkbox"> Coalesce same-key requests (COALESCE_REQUESTS)</label>
+        <label>Slot routing policy (SLOT_ROUTING_POLICY)<select id="f_routing"><option value="lru">lru — free slot first, then least recently used</option><option value="key_affinity">key_affinity — prefer an idle slot already running the KV key</option></select></label>
       </div>
     </details>
     <details open>
@@ -196,6 +197,7 @@ function collect() {
       request_timeout_secs: num($('f_timeout').value),
       stream_queue_size: int($('f_stream_queue').value),
       coalesce_requests: $('f_coalesce').checked,
+      slot_routing_policy: $('f_routing').value,
       api_key: $('f_api_key').value.trim()
     },
     backend: Array.from(document.querySelectorAll('.backend-row')).map(row => ({
@@ -238,6 +240,7 @@ function apply(c) {
   $('f_timeout').value = c.proxy.request_timeout_secs;
   $('f_stream_queue').value = c.proxy.stream_queue_size;
   $('f_coalesce').checked = !!c.proxy.coalesce_requests;
+  $('f_routing').value = c.proxy.slot_routing_policy || 'lru';
   $('f_api_key').value = c.proxy.api_key || '';
   renderBackends(c.backend && c.backend.length ? c.backend : []);
   $('f_wpb').value = c.kv_cache.words_per_block;

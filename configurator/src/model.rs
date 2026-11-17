@@ -9,7 +9,8 @@
 //!
 //! ```toml
 //! [proxy]        PORT / MODEL_ID / LOG_LEVEL / REQUEST_TIMEOUT /
-//!                STREAM_QUEUE_SIZE / COALESCE_REQUESTS / LLAMA_API_KEY
+//!                STREAM_QUEUE_SIZE / COALESCE_REQUESTS /
+//!                SLOT_ROUTING_POLICY / LLAMA_API_KEY
 //! [[backend]]    one entry per backend (BACKENDS when >1, LLAMA_URL /
 //!                N_SLOTS / SLOT_SAVE_PATH for a single backend)
 //! [kv_cache]     WORDS_PER_BLOCK / BIG_THRESHOLD_WORDS / LCP_TH / META_DIR /
@@ -73,6 +74,11 @@ pub struct ProxyConfig {
     pub stream_queue_size: usize,
     /// `COALESCE_REQUESTS`: group concurrent same-key requests.
     pub coalesce_requests: bool,
+    /// `SLOT_ROUTING_POLICY`: the slot pick policy (`lru` = free
+    /// never-used slots first, then least recently used; `key_affinity` =
+    /// before those tiers, prefer an idle slot already running the
+    /// request's KV restore key).
+    pub slot_routing_policy: String,
     /// `LLAMA_API_KEY`: sent to the backend as `Authorization: Bearer <key>`
     /// (`""` = no auth header).
     pub api_key: String,
@@ -126,7 +132,7 @@ pub struct RequestLogConfig {
     pub max_bytes: u64,
     /// `REQUEST_LOG_KEEP`: rotated generations retained (`0` = keep all).
     pub keep: usize,
-    /// `REQUEST_LOG_FIELDS`: ordered subset of XLF fields (`[]` = all 31).
+    /// `REQUEST_LOG_FIELDS`: ordered subset of XLF fields (`[]` = all 33).
     pub fields: Vec<String>,
 }
 
@@ -159,6 +165,7 @@ impl Default for ProxyConfig {
             request_timeout_secs: lpcache::config::DEFAULT_REQUEST_TIMEOUT_SECS,
             stream_queue_size: lpcache::config::DEFAULT_STREAM_QUEUE_SIZE,
             coalesce_requests: false,
+            slot_routing_policy: lpcache::config::RoutingPolicy::default().as_str().to_string(),
             api_key: String::new(),
         }
     }
@@ -275,6 +282,16 @@ impl LpcacheConfig {
                 "proxy.stream_queue_size must be >= 1 (0 is not representable)".into(),
             );
         }
+        if !matches!(
+            self.proxy.slot_routing_policy.to_ascii_lowercase().as_str(),
+            "lru" | "key_affinity" | "key-affinity"
+        ) {
+            warnings.push(format!(
+                "proxy.slot_routing_policy {:?} is not one of lru / key_affinity — \
+                 the proxy would log a warning and fall back to lru",
+                self.proxy.slot_routing_policy
+            ));
+        }
 
         if self.kv_cache.words_per_block == 0 {
             errors.push("kv_cache.words_per_block must be >= 1".into());
@@ -376,6 +393,11 @@ impl LpcacheConfig {
             "proxy",
             "COALESCE_REQUESTS".into(),
             p.coalesce_requests.to_string(),
+        ));
+        v.push((
+            "proxy",
+            "SLOT_ROUTING_POLICY".into(),
+            p.slot_routing_policy.clone(),
         ));
         if !p.api_key.trim().is_empty() {
             v.push(("proxy", "LLAMA_API_KEY".into(), p.api_key.clone()));
@@ -491,6 +513,7 @@ impl LpcacheConfig {
             format!("--request-timeout {}", fmt_num(p.request_timeout_secs)),
             format!("--stream-queue-size {}", p.stream_queue_size),
             format!("--coalesce-requests {}", p.coalesce_requests),
+            format!("--slot-routing-policy {}", p.slot_routing_policy),
         ];
         if !p.api_key.trim().is_empty() {
             a.push(format!("--api-key {}", p.api_key));
@@ -567,6 +590,7 @@ impl LpcacheConfig {
         );
         let _ = writeln!(s, "  stream_queue_size      {}", p.stream_queue_size);
         let _ = writeln!(s, "  coalesce_requests      {}", p.coalesce_requests);
+        let _ = writeln!(s, "  slot_routing_policy    {}", p.slot_routing_policy);
         let _ = writeln!(
             s,
             "  api_key                {}",
@@ -688,6 +712,7 @@ impl LpcacheConfig {
             "proxy.request_timeout_secs" => Some(fmt_num(self.proxy.request_timeout_secs)),
             "proxy.stream_queue_size" => Some(self.proxy.stream_queue_size.to_string()),
             "proxy.coalesce_requests" => Some(self.proxy.coalesce_requests.to_string()),
+            "proxy.slot_routing_policy" => Some(self.proxy.slot_routing_policy.clone()),
             "proxy.api_key" => Some(self.proxy.api_key.clone()),
             "kv_cache.words_per_block" => Some(self.kv_cache.words_per_block.to_string()),
             "kv_cache.big_threshold_words" => Some(self.kv_cache.big_threshold_words.to_string()),
@@ -724,6 +749,7 @@ impl LpcacheConfig {
             "proxy.request_timeout_secs",
             "proxy.stream_queue_size",
             "proxy.coalesce_requests",
+            "proxy.slot_routing_policy",
             "proxy.api_key",
             "kv_cache.words_per_block",
             "kv_cache.big_threshold_words",
@@ -782,6 +808,9 @@ impl LpcacheConfig {
                 self.proxy.stream_queue_size = parse_usize(value, key)?
             }
             "proxy.coalesce_requests" => set_bool(&mut self.proxy.coalesce_requests, value, key)?,
+            "proxy.slot_routing_policy" => {
+                self.proxy.slot_routing_policy = value.trim().to_string()
+            }
             "proxy.api_key" => self.proxy.api_key = value.to_string(),
             "kv_cache.words_per_block" => {
                 self.kv_cache.words_per_block = parse_usize(value, key)?
@@ -901,6 +930,11 @@ mod tests {
         assert_eq!(cfg.get_key("prefilter.blocklist").unwrap(), "foo,bar");
         cfg.set_key("proxy.coalesce_requests", "yes").unwrap();
         assert_eq!(cfg.get_key("proxy.coalesce_requests").unwrap(), "true");
+        cfg.set_key("proxy.slot_routing_policy", "key_affinity").unwrap();
+        assert_eq!(
+            cfg.get_key("proxy.slot_routing_policy").unwrap(),
+            "key_affinity"
+        );
         assert!(cfg.set_key("nope.nope", "x").is_err());
         assert!(cfg.set_key("proxy.port", "nope").is_err());
     }
@@ -917,6 +951,7 @@ mod tests {
         assert_eq!(get("N_SLOTS").as_deref(), Some("1"));
         assert_eq!(get("SLOT_SAVE_PATH").as_deref(), Some("kvcache"));
         assert_eq!(get("LLAMA_API_KEY").as_deref(), Some("sekret"));
+        assert_eq!(get("SLOT_ROUTING_POLICY").as_deref(), Some("lru"));
         assert_eq!(get("PREFILTER_BLOCKLIST").as_deref(), Some("bad"));
         assert!(get("BACKENDS").is_none());
         assert!(get("REQUEST_LOG").is_none());
@@ -957,6 +992,12 @@ mod tests {
         cfg.kv_cache.slot_save_path.clear();
         let (_, warnings) = cfg.validate();
         assert!(warnings.iter().any(|w| w.contains("slot_save_path")));
+
+        let mut cfg = LpcacheConfig::default();
+        cfg.proxy.slot_routing_policy = "round_robin".into();
+        let (errors, warnings) = cfg.validate();
+        assert!(errors.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("slot_routing_policy")));
     }
 
     #[test]
@@ -965,6 +1006,8 @@ mod tests {
         let args = cfg.cli_args();
         assert!(args.contains(&"--port 8081".to_string()));
         assert!(args.contains(&"--llama-url http://127.0.0.1:8000".to_string()));
+        assert!(args.contains(&"--coalesce-requests false".to_string()));
+        assert!(args.contains(&"--slot-routing-policy lru".to_string()));
         assert!(!args.iter().any(|a| a.starts_with("--request-log ")));
     }
 }

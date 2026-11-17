@@ -66,9 +66,9 @@ pub mod builtin;
 pub mod registry;
 
 pub use api::{
-    BackendBreaker, BackendError, BackendStatus, Dashboard, JsonChat, LlamaBackend, PostCleanup,
-    Prefilter, PrefilterDecision, PrefilterRequest, ProxyStatus, RequestLogRecord, RequestLogger,
-    RestoreOutcome, ResultStore, SlotStatus, StreamChat, format_utc,
+    BackendBreaker, BackendError, BackendScope, BackendStatus, Dashboard, JsonChat, LlamaBackend,
+    PostCleanup, Prefilter, PrefilterDecision, PrefilterRequest, ProxyStatus, RequestLogRecord,
+    RequestLogger, RestoreOutcome, ResultStore, SlotStatus, StreamChat, format_utc,
 };
 pub use builtin::dashboard::DashboardPlugin;
 pub use builtin::llama::LlamaClient;

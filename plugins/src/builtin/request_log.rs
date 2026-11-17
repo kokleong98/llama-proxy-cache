@@ -13,9 +13,11 @@
 //! `lpcache-prefill-tps`, `lpcache-gen-tps`, `lpcache-ttft-ms` —
 //! backend-reported token counts/timings plus the proxy-side time to
 //! first token) and the lpcache resource fields (`lpcache-cpu-ms`,
-//! `lpcache-disk-read-bytes`, `lpcache-disk-write-bytes` — the proxy
-//! process's own CPU and disk-I/O consumption during the request; see
-//! the `lpcache` crate's `procsample` module).
+//! `lpcache-disk-read-bytes`, `lpcache-disk-write-bytes`,
+//! `lpcache-ram-bytes`, `lpcache-peak-ram-bytes` — the proxy process's
+//! own CPU and disk-I/O consumption during the request, plus its
+//! resident memory and peak resident memory when the request completed;
+//! see the `lpcache` crate's `procsample` module).
 //!
 //! The file starts with the XLF header:
 //!
@@ -44,7 +46,7 @@
 //! - `max_bytes` (default 10 MiB): rotation threshold; `0` = no rotation.
 //! - `keep` (default `5`): rotated generations kept (`0` = keep all).
 //! - `fields` (optional): ordered list of field names to emit — any
-//!   subset of the 31 known fields (default: all of them, W3C fields
+//!   subset of the 33 known fields (default: all of them, W3C fields
 //!   first).
 //!
 //! The `datetime` field uses UTC with millisecond precision
@@ -102,6 +104,8 @@ pub const DEFAULT_FIELDS: &[&str] = &[
     "lpcache-cpu-ms",
     "lpcache-disk-read-bytes",
     "lpcache-disk-write-bytes",
+    "lpcache-ram-bytes",
+    "lpcache-peak-ram-bytes",
 ];
 
 /// Every known field name (the `fields` parameter is validated against
@@ -188,6 +192,8 @@ fn field_value(record: &RequestLogRecord, field: &str) -> Option<String> {
         "lpcache-cpu-ms" => record.cpu_ms.map(format_ms),
         "lpcache-disk-read-bytes" => record.disk_read_bytes.map(|v| v.to_string()),
         "lpcache-disk-write-bytes" => record.disk_write_bytes.map(|v| v.to_string()),
+        "lpcache-ram-bytes" => record.ram_bytes.map(|v| v.to_string()),
+        "lpcache-peak-ram-bytes" => record.peak_ram_bytes.map(|v| v.to_string()),
         // Unreachable: the field list is validated at construction.
         _ => None,
     }
@@ -537,6 +543,8 @@ mod tests {
             cpu_ms: Some(87.5),
             disk_read_bytes: Some(104_857_600),
             disk_write_bytes: Some(4096),
+            ram_bytes: Some(268_435_456),
+            peak_ram_bytes: Some(536_870_912),
         }
     }
 
@@ -605,6 +613,8 @@ mod tests {
         assert_eq!(get("lpcache-cpu-ms"), "87.50");
         assert_eq!(get("lpcache-disk-read-bytes"), "104857600");
         assert_eq!(get("lpcache-disk-write-bytes"), "4096");
+        assert_eq!(get("lpcache-ram-bytes"), "268435456");
+        assert_eq!(get("lpcache-peak-ram-bytes"), "536870912");
     }
 
     #[test]
@@ -654,14 +664,16 @@ mod tests {
     #[test]
     fn resource_fields_render_dash_when_sampling_unavailable() {
         // A record with no resource data (e.g. a platform where CPU/disk
-        // sampling is unavailable): every resource field is `-` while the
-        // other fields are intact.
+        // memory sampling is unavailable): every resource field is `-`
+        // while the other fields are intact.
         let td = tempfile::tempdir().expect("tempdir");
         let (log, path) = log_in(&td);
         let mut r = record();
         r.cpu_ms = None;
         r.disk_read_bytes = None;
         r.disk_write_bytes = None;
+        r.ram_bytes = None;
+        r.peak_ram_bytes = None;
         log.log(&r).expect("log");
         let content = std::fs::read_to_string(&path).expect("read");
         let lines: Vec<&str> = content.lines().collect();
@@ -673,7 +685,13 @@ mod tests {
                 .expect("field");
             values[i]
         };
-        for f in ["lpcache-cpu-ms", "lpcache-disk-read-bytes", "lpcache-disk-write-bytes"] {
+        for f in [
+            "lpcache-cpu-ms",
+            "lpcache-disk-read-bytes",
+            "lpcache-disk-write-bytes",
+            "lpcache-ram-bytes",
+            "lpcache-peak-ram-bytes",
+        ] {
             assert_eq!(get(f), "-", "{f}");
         }
         // non-resource fields unaffected.
