@@ -3382,6 +3382,96 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
         ),
         "hover handlers attached to all seven charts"
     );
+    // the token charts overlay the per-request p50/p95 of each metric
+    // (completion tokens; cached prompt tokens) and the resource charts
+    // the per-request p50/p95 of each resource metric (a solid p50 /
+    // dashed p95 tick per bar plus a legend; the percentile fields are
+    // tracked per scope, so the filtered views' points carry their
+    // scope's own fields) and the window-wide p50/p95 as full-width
+    // lines — plus the p50/p95 of the drawn per-bucket aggregate
+    // values (the bars themselves) as a second full-width line pair.
+    // The additive resource charts (cpu ms, disk read, disk write)
+    // additionally draw the window total next to the max.
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-tok\"), series, \"completions\", \"completion tokens\", \"#3fb950\", -1, fmtVal, \"completion_tokens_p50\", \"completion_tokens_p95\", ov ? ov.completion_tokens_p50 : null, ov ? ov.completion_tokens_p95 : null, ag ? ag.completion_tokens_p50 : null, ag ? ag.completion_tokens_p95 : null);"
+        ),
+        "completion-tokens chart overlays the per-request percentiles"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-cached\"), series, \"cached_tokens\", \"cached tokens\", \"#d29922\", -1, fmtVal, \"cached_tokens_p50\", \"cached_tokens_p95\", ov ? ov.cached_tokens_p50 : null, ov ? ov.cached_tokens_p95 : null, ag ? ag.cached_tokens_p50 : null, ag ? ag.cached_tokens_p95 : null);"
+        ),
+        "cached-tokens chart overlays the per-request percentiles"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-cpu\"), series, \"cpu_ms\", \"cpu ms\", \"#bc8cff\", -1, fmtVal, \"cpu_ms_p50\", \"cpu_ms_p95\", ov ? ov.cpu_ms_p50 : null, ov ? ov.cpu_ms_p95 : null, ag ? ag.cpu_ms_p50 : null, ag ? ag.cpu_ms_p95 : null, true);"
+        ),
+        "cpu chart overlays the per-request percentiles and shows the window total"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-dr\"), series, \"disk_read_bytes\", \"disk read (MB)\", \"#39c5cf\", -1, fmtMBn, \"disk_read_p50\", \"disk_read_p95\", ov ? ov.disk_read_p50 : null, ov ? ov.disk_read_p95 : null, ag ? ag.disk_read_p50 : null, ag ? ag.disk_read_p95 : null, true);"
+        ),
+        "disk-read chart overlays the per-request percentiles and shows the window total"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-dw\"), series, \"disk_write_bytes\", \"disk write (MB)\", \"#db61a2\", -1, fmtMBn, \"disk_write_p50\", \"disk_write_p95\", ov ? ov.disk_write_p50 : null, ov ? ov.disk_write_p95 : null, ag ? ag.disk_write_p50 : null, ag ? ag.disk_write_p95 : null, true);"
+        ),
+        "disk-write chart overlays the per-request percentiles and shows the window total"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-ram\"), series, \"ram_bytes\", \"peak ram (MB)\", \"#f85149\", -1, fmtMBn, \"ram_p50\", \"ram_p95\", ov ? ov.ram_p50 : null, ov ? ov.ram_p95 : null, ag ? ag.ram_p50 : null, ag ? ag.ram_p95 : null);"
+        ),
+        "ram chart overlays the per-request percentiles (no total — the peak gauge is not additive)"
+    );
+    assert!(
+        html.contains("ctx.fillText(showTotal ? \"max \"+fmt(max)+\" \\u00b7 total \"+fmt(tot) : \"max \"+fmt(max), 2, 12);"),
+        "the additive charts draw the window total next to the max"
+    );
+    assert!(
+        html.contains("drawBars(cv, c.series, c.key, c.label, c.color, c.hl, c.fmt, c.p50Key, c.p95Key, c.ovP50, c.ovP95, c.agP50, c.agP95, c.showTotal);"),
+        "the hover redraw keeps the window-total flag (cached on cv._chart)"
+    );
+    assert!(
+        html.contains("const ov = s.pct_overall || null;"),
+        "the window-wide percentile object feeds the resource charts"
+    );
+    assert!(
+        html.contains("const ag = s.pct_overall_agg || null;"),
+        "the window-wide aggregate-percentile object feeds the charts"
+    );
+    assert!(
+        html.contains("line(ovP50, P50C, []);"),
+        "the window-wide p50 line is drawn across the plot"
+    );
+    assert!(
+        html.contains("agline(agP50, []);") && html.contains("agline(agP95, [6,3]);"),
+        "the drawn-bars p50/p95 lines are drawn across the plot"
+    );
+    assert!(
+        html.contains("const P50C = \"#e6edf3\", P95C = \"#d29922\", AGGC = \"#a5d6ff\";"),
+        "percentile tick colors (solid p50, dashed p95, bars pair)"
+    );
+    assert!(
+        html.contains("items.push([\"barsP95\", AGGC, [6,3], \"bars p95\", barsTxt]);"),
+        "the drawn-bars pair joins the single-row legend"
+    );
+    assert!(
+        html.contains("c.hide[li.k] = !c.hide[li.k];"),
+        "clicking a legend item toggles the related lines"
+    );
+    assert!(
+        html.contains("const padTop = 24 + ((hasPct||hasAgg)?16:0),"),
+        "the single-row legend reserves one row of headroom"
+    );
+    assert!(
+        html.contains("new URLSearchParams(location.search).get(\"backend\")"),
+        "the page deep-links the backend filter from its own ?backend= param"
+    );
     // the resource charts live in their own panel: the throughput panel
     // holds only the request/token charts, the resources panel holds the
     // cpu / disk read / disk write / peak ram charts
@@ -3462,6 +3552,78 @@ async fn dashboard_counters_update_after_requests() {
     assert!(buckets[0]["disk_write_bytes"].is_u64());
     // the per-bucket peak RAM gauge (the proxy samples RSS on Linux)
     assert!(buckets[0]["ram_bytes"].is_u64());
+    // the all-backend series points carry the per-request p50/p95 of
+    // the resource and token values (a number when the proxy sampled
+    // the metric — always on Linux — null when the platform cannot
+    // sample it)
+    for f in [
+        "cpu_ms_p50",
+        "cpu_ms_p95",
+        "disk_read_p50",
+        "disk_read_p95",
+        "disk_write_p50",
+        "disk_write_p95",
+        "ram_p50",
+        "ram_p95",
+        "completion_tokens_p50",
+        "completion_tokens_p95",
+        "cached_tokens_p50",
+        "cached_tokens_p95",
+    ] {
+        assert!(
+            buckets[0][f].is_number() || buckets[0][f].is_null(),
+            "series bucket carries {f}"
+        );
+        // the all-backend series also carries the window-wide p50/p95
+        // of each metric (the merge of the buckets' histograms)
+        assert!(
+            v["series"]["pct_overall"][f].is_number() || v["series"]["pct_overall"][f].is_null(),
+            "series carries overall {f}"
+        );
+        // ... and the p50/p95 of the drawn per-bucket aggregate values
+        // (the bars themselves — always a number, zero counts)
+        assert!(
+            v["series"]["pct_overall_agg"][f].is_number(),
+            "series carries drawn-bars {f}"
+        );
+    }
+    // The backend-filtered view carries its own per-bucket p50/p95 and
+    // window-wide `pct_overall` (backend 0 served the chat request —
+    // the 404 never reached a backend).
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats?backend=0"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let vs = read_body(resp).await;
+    let sb = &vs["series"]["buckets"];
+    assert_eq!(sb.as_array().unwrap().len(), 1);
+    for f in [
+        "cpu_ms_p50",
+        "cpu_ms_p95",
+        "ram_p50",
+        "ram_p95",
+        "completion_tokens_p50",
+        "completion_tokens_p95",
+        "cached_tokens_p50",
+        "cached_tokens_p95",
+    ] {
+        assert!(
+            sb[0][f].is_number() || sb[0][f].is_null(),
+            "backend-filtered series bucket carries {f}"
+        );
+        assert!(
+            vs["series"]["pct_overall"][f].is_number() || vs["series"]["pct_overall"][f].is_null(),
+            "backend-filtered series carries overall {f}"
+        );
+        // the backend-filtered view carries its own drawn-bars p50/p95
+        // too (backend 0's bars — always a number, zero counts)
+        assert!(
+            vs["series"]["pct_overall_agg"][f].is_number(),
+            "backend-filtered series carries drawn-bars {f}"
+        );
+    }
     assert_eq!(v["series"]["window_reqs"], 2);
     assert!(v["series"]["req_per_sec"].as_f64().unwrap() > 0.0);
     // Recent requests, oldest first (the page reverses them for display);
@@ -3640,7 +3802,9 @@ async fn dashboard_stats_since_scopes_the_range() {
     for scope in ["coalesced", "coalesced_groups"] {
         let resp = app
             .clone()
-            .oneshot(get_req(&format!("/dashboard/api/stats?since=0&backend={scope}")))
+            .oneshot(get_req(&format!(
+                "/dashboard/api/stats?since=0&backend={scope}"
+            )))
             .await
             .expect("resp");
         assert_eq!(resp.status(), 200, "backend={scope} accepted");
@@ -3684,8 +3848,7 @@ async fn dashboard_coalesced_scopes_track_group_records() {
     let client = Arc::new(
         LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
     );
-    let clients: Vec<Arc<dyn LlamaBackend>> =
-        vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
     let spec = lpcache::plugins::PluginSpec::new("dashboard", json!({}));
     let dashboard = lpcache::plugins::load_dashboard(

@@ -217,7 +217,32 @@ ignored. See the `REQUEST_LOG*` rows above for the full field list.
 
 Serves a self-contained HTML page (inline CSS + JS, no external assets) plus a
 JSON stats endpoint, fed by one record per finished request (the same records
-the request logger receives). The dashboard's own routes are excluded from the
+the request logger receives). The resource charts (CPU ms, disk read/write,
+RAM) and the token charts (completion tokens, cached prompt tokens) overlay a
+solid p50 and dashed p95 tick per bar — the per-request
+percentiles of each metric, tracked per bucket per scope (all backends, each
+backend index, cached, coalesced, coalesced groups — so the ticks and lines
+stay correct for every `backend` filter; the series points carry
+`cpu_ms_p50`/`cpu_ms_p95`, `disk_read_p50`/`disk_read_p95`,
+`disk_write_p50`/`disk_write_p95`, `ram_p50`/`ram_p95`,
+`completion_tokens_p50`/`completion_tokens_p95`,
+`cached_tokens_p50`/`cached_tokens_p95`, null per metric
+without data — a request that restored nothing counts as 0 cached tokens, so
+a p50 of 0 means at least half the requests had no cache) — plus two
+full-width line pairs per chart for the whole
+window/range of the selected scope: the per-request p50/p95
+(`series.pct_overall`, the merge of the
+scope's buckets' histograms; absent for a backend index with no traffic in
+the window) and the p50/p95 of the drawn per-bucket aggregate
+values — the bars themselves, so that pair reads against the bar heights
+(`series.pct_overall_agg`, always present; a zero-valued bar still counts
+as a sample). The request-count chart has no per-request scalar, so it carries
+no percentiles. The additive resource charts (CPU ms, disk read, disk
+write) draw the window total — the sum of the drawn per-bucket values —
+next to the max in each chart's top-left corner (the peak-RAM gauge is
+not additive and keeps the max alone). The page's own URL takes a `?backend=` param with the same
+values to deep-link the backend filter (e.g. `/dashboard?backend=0`).
+The dashboard's own routes are excluded from the
 aggregates and the request log. At most one `dashboard` plugin. Unlike the
 other plugins it **rejects unknown params** — a typo'd param name is a startup
 error.

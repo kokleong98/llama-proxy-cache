@@ -40,7 +40,21 @@
 //!   `?backend` filter) covering the whole process lifetime, bounded by
 //!   `MAX_BUCKETS` (oldest dropped first); a range query over many
 //!   buckets is coarsened to at most `MAX_SERIES_POINTS` points before
-//!   it is served, so the payload stays small for long ranges;
+//!   it is served, so the payload stays small for long ranges. Each
+//!   bucket also keeps a bounded log-histogram of the per-request
+//!   resource and token values (CPU ms, disk bytes read/written,
+//!   resident RAM, completion tokens, cached prompt tokens)
+//!   per scope (all backends, each backend index, cached, coalesced,
+//!   coalesced groups — only the occupied bins are stored, so the
+//!   per-bucket memory stays small), from which the series points
+//!   carry approximate `p50`/`p95` fields per metric that the page
+//!   overlays on the resource and token charts as per-bucket
+//!   percentile ticks (correct for every `?backend` filter value); the
+//!   series also carries `pct_overall` — the window/range-wide
+//!   per-request p50/p95 of each metric for the selected scope — and
+//!   `pct_overall_agg`, the same percentiles of the drawn per-bucket
+//!   aggregate values (the bars themselves), and the page draws both
+//!   as full-width line pairs on the resource and token charts;
 //! - **recent requests** — a ring buffer of the last `max_recent`
 //!   finished requests (status, backend index, duration, key, flags,
 //!   tokens, timings); each backend scope (all backends, each backend
@@ -53,7 +67,8 @@
 //! stat cards, a throughput bar-chart panel (requests, completion
 //! tokens and cached tokens per bucket), a resources bar-chart panel
 //! (the proxy's own CPU ms, disk bytes read/written and peak RAM per
-//! bucket), the backend table, a per-backend slot occupancy grid
+//! bucket — the additive cpu/disk charts also draw the window total
+//! next to the max), the backend table, a per-backend slot occupancy grid
 //! (each backend's slots grouped under its label) and the
 //! recent-requests table (with the backend index of each request). A
 //! time-filter dropdown, grouped into presets (30 seconds, 1 minute, 5
@@ -65,6 +80,9 @@
 //! the cards, charts and recent table to the selected range and backend
 //! by polling with
 //! `?since=<unix seconds>&backend=<index|cached|coalesced|coalesced_groups>`.
+//! The page's own URL takes the same `?backend` param to deep-link the
+//! backend filter (the dropdown's selection, applied on the first render
+//! once its options exist).
 //! All
 //! aggregates reset on proxy restart; nothing is persisted.
 //!
@@ -195,6 +213,244 @@ pub fn validate(params: &DashboardParams) -> Result<(), String> {
     Ok(())
 }
 
+/// A bounded, mergeable log-spaced histogram of non-negative values —
+/// the approximate `p50`/`p95` of the per-request resource and token
+/// values of one series bucket (or the merge of several buckets).
+///
+/// Bin `i` covers `[PCT_FLOOR * 10^(i/3), PCT_FLOOR * 10^((i+1)/3))` —
+/// each bin spans a factor of `10^(1/3)` ≈ 2.15, and a reported
+/// percentile is the geometric midpoint of the bin its rank falls in
+/// (like a Prometheus histogram quantile, the precision is a constant
+/// relative factor, independent of the value's magnitude). Values
+/// below the floor (exact zeros and negative sampling noise) count
+/// into `zeros`.
+///
+/// The shape is fixed (at most `PCT_BINS` bins covering
+/// `[0.1, 10^13)` — from 0.1 ms of CPU or a single token to 10 TiB of
+/// bytes) regardless
+/// of how many requests land in the bucket, and merging is bin-wise
+/// addition — exactly what series coarsening does to the percentiles
+/// of the buckets it folds into one point. Only the *occupied* bins are
+/// stored (a sorted `(bin, count)` list), so the common case — a
+/// handful of distinct values per bucket — costs a few bytes per
+/// metric instead of the full 39 bins, which is what makes the
+/// per-scope histograms (one set per backend/scope per bucket)
+/// affordable. Counts saturate at `u16::MAX` per bin (65 535 requests
+/// in one bin of one bucket — beyond any realistic rate).
+#[derive(Debug, Clone, Default)]
+pub struct Pct {
+    /// The occupied `(bin, count)` pairs, sorted by bin (an absent bin
+    /// has count 0; see the type docs for the bin layout).
+    bins: Vec<(u8, u16)>,
+    /// Values below the floor (exact zeros and negative noise).
+    zeros: u16,
+}
+
+/// Histogram floor: the lowest value with its own bin (0.1 — a hundredth
+/// of a millisecond of CPU, far below any per-request value worth
+/// distinguishing).
+pub const PCT_FLOOR: f64 = 0.1;
+/// Number of histogram bins: three sub-bins per order of magnitude over
+/// 13 decades (`[0.1, 10^13)`).
+pub const PCT_BINS: usize = 39;
+
+impl Pct {
+    /// The bin of a value at or above the floor (values past the last
+    /// bin clamp to it).
+    fn bin_of(v: f64) -> usize {
+        let i = ((v / PCT_FLOOR).log10() * 3.0).floor() as usize;
+        i.min(PCT_BINS - 1)
+    }
+
+    /// Fold one value in.
+    fn add(&mut self, v: f64) {
+        if !v.is_finite() || v <= 0.0 || v < PCT_FLOOR {
+            self.zeros = self.zeros.saturating_add(1);
+            return;
+        }
+        let i = Self::bin_of(v) as u8;
+        match self.bins.iter_mut().find(|(b, _)| *b == i) {
+            Some((_, c)) => *c = c.saturating_add(1),
+            None => {
+                // keep the list sorted by bin (it is tiny — a linear
+                // scan beats any bookkeeping)
+                let pos = self
+                    .bins
+                    .iter()
+                    .position(|(b, _)| *b > i)
+                    .unwrap_or(self.bins.len());
+                self.bins.insert(pos, (i, 1));
+            }
+        }
+    }
+
+    /// Merge another histogram (bin-wise addition of the occupied bins).
+    fn merge(&mut self, o: &Pct) {
+        self.zeros = self.zeros.saturating_add(o.zeros);
+        if o.bins.is_empty() {
+            return;
+        }
+        if self.bins.is_empty() {
+            self.bins = o.bins.clone();
+            return;
+        }
+        // merge the two sorted lists (merge sort's merge step)
+        let mut out = Vec::with_capacity(self.bins.len() + o.bins.len());
+        let mut a = self.bins.iter().copied();
+        let mut b = o.bins.iter().copied();
+        let (mut na, mut nb) = (a.next(), b.next());
+        while let (Some(x), Some(y)) = (na, nb) {
+            if x.0 < y.0 {
+                out.push(x);
+                na = a.next();
+            } else if x.0 > y.0 {
+                out.push(y);
+                nb = b.next();
+            } else {
+                out.push((x.0, x.1.saturating_add(y.1)));
+                na = a.next();
+                nb = b.next();
+            }
+        }
+        if let Some(x) = na {
+            out.push(x);
+            out.extend(a);
+        }
+        if let Some(y) = nb {
+            out.push(y);
+            out.extend(b);
+        }
+        self.bins = out;
+    }
+
+    /// The nearest-rank `p`-th percentile (a percent, `0 < p < 100`) as
+    /// the geometric midpoint of its bin — `None` when no value was
+    /// ever folded in, `0.0` when the rank falls in the zero bin.
+    fn quantile(&self, p: f64) -> Option<f64> {
+        let total = self.zeros as u64 + self.bins.iter().map(|&(_, c)| c as u64).sum::<u64>();
+        if total == 0 {
+            return None;
+        }
+        let rank = ((p / 100.0) * total as f64).ceil().clamp(1.0, total as f64) as u64;
+        let mut acc = self.zeros as u64;
+        if rank <= acc {
+            return Some(0.0);
+        }
+        for &(i, c) in &self.bins {
+            acc += c as u64;
+            if rank <= acc {
+                return Some(PCT_FLOOR * 10f64.powf((i as f64 + 0.5) / 3.0));
+            }
+        }
+        // Unreachable (rank <= total), but a rank past every occupied
+        // bin means the last occupied bin.
+        Some(
+            self.bins
+                .last()
+                .map(|&(i, _)| PCT_FLOOR * 10f64.powf((i as f64 + 0.5) / 3.0))
+                .unwrap_or(0.0),
+        )
+    }
+}
+
+/// The per-request percentile histograms of one series bucket for one
+/// scope — every scope (all backends, each backend index, cached,
+/// coalesced, coalesced groups) keeps one set per bucket, so the
+/// `p50`/`p95` fields the page overlays on the resource and token
+/// charts are correct for every `?backend` filter value (see
+/// [`Bucket::pct`] and the `pct_*` sub-histograms).
+#[derive(Debug, Clone, Default)]
+pub struct PctSet {
+    /// Per-request CPU ms.
+    pub cpu_ms: Pct,
+    /// Per-request disk bytes read.
+    pub disk_read: Pct,
+    /// Per-request disk bytes written.
+    pub disk_write: Pct,
+    /// Per-request resident RAM bytes (the RSS gauge at completion —
+    /// the per-request values behind the bucket's maxed `ram_bytes`).
+    pub ram: Pct,
+    /// Per-request completion tokens (the per-request values behind
+    /// the bucket's summed `completion_tokens`).
+    pub completion_tokens: Pct,
+    /// Per-request cached (restored) prompt tokens (the per-request
+    /// values behind the bucket's summed `cached_tokens` — the requests
+    /// that restored nothing fold in as zero, so a p50 of 0 reads as
+    /// "at least half the requests had no cache").
+    pub cached_tokens: Pct,
+}
+
+impl PctSet {
+    /// Fold one finished record in (a missing field is skipped, like
+    /// every other aggregate).
+    fn add(&mut self, record: &RequestLogRecord) {
+        if let Some(v) = record.cpu_ms {
+            self.cpu_ms.add(v);
+        }
+        if let Some(v) = record.disk_read_bytes {
+            self.disk_read.add(v as f64);
+        }
+        if let Some(v) = record.disk_write_bytes {
+            self.disk_write.add(v as f64);
+        }
+        if let Some(v) = record.ram_bytes {
+            self.ram.add(v as f64);
+        }
+        if let Some(v) = record.completion_tokens {
+            self.completion_tokens.add(v as f64);
+        }
+        if let Some(v) = record.cached_tokens {
+            self.cached_tokens.add(v as f64);
+        }
+    }
+
+    /// Merge another set (bin-wise, per metric).
+    fn merge(&mut self, o: &PctSet) {
+        self.cpu_ms.merge(&o.cpu_ms);
+        self.disk_read.merge(&o.disk_read);
+        self.disk_write.merge(&o.disk_write);
+        self.ram.merge(&o.ram);
+        self.completion_tokens.merge(&o.completion_tokens);
+        self.cached_tokens.merge(&o.cached_tokens);
+    }
+
+    /// The `p50`/`p95` of each metric as the series-point fields (a
+    /// metric without any value in the bucket yields `null`s).
+    fn point_fields(&self) -> [(&'static str, Option<f64>); 12] {
+        [
+            ("cpu_ms_p50", self.cpu_ms.quantile(50.0)),
+            ("cpu_ms_p95", self.cpu_ms.quantile(95.0)),
+            ("disk_read_p50", self.disk_read.quantile(50.0)),
+            ("disk_read_p95", self.disk_read.quantile(95.0)),
+            ("disk_write_p50", self.disk_write.quantile(50.0)),
+            ("disk_write_p95", self.disk_write.quantile(95.0)),
+            ("ram_p50", self.ram.quantile(50.0)),
+            ("ram_p95", self.ram.quantile(95.0)),
+            (
+                "completion_tokens_p50",
+                self.completion_tokens.quantile(50.0),
+            ),
+            (
+                "completion_tokens_p95",
+                self.completion_tokens.quantile(95.0),
+            ),
+            ("cached_tokens_p50", self.cached_tokens.quantile(50.0)),
+            ("cached_tokens_p95", self.cached_tokens.quantile(95.0)),
+        ]
+    }
+
+    /// The merge of the histograms of a set of buckets — the exact
+    /// union of their per-request samples, so the merged set's
+    /// `p50`/`p95` cover the whole window/range of the series.
+    fn merge_all<'a>(sets: impl Iterator<Item = &'a PctSet>) -> Self {
+        let mut out = Self::default();
+        for s in sets {
+            out.merge(s);
+        }
+        out
+    }
+}
+
 /// One time-series bucket of `bucket_secs` seconds: the request
 /// counters of everything that finished in `[t, t + bucket_secs)`.
 #[derive(Debug, Default, Clone)]
@@ -221,6 +477,27 @@ pub struct Bucket {
     /// Coalesced-group sub-counters: the `?backend=coalesced_groups`
     /// view of the series (the leaders and followers of the groups).
     pub coalesced_groups: Counters,
+    /// Per-request resource and token percentile histograms of the
+    /// bucket (all records — the all-backend view; see [`PctSet`]): the
+    /// series points' `p50`/`p95` fields the page overlays on the
+    /// resource and token charts. The `pct_*` sub-histograms below are
+    /// the same per scope,
+    /// so the fields are correct for every `?backend` filter value
+    /// (only occupied bins are stored, see [`Pct`]).
+    pub pct: PctSet,
+    /// Per-backend percentile sub-histograms (index = backend index,
+    /// grown on demand, parallel to `by_be`): the `?backend=<i>` views'
+    /// percentiles.
+    pub pct_by_be: Vec<PctSet>,
+    /// Cached-result percentile sub-histograms: the
+    /// `?backend=cached` view's percentiles.
+    pub pct_cached: PctSet,
+    /// Coalesced-follower percentile sub-histograms: the
+    /// `?backend=coalesced` view's percentiles.
+    pub pct_coalesced: PctSet,
+    /// Coalesced-group percentile sub-histograms: the
+    /// `?backend=coalesced_groups` view's percentiles.
+    pub pct_coalesced_groups: PctSet,
 }
 
 impl Bucket {
@@ -232,6 +509,11 @@ impl Bucket {
             cached: Counters::default(),
             coalesced: Counters::default(),
             coalesced_groups: Counters::default(),
+            pct: PctSet::default(),
+            pct_by_be: Vec::new(),
+            pct_cached: PctSet::default(),
+            pct_coalesced: PctSet::default(),
+            pct_coalesced_groups: PctSet::default(),
         }
     }
 
@@ -239,23 +521,31 @@ impl Bucket {
     /// record ran on a backend, that backend's sub-counters; when it was
     /// served from the result cache, the cached-result sub-counters;
     /// when it was a coalesced follower or part of a coalesced group,
-    /// those sub-counters).
+    /// those sub-counters — and each scope's percentile histograms the
+    /// same way, so every scope's series carries its own
+    /// `p50`/`p95` fields).
     fn add(&mut self, record: &RequestLogRecord) {
         self.c.add(record);
+        self.pct.add(record);
         if let Some(be) = record.backend {
             if be >= self.by_be.len() {
                 self.by_be.resize(be + 1, Counters::default());
+                self.pct_by_be.resize(be + 1, PctSet::default());
             }
             self.by_be[be].add(record);
+            self.pct_by_be[be].add(record);
         }
         if record.cache_hit == Some(true) {
             self.cached.add(record);
+            self.pct_cached.add(record);
         }
         if record.coalesced == Some("follower") {
             self.coalesced.add(record);
+            self.pct_coalesced.add(record);
         }
         if record.coalesced.is_some() {
             self.coalesced_groups.add(record);
+            self.pct_coalesced_groups.add(record);
         }
     }
 }
@@ -536,8 +826,17 @@ fn counters_json(c: &Counters) -> Value {
 
 /// The slim chart point of one counter set (the fields the page's bar
 /// charts need; the full counters travel only in `counters` / `range`).
-fn counters_point(t: u64, c: &Counters) -> Value {
-    json!({
+/// With `pct` (the scope's sub-histograms of the bucket — every scope
+/// has some, `None` only for a backend index with no traffic in the
+/// bucket) the point also carries the per-request `p50`/`p95` of each
+/// metric (`cpu_ms_p50`, `cpu_ms_p95`, `disk_read_p50`,
+/// `disk_read_p95`, `disk_write_p50`, `disk_write_p95`, `ram_p50`,
+/// `ram_p95`, `completion_tokens_p50`, `completion_tokens_p95`,
+/// `cached_tokens_p50`, `cached_tokens_p95` — `null` per metric without
+/// data in the bucket) that the page overlays on the resource and token
+/// charts.
+fn counters_point(t: u64, c: &Counters, pct: Option<&PctSet>) -> Value {
+    let mut v = json!({
         "t": t,
         "reqs": c.total,
         "completions": c.completion_tokens,
@@ -546,7 +845,96 @@ fn counters_point(t: u64, c: &Counters) -> Value {
         "disk_read_bytes": c.disk_read_bytes,
         "disk_write_bytes": c.disk_write_bytes,
         "ram_bytes": c.ram_max_bytes,
-    })
+    });
+    if let Some(p) = pct {
+        for (k, q) in p.point_fields() {
+            v[k] = match q {
+                Some(v) => Value::from(v),
+                None => Value::Null,
+            };
+        }
+    }
+    v
+}
+
+/// The window/range-wide percentile object for a [`PctSet`]: the twelve
+/// `*_p50`/`*_p95` fields (`null` per metric without data in the
+/// window) that the page draws as full-width lines on the resource and
+/// token charts.
+fn pct_overall_json(set: &PctSet) -> Value {
+    let mut v = serde_json::Map::new();
+    for (k, q) in set.point_fields() {
+        v.insert(
+            k.to_string(),
+            match q {
+                Some(v) => Value::from(v),
+                None => Value::Null,
+            },
+        );
+    }
+    Value::Object(v)
+}
+
+/// The window/range-wide percentile object for the *drawn* per-bucket
+/// aggregate values: the p50/p95 of the series points' own bar values
+/// (the summed tokens, CPU ms and disk bytes — the per-bucket peak for
+/// RAM), so the page's second full-width line pair reads against the
+/// bar heights. Same field names as [`pct_overall_json`] (`null` per
+/// metric missing from every point; a zero-valued point still counts,
+/// unlike the per-request zero bin). Computed over the points as drawn
+/// (coarsened for wide ranges, so a merged bar is one sample); `None`
+/// for an empty series.
+fn point_agg_percentiles(points: &[Value]) -> Option<Value> {
+    if points.is_empty() {
+        return None;
+    }
+    // (bar field, output prefix) — the six charts' bar values.
+    let metrics = [
+        ("cpu_ms", "cpu_ms"),
+        ("disk_read_bytes", "disk_read"),
+        ("disk_write_bytes", "disk_write"),
+        ("ram_bytes", "ram"),
+        ("completions", "completion_tokens"),
+        ("cached_tokens", "cached_tokens"),
+    ];
+    let mut v = serde_json::Map::new();
+    for (field, prefix) in metrics {
+        let vals: Vec<f64> = points
+            .iter()
+            .filter_map(|p| p.get(field).and_then(Value::as_f64))
+            .collect();
+        let (p50, p95) = if vals.is_empty() {
+            (Value::Null, Value::Null)
+        } else {
+            let mut sorted = vals;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // nearest rank, like [`Pct::quantile`]
+            let rank = |p: f64| {
+                ((p / 100.0) * sorted.len() as f64)
+                    .ceil()
+                    .clamp(1.0, sorted.len() as f64) as usize
+            };
+            (
+                Value::from(sorted[rank(50.0) - 1]),
+                Value::from(sorted[rank(95.0) - 1]),
+            )
+        };
+        v.insert(format!("{prefix}_p50"), p50);
+        v.insert(format!("{prefix}_p95"), p95);
+    }
+    Some(Value::Object(v))
+}
+
+/// The scope's percentiles of a whole window/range — the merge of the
+/// scope's sub-histograms of the buckets (`None` when the scope never
+/// had data in any of them, e.g. a backend index that never served a
+/// request in the window).
+fn scope_pct_overall<'a>(
+    buckets: impl Iterator<Item = &'a Bucket>,
+    scope: BackendScope,
+) -> Option<PctSet> {
+    let sets: Vec<&'a PctSet> = buckets.filter_map(|b| bucket_pct(b, scope)).collect();
+    (!sets.is_empty()).then(|| PctSet::merge_all(sets.into_iter()))
 }
 
 /// The counter set of one bucket for the selected backend scope
@@ -561,6 +949,21 @@ fn bucket_counters(b: &Bucket, scope: BackendScope) -> Option<&Counters> {
         BackendScope::Cached => Some(&b.cached),
         BackendScope::Coalesced => Some(&b.coalesced),
         BackendScope::CoalescedGroups => Some(&b.coalesced_groups),
+    }
+}
+
+/// The percentile histograms of one bucket for the selected backend
+/// scope (`All` = the bucket total; a backend with no traffic in the
+/// bucket has none; `Cached` = the bucket's cached-result
+/// sub-histograms; `Coalesced` = its coalesced-follower sub-histograms;
+/// `CoalescedGroups` = its coalesced-group sub-histograms).
+fn bucket_pct(b: &Bucket, scope: BackendScope) -> Option<&PctSet> {
+    match scope {
+        BackendScope::All => Some(&b.pct),
+        BackendScope::Backend(i) => b.pct_by_be.get(i),
+        BackendScope::Cached => Some(&b.pct_cached),
+        BackendScope::Coalesced => Some(&b.pct_coalesced),
+        BackendScope::CoalescedGroups => Some(&b.pct_coalesced_groups),
     }
 }
 
@@ -763,7 +1166,10 @@ impl DashboardPlugin {
     /// beyond the cap, consecutive buckets are merged into a step aligned
     /// to a multiple of `bucket_secs` (raw buckets are already aligned,
     /// so every merged point keeps an exact start time). `scope` selects
-    /// the per-scope sub-counters (`All` = the bucket totals).
+    /// the per-scope sub-counters (`All` = the bucket totals) and the
+    /// matching percentile sub-histograms (every scope keeps its own,
+    /// so every view's points carry the `p50`/`p95` fields — `null`
+    /// where the scope has no values in the bucket).
     /// Returns the effective step and the slim points.
     fn series_points(
         buckets: &[Bucket],
@@ -776,24 +1182,37 @@ impl DashboardPlugin {
                 bucket_secs,
                 buckets
                     .iter()
-                    .map(|b| counters_point(b.t, bucket_counters(b, scope).unwrap_or(&zeros)))
+                    .map(|b| {
+                        counters_point(
+                            b.t,
+                            bucket_counters(b, scope).unwrap_or(&zeros),
+                            bucket_pct(b, scope),
+                        )
+                    })
                     .collect(),
             );
         }
         let step = bucket_secs * buckets.len().div_ceil(MAX_SERIES_POINTS) as u64;
-        let mut merged: Vec<(u64, Counters)> = Vec::with_capacity(MAX_SERIES_POINTS);
+        let mut merged: Vec<(u64, Counters, PctSet)> = Vec::with_capacity(MAX_SERIES_POINTS);
         for b in buckets {
             let t = (b.t / step) * step;
             let zeros = Counters::default();
             let c = bucket_counters(b, scope).unwrap_or(&zeros).clone();
+            let p = bucket_pct(b, scope).cloned().unwrap_or_default();
             match merged.last_mut() {
-                Some((mt, mc)) if *mt == t => mc.merge(&c),
-                _ => merged.push((t, c)),
+                Some((mt, mc, mp)) if *mt == t => {
+                    mc.merge(&c);
+                    mp.merge(&p);
+                }
+                _ => merged.push((t, c, p)),
             }
         }
         (
             step,
-            merged.iter().map(|(t, c)| counters_point(*t, c)).collect(),
+            merged
+                .iter()
+                .map(|(t, c, p)| counters_point(*t, c, Some(p)))
+                .collect(),
         )
     }
 
@@ -813,6 +1232,16 @@ impl DashboardPlugin {
     /// - `None` — the legacy shape: lifetime counters of the selected
     ///   backend scope plus the trailing `window_secs` of the series
     ///   (as of now) and its rates.
+    ///
+    /// In both shapes, the series also carries `pct_overall` for the
+    /// selected scope — the window/range-wide per-request `p50`/`p95`
+    /// of each metric (the merge of the scope's buckets'
+    /// sub-histograms, `null` per metric without data) that the page
+    /// draws as full-width lines on the resource and token charts (a
+    /// backend index that never served a request in the window has no
+    /// `pct_overall`) — and `pct_overall_agg`, the same percentiles of
+    /// the drawn per-bucket aggregate values (the bars themselves; the
+    /// page's second full-width line pair, "bars p50/p95").
     pub fn stats_inner(
         &self,
         proxy: &ProxyStatus,
@@ -861,14 +1290,30 @@ impl DashboardPlugin {
                     }
                 };
                 let (step, points) = Self::series_points(range_buckets, self.bucket_secs, scope);
+                // The range-wide p50/p95 of the drawn per-bucket
+                // aggregate values (the bars themselves) — the page's
+                // second full-width line pair ("bars p50/p95").
+                let pct_overall_agg = point_agg_percentiles(&points);
                 payload["range"] = json!({
                     "since": s,
                     "counters": counters_json(&range_counters),
                 });
-                payload["series"] = json!({
+                let mut series = json!({
                     "bucket_secs": step,
                     "buckets": points,
                 });
+                // The range-wide p50/p95 of the scope (per-bucket
+                // ticks and full-width lines both come from these
+                // histograms) — the merge of the scope's buckets'
+                // sub-histograms is the exact union of their
+                // per-request samples.
+                if let Some(overall) = scope_pct_overall(range_buckets.iter(), scope) {
+                    series["pct_overall"] = pct_overall_json(&overall);
+                }
+                if let Some(agg) = pct_overall_agg {
+                    series["pct_overall_agg"] = agg;
+                }
+                payload["series"] = series;
             }
             None => {
                 // Legacy shape: the trailing `window_secs` of the series
@@ -893,17 +1338,38 @@ impl DashboardPlugin {
                     })
                     .sum();
                 let w = self.window_secs as f64;
-                payload["series"] = json!({
+                let points: Vec<Value> = window
+                    .iter()
+                    .map(|b| {
+                        counters_point(
+                            b.t,
+                            bucket_counters(b, scope).unwrap_or(&zeros),
+                            bucket_pct(b, scope),
+                        )
+                    })
+                    .collect();
+                // The window-wide p50/p95 of the drawn per-bucket
+                // aggregate values (the bars themselves) — the page's
+                // second full-width line pair ("bars p50/p95").
+                let pct_overall_agg = point_agg_percentiles(&points);
+                let mut series = json!({
                     "bucket_secs": self.bucket_secs,
                     "window_reqs": reqs_window,
                     "window_completions": toks_window,
                     "req_per_sec": reqs_window as f64 / w,
                     "tok_per_sec": toks_window as f64 / w,
-                    "buckets": window
-                        .iter()
-                        .map(|b| counters_point(b.t, bucket_counters(b, scope).unwrap_or(&zeros)))
-                        .collect::<Vec<_>>(),
+                    "buckets": points,
                 });
+                // The window-wide p50/p95 of the scope — the merge of
+                // the scope's buckets' sub-histograms is the exact
+                // union of their per-request samples.
+                if let Some(overall) = scope_pct_overall(window.iter().copied(), scope) {
+                    series["pct_overall"] = pct_overall_json(&overall);
+                }
+                if let Some(agg) = pct_overall_agg {
+                    series["pct_overall_agg"] = agg;
+                }
+                payload["series"] = series;
             }
         }
         // The recent ring for the selected scope — each scope keeps its
@@ -1023,6 +1489,7 @@ canvas { width:100%; height:132px; display:block; }
 .bartip { position:fixed; z-index:50; pointer-events:none; display:none; background:#1c2128; border:1px solid var(--border); border-radius:6px; padding:6px 10px; font-size:12px; box-shadow:0 6px 16px rgba(0,0,0,.45); min-width:104px; }
 .bartip .tt-h { display:flex; justify-content:space-between; gap:14px; color:var(--dim); font-size:10.5px; margin-bottom:3px; white-space:nowrap; }
 .bartip .tt-v { font-size:16px; font-weight:600; }
+.bartip .tt-x { font-size:12px; font-weight:600; margin-top:2px; }
 footer { color:var(--dim); font-size:11px; text-align:center; padding:0 0 18px; }
 .empty { color:var(--dim); padding:8px 0; }
 .filters { display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:8px 12px; }
@@ -1155,6 +1622,8 @@ function card(id, v, s){ $(id+"-v").textContent=v; if(s!=null) $(id+"-s").textCo
 function esc(s){ const d=document.createElement("span"); d.textContent=s==null?"":s; return d.innerHTML; }
 function statusBadge(st){ const cls = st<400 ? "b-ok" : (st<500 ? "b-warn" : "b-err"); return '<span class="badge '+cls+'">'+st+'</span>'; }
 // Re-align sparse buckets onto a gapless timeline (missing = zero).
+// The synthesized zero buckets carry the percentile fields as null (no
+// ticks to draw for a gap).
 function fillSeries(buckets, bucketSecs){
   if(!buckets || !buckets.length) return [];
   const out = [];
@@ -1162,10 +1631,14 @@ function fillSeries(buckets, bucketSecs){
   for(let t=first; t<=last; t+=bucketSecs){
     let b = null;
     for(const x of buckets){ if(x.t===t){ b=x; break; } }
-    out.push(b || {t:t, reqs:0, completions:0, cached_tokens:0, cpu_ms:0, disk_read_bytes:0, disk_write_bytes:0, ram_bytes:0});
+    out.push(b || {t:t, reqs:0, completions:0, cached_tokens:0, cpu_ms:0, disk_read_bytes:0, disk_write_bytes:0, ram_bytes:0, cpu_ms_p50:null, cpu_ms_p95:null, disk_read_p50:null, disk_read_p95:null, disk_write_p50:null, disk_write_p95:null, ram_p50:null, ram_p95:null});
   }
   return out;
 }
+// Per-bucket percentile overlay ticks (the resource charts): solid =
+// p50, dashed = p95 of the per-request values (all-backend scope — the
+// backend-filtered views carry no percentile fields and draw none).
+const P50C = "#e6edf3", P95C = "#d29922", AGGC = "#a5d6ff";
 // ---- shared hover tooltip (one element for all the charts) ---------------
 let tip = null;
 function ensureTip(){
@@ -1173,9 +1646,13 @@ function ensureTip(){
   return tip;
 }
 function fmtVal(v){ return v==null ? "\u2013" : Math.round(v).toLocaleString(); }
-function showTip(cx, cy, label, time, val, color){
+function showTip(cx, cy, label, time, val, color, extra){
   const el = ensureTip();
-  el.innerHTML = '<div class="tt-h"><span>'+esc(label)+'</span><span>'+esc(time)+'</span></div><div class="tt-v" style="color:'+color+'">'+esc(val)+'</div>';
+  let html = '<div class="tt-h"><span>'+esc(label)+'</span><span>'+esc(time)+'</span></div><div class="tt-v" style="color:'+color+'">'+esc(val)+'</div>';
+  if(extra && extra.length){
+    for(const ex of extra){ html += '<div class="tt-x" style="color:'+ex[1]+'">'+esc(ex[0])+'</div>'; }
+  }
+  el.innerHTML = html;
   el.style.display = "block";
   const r = el.getBoundingClientRect(), pad = 14;
   let left = cx + pad, top = cy - r.height - pad;
@@ -1188,18 +1665,35 @@ function showTip(cx, cy, label, time, val, color){
 }
 function hideTip(){ if(tip) tip.style.display = "none"; }
 
-// Draw one throughput bar chart. `series` are aligned bucket objects
-// ({t, reqs, completions, cached_tokens, cpu_ms, disk_read_bytes,
-// disk_write_bytes, ram_bytes}); `key` picks the field to plot,
+// Draw one bar chart. `series` are aligned bucket objects ({t, reqs,
+// completions, cached_tokens, cpu_ms, disk_read_bytes, disk_write_bytes,
+// ram_bytes, and — all-backend scope only — the per-request resource
+// `p50`/`p95` fields}); `key` picks the field to plot,
 // `label`/`color` feed the on-bar figures and the hover tooltip, `fmt`
 // formats the figures and tooltip value (default `fmtVal`; the byte
 // charts pass `fmtMBn` so the figures read as plain MB numbers — the
-// caption carries the unit), and `hl` is the
-// currently hovered bar index (-1 for none). The figure of each bar is
+// caption carries the unit), `hl` is the
+// currently hovered bar index (-1 for none), and `p50Key`/`p95Key` (the
+// resource charts) name the point fields of the per-request percentile
+// overlay: when the points carry them, each bar gets a solid p50 tick
+// and a dashed p95 tick at the per-request value (plus a small legend
+// right-aligned in the top strip, which reserves a blank row below it so
+// the bar figures can never overlap the legend text),
+// and the tooltip lists them on one line ("p50 X / p95 Y"). Each legend
+// item is clickable and toggles its related lines (hidden items are
+// drawn faded and dropped from the scale). `ovP50`/`ovP95`
+// per-request percentile values (all scopes — the points' fields carry
+// the scope's own histogram) — when not null they are drawn as
+// full-width lines across the whole plot (solid p50 / dashed p95) and
+// listed in the legend. `agP50`/`agP95` are the window-wide p50/p95 of
+// the drawn per-bucket aggregate values (the bars themselves) — when
+// not null they are drawn as a second full-width line pair (solid p50 /
+// dashed p95, in the bars color) and the same single-row legend carries
+// the bars pair ("bars p50" / "bars p95" + "bars X / Y"). The figure of each bar is
 // drawn on top of it; an adaptive stride skips labels when buckets are dense
 // so the figures never overlap. Chart geometry is cached on the canvas
 // (cv._chart) so the hover handlers can re-render on mousemove.
-function drawBars(cv, series, key, label, color, hl, fmt){ fmt = fmt || fmtVal;
+function drawBars(cv, series, key, label, color, hl, fmt, p50Key, p95Key, ovP50, ovP95, agP50, agP95, showTotal){ fmt = fmt || fmtVal;
   const dpr = window.devicePixelRatio || 1;
   const w = cv.clientWidth || 700, h = cv.clientHeight || 132;
   cv.width = w*dpr; cv.height = h*dpr;
@@ -1208,11 +1702,47 @@ function drawBars(cv, series, key, label, color, hl, fmt){ fmt = fmt || fmtVal;
   ctx.scale(dpr,dpr);
   ctx.clearRect(0,0,w,h);
   const values = (series||[]).map(b => (b==null || b[key]==null ? 0 : b[key]));
+  // The per-bucket percentile ticks: p50/p95 of the per-request values,
+  // read from the point fields named by p50Key/p95Key (null when the
+  // view doesn't track percentiles — the backend-filtered ones — or the
+  // bucket has no data for the metric).
+  const p50s = p50Key ? (series||[]).map(b => (b==null || b[p50Key]==null ? null : b[p50Key])) : null;
+  const p95s = p95Key ? (series||[]).map(b => (b==null || b[p95Key]==null ? null : b[p95Key])) : null;
+  // The window-wide percentile values (all scopes) — full-width lines
+  // across the whole plot; agP50/agP95 are the p50/p95 of the drawn
+  // per-bucket aggregate values (the bars themselves) — the second
+  // line pair.
+  ovP50 = ovP50==null ? null : ovP50;
+  ovP95 = ovP95==null ? null : ovP95;
+  agP50 = agP50==null ? null : agP50;
+  agP95 = agP95==null ? null : agP95;
+  // Legend toggle state: clicking a legend item hides its related lines
+  // (persisted on cv._chart across redraws and data updates).
+  const hide = (cv._chart && cv._chart.hide) || {};
+  const hasPct = !!(p50s && p50s.some(v=>v!=null)) || !!(p95s && p95s.some(v=>v!=null));
+  const hasAgg = (agP50||0)>0 || (agP95||0)>0;
   const n = values.length;
   if(!n){ ctx.fillStyle="#8b949e"; ctx.font="11px sans-serif"; ctx.fillText("no traffic yet", 2, 14); cv._chart = null; return; }
   let max = 1;
   for(const v of values){ if(v>max) max=v; }
-  const bw = w/n, padTop = 24, baseY = h-5, maxH = Math.max(10, baseY-padTop);
+  // A per-request value never exceeds its bucket's sum (peak for RAM),
+  // but fold the visible ticks into the scale anyway so they can never
+  // draw outside the plot (hidden ones are dropped, so hiding a high
+  // line brings the bars back into view).
+  if(!hide.p50 && p50s){ for(const v of p50s){ if(v!=null && v>max) max=v; } }
+  if(!hide.p95 && p95s){ for(const v of p95s){ if(v!=null && v>max) max=v; } }
+  // An overall p95 can sit above every per-bucket p95 (a small bucket of
+  // large values) — fold the visible lines into the scale as well.
+  if(!hide.p50 && ovP50!=null && ovP50>max) max=ovP50;
+  if(!hide.p95 && ovP95!=null && ovP95>max) max=ovP95;
+  if(!hide.barsP50 && agP50!=null && agP50>max) max=agP50;
+  if(!hide.barsP95 && agP95!=null && agP95>max) max=agP95;
+  const bw = w/n, baseY = h-5;
+  // When the percentile legend (below) is shown it right-aligns in the top
+  // strip; push the plot down by a full row so the figure of the tallest
+  // bar (drawn 4 px above its top) always keeps a blank row clear of the
+  // legend text instead of overlapping it.
+  const padTop = 24 + ((hasPct||hasAgg)?16:0), maxH = Math.max(10, baseY-padTop);
   ctx.font = "10px sans-serif";
   const charW = Math.max(4, ctx.measureText("0").width);
   const stride = Math.max(1, Math.ceil((String(max).length*charW + 6) / bw));
@@ -1223,6 +1753,19 @@ function drawBars(cv, series, key, label, color, hl, fmt){ fmt = fmt || fmtVal;
     ctx.fillStyle = color;
     ctx.fillRect(x, baseY-bh, bwid, bh);
     if(hov && bh>0){ ctx.save(); ctx.globalAlpha=.28; ctx.fillStyle="#ffffff"; ctx.fillRect(x, baseY-bh, bwid, bh); ctx.restore(); }
+    if(hasPct){
+      // a solid p50 / dashed p95 tick across the bar at the per-request
+      // value (skipped for buckets without data for the metric)
+      const tick = (val, col, dash)=>{
+        if(val==null || val<=0) return;
+        const ty = baseY - Math.max(2, Math.round((val/max)*maxH));
+        ctx.save(); ctx.strokeStyle=col; ctx.lineWidth=2; ctx.setLineDash(dash);
+        ctx.beginPath(); ctx.moveTo(x+.5, ty+.5); ctx.lineTo(x+bwid-.5, ty+.5); ctx.stroke();
+        ctx.restore();
+      };
+      if(!hide.p50) tick(p50s ? p50s[i] : null, P50C, []);
+      if(!hide.p95) tick(p95s ? p95s[i] : null, P95C, [3,2]);
+    }
     if((i % stride === 0 && v>0) || hov){
       const txt = fmt(v);
       ctx.font = (hov ? "700 " : "")+"10px sans-serif";
@@ -1232,6 +1775,35 @@ function drawBars(cv, series, key, label, color, hl, fmt){ fmt = fmt || fmtVal;
       ctx.fillText(txt, lx, baseY-bh-4);
     }
   });
+  if(ovP50!=null || ovP95!=null){
+    // The window-wide percentile lines: full-width across the whole plot
+    // (unlike the per-bar ticks) at the p50/p95 of every request in the
+    // window (values of 0 or below are skipped, like the ticks).
+    const line = (val, col, dash)=>{
+      if(val==null || val<=0) return;
+      const y = baseY - Math.max(2, Math.round((val/max)*maxH));
+      ctx.save(); ctx.strokeStyle=col; ctx.lineWidth=1.5; ctx.setLineDash(dash);
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
+      ctx.restore();
+    };
+    if(!hide.p50) line(ovP50, P50C, []);
+    if(!hide.p95) line(ovP95, P95C, [3,2]);
+  }
+  if(agP50!=null || agP95!=null){
+    // The p50/p95 of the drawn per-bucket aggregate values (the bars
+    // themselves — sums, per-bucket peak for RAM) — the second
+    // full-width line pair, so it reads against the bar heights
+    // (values of 0 or below are skipped, like the lines above).
+    const agline = (val, dash)=>{
+      if(val==null || val<=0) return;
+      const y = baseY - Math.max(2, Math.round((val/max)*maxH));
+      ctx.save(); ctx.strokeStyle=AGGC; ctx.lineWidth=1.5; ctx.setLineDash(dash);
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
+      ctx.restore();
+    };
+    if(!hide.barsP50) agline(agP50, []);
+    if(!hide.barsP95) agline(agP95, [6,3]);
+  }
   if(hl!=null && hl>=0 && hl<n){
     const v = values[hl], bh = v>0 ? Math.max(2, Math.round((v/max)*maxH)) : 0;
     const x = hl*bw+1, bwid = Math.max(1, bw-2);
@@ -1241,46 +1813,128 @@ function drawBars(cv, series, key, label, color, hl, fmt){ fmt = fmt || fmtVal;
   }
   ctx.font = "11px sans-serif";
   ctx.fillStyle = "#8b949e";
-  ctx.fillText("max "+fmt(max), 2, 12);
+  // The additive charts (cpu ms, disk read, disk write) also carry the
+  // window total — the sum of the drawn per-bucket values — right of the
+  // max; the non-additive charts (request count, token sums, peak RAM)
+  // keep the max alone.
+  const tot = values.reduce((s, v) => s + v, 0);
+  ctx.fillText(showTotal ? "max "+fmt(max)+" \u00b7 total "+fmt(tot) : "max "+fmt(max), 2, 12);
+  let legItems = [];
+  if(hasPct || hasAgg){
+    // legend for the percentile overlays, right-aligned in the top strip
+    // on a single row (solid = p50, dashed = p95; "all X / Y" = the
+    // window-wide per-request values drawn as full-width lines across
+    // the plot; "bars X / Y" = the p50/p95 of the drawn per-bucket
+    // aggregate values — the second line pair). Each item is clickable:
+    // it toggles the related lines (hidden items are drawn faded and
+    // dropped from the scale).
+    ctx.font = "10px sans-serif";
+    const SW = 11, G1 = 6, G2 = 12;
+    const wTxt = t => ctx.measureText(t).width;
+    const allTxt = (ovP50>0 || ovP95>0)
+      ? "all "+fmt(ovP50||0)+" / "+fmt(ovP95||0) : "";
+    const barsTxt = "bars "+fmt(agP50||0)+" / "+fmt(agP95||0);
+    // [toggle key, swatch color, dash, label, trailing text]
+    const items = [];
+    if(hasPct){
+      items.push(["p50", P50C, [], "p50", ""]);
+      items.push(["p95", P95C, [3,2], "p95", allTxt]);
+    }
+    if(hasAgg){
+      items.push(["barsP50", AGGC, [], "bars p50", ""]);
+      items.push(["barsP95", AGGC, [6,3], "bars p95", barsTxt]);
+    }
+    const legendW = items.reduce((s,it)=>s + SW+G1+wTxt(it[3]) + (it[4] ? G2+wTxt(it[4]) : 0) + G2, 0);
+    let lx = Math.max(2, w - legendW - 6);
+    ctx.lineWidth = 2; ctx.fillStyle = "#8b949e";
+    for(const it of items){
+      ctx.save(); ctx.globalAlpha = hide[it[0]] ? .35 : 1;
+      ctx.strokeStyle = it[1]; ctx.setLineDash(it[2]);
+      ctx.beginPath(); ctx.moveTo(lx, 9); ctx.lineTo(lx+SW, 9); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillText(it[3], lx+SW+G1, 12);
+      ctx.restore();
+      legItems.push({k: it[0], x: lx, y: 2, w: SW+G1+wTxt(it[3]), h: 14});
+      lx += SW+G1+wTxt(it[3]);
+      if(it[4]){ ctx.fillText(it[4], lx+G2, 12); lx += G2+wTxt(it[4]); }
+      lx += G2;
+    }
+  }
   ctx.strokeStyle = "#30363d";
   ctx.beginPath(); ctx.moveTo(0,h-3.5); ctx.lineTo(w,h-3.5); ctx.stroke();
-  cv._chart = { series, key, label, color, w, h, bw, baseY, maxH, max, hl: hl==null?-1:hl, fmt };
+  cv._chart = { series, key, label, color, w, h, bw, baseY, maxH, max, hl: hl==null?-1:hl, fmt, p50Key: p50Key||null, p95Key: p95Key||null, ovP50, ovP95, agP50, agP95, showTotal: !!showTotal, hide: hide, legItems: legItems };
 }
 function redrawChart(cv){
   const c = cv._chart;
   if(!c) return;
-  drawBars(cv, c.series, c.key, c.label, c.color, c.hl, c.fmt);
+  drawBars(cv, c.series, c.key, c.label, c.color, c.hl, c.fmt, c.p50Key, c.p95Key, c.ovP50, c.ovP95, c.agP50, c.agP95, c.showTotal);
 }
-// Wire up hover + tooltip on a chart canvas (call once per canvas).
+// Wire up hover + tooltip and the clickable legend on a chart canvas
+// (call once per canvas).
 function attachChart(cv){
   cv.addEventListener("mousemove", e=>{
     const c = cv._chart;
-    if(!c || !c.series.length){ hideTip(); return; }
+    if(!c || !c.series.length){ hideTip(); cv.style.cursor = "default"; return; }
     const rect = cv.getBoundingClientRect();
-    const x = e.clientX - rect.left;
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    // legend items are clickable (they toggle their related lines)
+    cv.style.cursor = (c.legItems||[]).some(li=>x>=li.x && x<=li.x+li.w && y>=li.y && y<=li.y+li.h) ? "pointer" : "default";
     let i = Math.floor(x / c.bw);
     if(i<0 || i>=c.series.length){ hideTip(); if(c.hl!==-1){ c.hl=-1; redrawChart(cv); } return; }
     if(i!==c.hl){ c.hl = i; redrawChart(cv); }
     const b = c.series[i];
     const val = (b==null || b[c.key]==null) ? 0 : b[c.key];
-    showTip(e.clientX, e.clientY, c.label, new Date(b.t*1000).toLocaleTimeString(), (c.fmt || fmtVal)(val), c.color);
+    // the per-request percentile values of the bucket (the resource
+    // charts, all-backend scope) — one combined "p50 X / p95 Y" line
+    const extra = [];
+    if(c.p50Key || c.p95Key){
+      const parts = [];
+      if(c.p50Key && b[c.p50Key]!=null) parts.push("p50 "+(c.fmt||fmtVal)(b[c.p50Key]));
+      if(c.p95Key && b[c.p95Key]!=null) parts.push("p95 "+(c.fmt||fmtVal)(b[c.p95Key]));
+      if(parts.length) extra.push([parts.join(" / "), P50C]);
+    }
+    showTip(e.clientX, e.clientY, c.label, new Date(b.t*1000).toLocaleTimeString(), (c.fmt || fmtVal)(val), c.color, extra);
   });
   cv.addEventListener("mouseleave", ()=>{
     hideTip();
+    cv.style.cursor = "default";
     const c = cv._chart;
     if(c && c.hl!==-1){ c.hl=-1; redrawChart(cv); }
+  });
+  // Clicking a legend item toggles the related lines (the item is drawn
+  // faded while hidden and its values are dropped from the scale).
+  cv.addEventListener("click", e=>{
+    const c = cv._chart;
+    if(!c || !c.legItems || !c.legItems.length) return;
+    const rect = cv.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    for(const li of c.legItems){
+      if(x>=li.x && x<=li.x+li.w && y>=li.y && y<=li.y+li.h){
+        if(!c.hide) c.hide = {};
+        c.hide[li.k] = !c.hide[li.k];
+        redrawChart(cv);
+        return;
+      }
+    }
   });
 }
 // Keep the backend filter's options in sync with the proxy's backend
 // list (rebuild only when the list changes; preserve a still-valid
-// selection and keep the BE state in step with the dropdown).
+// selection and keep the BE state in step with the dropdown). A
+// deep-linked ?backend= param on the page's own URL seeds the first
+// build (the options don't exist yet when the URL is read).
+let DEEP_BE = (function(){
+  const be = new URLSearchParams(location.search).get("backend");
+  return be!==null && be!=="" && (be==="cached" || be==="coalesced" || be==="coalesced_groups" || /^\d+$/.test(be)) ? be : null;
+})();
 function renderBackendSel(p){
   const sel = $("backend");
   const list = p.backends || [];
   const sig = list.map(b=>b.url).join("\u0001");
   if(sig !== sel._sig){
     sel._sig = sig;
-    const cur = sel.value;
+    let cur = sel.value;
+    if(cur==="" && DEEP_BE!==null){ cur = DEEP_BE; DEEP_BE = null; }
     sel.innerHTML = '<option value="">all</option>' +
       list.map((b,i)=>'<option value="'+i+'">backend '+i+' \u00b7 '+esc(b.url)+'</option>').join("") +
       '<option value="cached">cached results \u00b7 no backend</option>' +
@@ -1323,13 +1977,25 @@ function render(d){
   card("c-dw", fmtMB(res.disk_write_bytes), "total \u00b7 "+rangeLabel());
   card("c-ram", fmtMB(res.ram_max_bytes), "max \u00b7 "+rangeLabel());
   const series = fillSeries(s.buckets, s.bucket_secs);
+  // The per-request p50/p95 of each metric (completion tokens; cached
+  // prompt tokens — a request that restored nothing counts as 0) is
+  // overlaid on the token charts and of each resource metric on the
+  // resource charts — per scope (the filtered views' points carry
+  // their scope's own fields, null where the scope has no data in the
+  // bucket). The window-wide p50/p95 of the selected scope's requests
+  // is drawn as a full-width line pair ("all"), and the p50/p95 of
+  // the drawn per-bucket aggregate values (the bars themselves) as a
+  // second full-width line pair ("bars"). The request-count chart has
+  // no per-request scalar, so it stays plain bars.
+  const ov = s.pct_overall || null;
+  const ag = s.pct_overall_agg || null;
   drawBars($("chart-req"), series, "reqs", "requests", "#58a6ff", -1);
-  drawBars($("chart-tok"), series, "completions", "completion tokens", "#3fb950", -1);
-  drawBars($("chart-cached"), series, "cached_tokens", "cached tokens", "#d29922", -1);
-  drawBars($("chart-cpu"), series, "cpu_ms", "cpu ms", "#bc8cff", -1);
-  drawBars($("chart-dr"), series, "disk_read_bytes", "disk read (MB)", "#39c5cf", -1, fmtMBn);
-  drawBars($("chart-dw"), series, "disk_write_bytes", "disk write (MB)", "#db61a2", -1, fmtMBn);
-  drawBars($("chart-ram"), series, "ram_bytes", "peak ram (MB)", "#f85149", -1, fmtMBn);
+  drawBars($("chart-tok"), series, "completions", "completion tokens", "#3fb950", -1, fmtVal, "completion_tokens_p50", "completion_tokens_p95", ov ? ov.completion_tokens_p50 : null, ov ? ov.completion_tokens_p95 : null, ag ? ag.completion_tokens_p50 : null, ag ? ag.completion_tokens_p95 : null);
+  drawBars($("chart-cached"), series, "cached_tokens", "cached tokens", "#d29922", -1, fmtVal, "cached_tokens_p50", "cached_tokens_p95", ov ? ov.cached_tokens_p50 : null, ov ? ov.cached_tokens_p95 : null, ag ? ag.cached_tokens_p50 : null, ag ? ag.cached_tokens_p95 : null);
+  drawBars($("chart-cpu"), series, "cpu_ms", "cpu ms", "#bc8cff", -1, fmtVal, "cpu_ms_p50", "cpu_ms_p95", ov ? ov.cpu_ms_p50 : null, ov ? ov.cpu_ms_p95 : null, ag ? ag.cpu_ms_p50 : null, ag ? ag.cpu_ms_p95 : null, true);
+  drawBars($("chart-dr"), series, "disk_read_bytes", "disk read (MB)", "#39c5cf", -1, fmtMBn, "disk_read_p50", "disk_read_p95", ov ? ov.disk_read_p50 : null, ov ? ov.disk_read_p95 : null, ag ? ag.disk_read_p50 : null, ag ? ag.disk_read_p95 : null, true);
+  drawBars($("chart-dw"), series, "disk_write_bytes", "disk write (MB)", "#db61a2", -1, fmtMBn, "disk_write_p50", "disk_write_p95", ov ? ov.disk_write_p50 : null, ov ? ov.disk_write_p95 : null, ag ? ag.disk_write_p50 : null, ag ? ag.disk_write_p95 : null, true);
+  drawBars($("chart-ram"), series, "ram_bytes", "peak ram (MB)", "#f85149", -1, fmtMBn, "ram_p50", "ram_p95", ov ? ov.ram_p50 : null, ov ? ov.ram_p95 : null, ag ? ag.ram_p50 : null, ag ? ag.ram_p95 : null);
   const span = series.length ? series.length*s.bucket_secs : 0;
   const spanLabel = span ? (ranged ? rangeLabel() : span+" s window")+" \u00b7 "+s.bucket_secs+" s buckets" : "";
   $("cap-req").textContent = spanLabel;
@@ -1575,6 +2241,469 @@ mod tests {
         assert_eq!(d.stats_path(), "/stats/api/stats");
     }
 
+    /// The geometric midpoint of the [`Pct`] bin containing `v` (what
+    /// `Pct::quantile` reports for a value in that bin; `0.0` below the
+    /// floor).
+    fn pct_mid(v: f64) -> f64 {
+        if v < PCT_FLOOR {
+            return 0.0;
+        }
+        let i = Pct::bin_of(v);
+        PCT_FLOOR * 10f64.powf((i as f64 + 0.5) / 3.0)
+    }
+
+    #[test]
+    fn pct_hist_quantiles_are_bounded_and_merge() {
+        // empty: no values → no quantile
+        let p = Pct::default();
+        assert!(p.quantile(50.0).is_none());
+        assert!(p.quantile(95.0).is_none());
+        // zeros, sub-floor values and negative sampling noise land in
+        // the zero bin
+        let mut p = Pct::default();
+        p.add(0.0);
+        p.add(0.05);
+        p.add(-1.0);
+        assert_eq!(p.quantile(50.0), Some(0.0));
+        assert_eq!(p.quantile(95.0), Some(0.0));
+        // a single value: every percentile is its bin's midpoint
+        let mut p = Pct::default();
+        p.add(1234.5);
+        assert_eq!(p.quantile(50.0), Some(pct_mid(1234.5)));
+        assert_eq!(p.quantile(95.0), Some(pct_mid(1234.5)));
+        // many values: a reported percentile is within one bin of the
+        // true rank's value (a bin spans a factor of 10^(1/3), so the
+        // midpoint is within a factor of 10^(1/6) ≈ 1.47 of any value
+        // in the bin)
+        let mut p = Pct::default();
+        for i in 1..=100 {
+            p.add(i as f64);
+        }
+        for (q, want) in [(50.0, 50.0f64), (95.0, 95.0f64)] {
+            let got = p.quantile(q).unwrap();
+            assert!(
+                (got / want - 1.0).abs() < 1.5,
+                "p{q}: got {got}, want ≈ {want}"
+            );
+        }
+        // merge is bin-wise addition (series coarsening relies on it)
+        let mut a = Pct::default();
+        a.add(10.0);
+        let mut b = Pct::default();
+        b.add(1000.0);
+        a.merge(&b);
+        assert_eq!(a.quantile(50.0), Some(pct_mid(10.0)));
+        assert_eq!(a.quantile(95.0), Some(pct_mid(1000.0)));
+        // merging an empty histogram changes nothing
+        let mut c = Pct::default();
+        c.add(7.0);
+        c.merge(&Pct::default());
+        assert_eq!(c.quantile(50.0), Some(pct_mid(7.0)));
+    }
+
+    #[test]
+    fn series_buckets_track_per_request_percentiles() {
+        let d = DashboardPlugin::new(params(
+            json!({ "window_secs": 30, "bucket_secs": 10, "max_recent": 2 }),
+        ))
+        .unwrap();
+        // Bucket 100: two requests, cpu 10/100 ms (an order of
+        // magnitude apart → distinct bins), ram 1e6/1e7; bucket 120:
+        // one request, cpu 1000.
+        let mut r1 = record(200);
+        r1.cpu_ms = Some(10.0);
+        r1.ram_bytes = Some(1_000_000);
+        d.record_at(100.0, &r1).unwrap();
+        let mut r2 = record(200);
+        r2.cpu_ms = Some(100.0);
+        r2.ram_bytes = Some(10_000_000);
+        d.record_at(109.0, &r2).unwrap();
+        let mut r3 = record(200);
+        r3.cpu_ms = Some(1000.0);
+        d.record_at(125.0, &r3).unwrap();
+
+        // All-backend scope: the points carry the per-request p50/p95
+        // of each resource metric.
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        let b0 = &v["series"]["buckets"][0];
+        let b1 = &v["series"]["buckets"][1];
+        // bucket 100: p50 = the lower value's bin, p95 the higher's
+        assert_eq!(b0["cpu_ms_p50"], pct_mid(10.0));
+        assert_eq!(b0["cpu_ms_p95"], pct_mid(100.0));
+        assert!(b0["cpu_ms_p50"].as_f64().unwrap() < b0["cpu_ms_p95"].as_f64().unwrap());
+        // the equal per-request disk values: p50 == p95 == that bin's
+        // midpoint
+        assert_eq!(b0["disk_read_p50"], pct_mid(1024.0));
+        assert_eq!(b0["disk_read_p95"], pct_mid(1024.0));
+        assert_eq!(b0["disk_write_p50"], pct_mid(2048.0));
+        assert_eq!(b0["disk_write_p95"], pct_mid(2048.0));
+        assert_eq!(b0["ram_p50"], pct_mid(1_000_000.0));
+        assert_eq!(b0["ram_p95"], pct_mid(10_000_000.0));
+        // the single-request bucket: p50 == p95
+        assert_eq!(b1["cpu_ms_p50"], pct_mid(1000.0));
+        assert_eq!(b1["cpu_ms_p95"], pct_mid(1000.0));
+        // the scoped views track their own percentiles (the cached
+        // view's points carry the fields too — null, since none of
+        // these records was a cache hit)
+        let v = d.stats(&proxy(), Some(0), BackendScope::Cached);
+        assert_eq!(v["series"]["buckets"][0]["cpu_ms_p50"], Value::Null);
+        assert_eq!(v["series"]["buckets"][0]["ram_p95"], Value::Null);
+        // a backend index with no traffic in the bucket has no
+        // sub-histograms at all (its points lack the fields, so the
+        // page draws no ticks)
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(0));
+        assert!(v["series"]["buckets"][0].get("disk_read_p50").is_none());
+    }
+
+    #[test]
+    fn series_scoped_percentiles_track_each_backend() {
+        let d = DashboardPlugin::new(params(
+            json!({ "window_secs": 30, "bucket_secs": 10, "max_recent": 2 }),
+        ))
+        .unwrap();
+        // Bucket 100 gets two records on different backends (cpu an
+        // order of magnitude apart) plus one cache hit on backend 0 —
+        // each scope's percentiles must see only its own records.
+        let mut r1 = record(200);
+        r1.backend = Some(0);
+        r1.cpu_ms = Some(10.0);
+        r1.completion_tokens = Some(10);
+        r1.cached_tokens = Some(20);
+        d.record_at(100.0, &r1).unwrap();
+        let mut r2 = record(200);
+        r2.backend = Some(1);
+        r2.cpu_ms = Some(1000.0);
+        r2.completion_tokens = Some(1000);
+        r2.cached_tokens = Some(0);
+        d.record_at(105.0, &r2).unwrap();
+        let mut r3 = record(200);
+        r3.backend = Some(0);
+        r3.cache_hit = Some(true);
+        r3.cpu_ms = Some(50.0);
+        r3.completion_tokens = Some(50);
+        r3.cached_tokens = Some(800);
+        d.record_at(108.0, &r3).unwrap();
+        // backend 0's view: only its two records (10, 50)
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(0));
+        let b0 = &v["series"]["buckets"][0];
+        assert_eq!(b0["cpu_ms_p50"], pct_mid(10.0));
+        assert_eq!(b0["cpu_ms_p95"], pct_mid(50.0));
+        // the token metrics percentilize the same per scope (completion
+        // 10/50; cached 20/800)
+        assert_eq!(b0["completion_tokens_p50"], pct_mid(10.0));
+        assert_eq!(b0["completion_tokens_p95"], pct_mid(50.0));
+        assert_eq!(b0["cached_tokens_p50"], pct_mid(20.0));
+        assert_eq!(b0["cached_tokens_p95"], pct_mid(800.0));
+        // backend 1's view: only its single record (1000)
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(1));
+        let b1 = &v["series"]["buckets"][0];
+        assert_eq!(b1["cpu_ms_p50"], pct_mid(1000.0));
+        assert_eq!(b1["cpu_ms_p95"], pct_mid(1000.0));
+        // that record restored nothing → its cached-token percentiles
+        // are 0 (the zero bin), not null
+        assert_eq!(b1["completion_tokens_p50"], pct_mid(1000.0));
+        assert_eq!(b1["cached_tokens_p50"], 0.0);
+        assert_eq!(b1["cached_tokens_p95"], 0.0);
+        // the cached view: only the cache-hit record (50)
+        let v = d.stats(&proxy(), Some(0), BackendScope::Cached);
+        let bc = &v["series"]["buckets"][0];
+        assert_eq!(bc["cpu_ms_p50"], pct_mid(50.0));
+        assert_eq!(bc["cpu_ms_p95"], pct_mid(50.0));
+        assert_eq!(bc["completion_tokens_p50"], pct_mid(50.0));
+        assert_eq!(bc["cached_tokens_p95"], pct_mid(800.0));
+        // the all-backend view still sees everything (10, 50, 1000):
+        // p50 = the second value, p95 the largest
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        assert_eq!(v["series"]["buckets"][0]["cpu_ms_p50"], pct_mid(50.0));
+        assert_eq!(v["series"]["buckets"][0]["cpu_ms_p95"], pct_mid(1000.0));
+        // the token metrics the same way (completion 10/50/1000; cached
+        // 0/20/800 — the zero stays in the zero bin)
+        assert_eq!(
+            v["series"]["buckets"][0]["completion_tokens_p50"],
+            pct_mid(50.0)
+        );
+        assert_eq!(
+            v["series"]["buckets"][0]["completion_tokens_p95"],
+            pct_mid(1000.0)
+        );
+        assert_eq!(
+            v["series"]["buckets"][0]["cached_tokens_p50"],
+            pct_mid(20.0)
+        );
+        assert_eq!(
+            v["series"]["buckets"][0]["cached_tokens_p95"],
+            pct_mid(800.0)
+        );
+        // every scope's `pct_overall` covers its own window (the merge
+        // of the scope's sub-histograms)
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(1));
+        assert_eq!(v["series"]["pct_overall"]["cpu_ms_p50"], pct_mid(1000.0));
+        assert_eq!(v["series"]["pct_overall"]["cached_tokens_p50"], 0.0);
+        let v = d.stats(&proxy(), Some(0), BackendScope::Cached);
+        assert_eq!(v["series"]["pct_overall"]["cpu_ms_p95"], pct_mid(50.0));
+        assert_eq!(
+            v["series"]["pct_overall"]["cached_tokens_p95"],
+            pct_mid(800.0)
+        );
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        assert_eq!(v["series"]["pct_overall"]["cpu_ms_p50"], pct_mid(50.0));
+        assert_eq!(v["series"]["pct_overall"]["cpu_ms_p95"], pct_mid(1000.0));
+        assert_eq!(
+            v["series"]["pct_overall"]["completion_tokens_p95"],
+            pct_mid(1000.0)
+        );
+        assert_eq!(
+            v["series"]["pct_overall"]["cached_tokens_p50"],
+            pct_mid(20.0)
+        );
+        // every scope's `pct_overall_agg` is the percentile of its own
+        // drawn bars (one bucket → p50 = p95 = the bar's aggregate)
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(1));
+        assert_eq!(v["series"]["pct_overall_agg"]["cpu_ms_p50"], 1000.0);
+        // that single bar restored nothing → its cached-token
+        // aggregate is 0 (a zero bar still counts as a sample)
+        assert_eq!(v["series"]["pct_overall_agg"]["cached_tokens_p50"], 0.0);
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        assert_eq!(v["series"]["pct_overall_agg"]["cpu_ms_p50"], 1060.0);
+        assert_eq!(
+            v["series"]["pct_overall_agg"]["completion_tokens_p95"],
+            1060.0
+        );
+        assert_eq!(v["series"]["pct_overall_agg"]["cached_tokens_p95"], 820.0);
+        // a backend that never served a request in the window has no
+        // sub-histograms → no pct fields, no `pct_overall`; its drawn
+        // bars are zero, so `pct_overall_agg` is present, all zeros
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(3));
+        assert!(v["series"]["buckets"][0].get("cpu_ms_p50").is_none());
+        assert!(v["series"].get("pct_overall").is_none());
+        assert_eq!(v["series"]["pct_overall_agg"]["cpu_ms_p50"], 0.0);
+        assert_eq!(v["series"]["pct_overall_agg"]["cached_tokens_p95"], 0.0);
+    }
+
+    #[test]
+    fn series_coarsening_merges_percentiles() {
+        // 400 five-second buckets → more than MAX_SERIES_POINTS →
+        // coarsened (step 10 s); the merged points must carry the
+        // percentiles merged across the buckets they fold.
+        let mut buckets = Vec::new();
+        for i in 0..400u64 {
+            let mut b = Bucket::new(i * 5);
+            let mut r = record(200);
+            // one record per bucket; cpu grows with the index so the
+            // merged percentiles differ from any single bucket's
+            r.cpu_ms = Some(i as f64 + 1.0);
+            b.add(&r);
+            buckets.push(b);
+        }
+        let (step, pts) = DashboardPlugin::series_points(&buckets, 5, BackendScope::All);
+        assert_eq!(step, 10);
+        assert!(pts.len() <= MAX_SERIES_POINTS);
+        // every coarsened point carries the merged percentile fields
+        for p in &pts {
+            assert!(p["cpu_ms_p50"].is_number());
+            assert!(p["cpu_ms_p95"].is_number());
+            assert!(p["disk_read_p50"].is_number());
+            assert!(p["ram_p95"].is_number());
+            // the token metrics merge the same way (every record in the
+            // fixture carries completion/cached token counts)
+            assert!(p["completion_tokens_p50"].is_number());
+            assert!(p["cached_tokens_p95"].is_number());
+        }
+        // the last merged point absorbed the two highest per-request
+        // values (399, 400): its p95 is within one bin of 400
+        let last = &pts[pts.len() - 1];
+        let got = last["cpu_ms_p95"].as_f64().unwrap();
+        assert!(
+            (got / 400.0 - 1.0).abs() < 1.5,
+            "coarsened p95: got {got}, want ≈ 400"
+        );
+        // and its p50 sits at or below it
+        let mid = last["cpu_ms_p50"].as_f64().unwrap();
+        assert!(mid > 0.0 && mid <= got);
+        // the scoped views coarsen the same buckets with their own
+        // percentiles (null here — none of these records was a cache
+        // hit, so the cached sub-histograms stay empty)
+        let (_, scoped) = DashboardPlugin::series_points(&buckets, 5, BackendScope::Cached);
+        assert!(scoped.len() == pts.len());
+        for p in &scoped {
+            assert_eq!(p["cpu_ms_p50"], Value::Null);
+            assert_eq!(p["ram_p95"], Value::Null);
+        }
+        // the percentiles of the drawn (coarsened) bars themselves:
+        // each merged bar is one sample, and all twelve fields are
+        // numbers (every bar carries every metric)
+        let agg = point_agg_percentiles(&pts).unwrap();
+        assert_eq!(agg.as_object().unwrap().len(), 12);
+        for (k, q) in agg.as_object().unwrap() {
+            assert!(q.is_number(), "field {k}");
+        }
+        let p50 = agg["cpu_ms_p50"].as_f64().unwrap();
+        let p95 = agg["cpu_ms_p95"].as_f64().unwrap();
+        assert!(p50 > 0.0 && p50 <= p95);
+        // the cached scope's bars are all-zero (no cache hit ever):
+        // zero bars still count as samples (0, not null)
+        let agg = point_agg_percentiles(&scoped).unwrap();
+        assert_eq!(agg["cpu_ms_p50"], 0.0);
+        assert_eq!(agg["cpu_ms_p95"], 0.0);
+    }
+
+    #[test]
+    fn point_agg_percentiles_nearest_rank() {
+        // empty series → None
+        assert!(point_agg_percentiles(&[]).is_none());
+        // three points → the nearest-rank percentiles pick the second
+        // (rank ceil(0.5*3) = 2) and the third (ceil(0.95*3) = 3)
+        // values of each metric
+        let pts = vec![
+            json!({
+                "cpu_ms": 10.0,
+                "disk_read_bytes": 100,
+                "disk_write_bytes": 200,
+                "ram_bytes": 300,
+                "completions": 40,
+                "cached_tokens": 50
+            }),
+            json!({
+                "cpu_ms": 100.0,
+                "disk_read_bytes": 1_000,
+                "disk_write_bytes": 2_000,
+                "ram_bytes": 3_000,
+                "completions": 400,
+                "cached_tokens": 500
+            }),
+            json!({
+                "cpu_ms": 1_000.0,
+                "disk_read_bytes": 10_000,
+                "disk_write_bytes": 20_000,
+                "ram_bytes": 30_000,
+                "completions": 4_000,
+                "cached_tokens": 5_000
+            }),
+        ];
+        let v = point_agg_percentiles(&pts).unwrap();
+        // the same twelve field names as `pct_overall_json`
+        assert_eq!(v.as_object().unwrap().len(), 12);
+        assert_eq!(v["cpu_ms_p50"], 100.0);
+        assert_eq!(v["cpu_ms_p95"], 1_000.0);
+        assert_eq!(v["disk_read_p50"], 1_000.0);
+        assert_eq!(v["disk_read_p95"], 10_000.0);
+        assert_eq!(v["disk_write_p95"], 20_000.0);
+        assert_eq!(v["ram_p50"], 3_000.0);
+        assert_eq!(v["completion_tokens_p50"], 400.0);
+        assert_eq!(v["cached_tokens_p95"], 5_000.0);
+        // a point missing the field is skipped, but a zero value still
+        // counts (unlike the per-request histogram's zero bin)
+        let pts = vec![
+            json!({ "cpu_ms": 0.0 }),
+            json!({}),
+            json!({ "cpu_ms": 9.0 }),
+        ];
+        let v = point_agg_percentiles(&pts).unwrap();
+        assert_eq!(v["cpu_ms_p50"], 0.0);
+        assert_eq!(v["cpu_ms_p95"], 9.0);
+        // a metric missing from every point is null (not absent)
+        assert_eq!(v["ram_p50"], Value::Null);
+        assert_eq!(v["ram_p95"], Value::Null);
+    }
+
+    #[test]
+    fn series_overall_percentiles_cover_the_window() {
+        let d = DashboardPlugin::new(params(
+            json!({ "window_secs": 30, "bucket_secs": 10, "max_recent": 2 }),
+        ))
+        .unwrap();
+        // cpu 10/100 ms in bucket 100, cpu 1000 in bucket 120 — the
+        // overall set sees all three values across the two buckets.
+        let mut r1 = record(200);
+        r1.cpu_ms = Some(10.0);
+        d.record_at(100.0, &r1).unwrap();
+        let mut r2 = record(200);
+        r2.cpu_ms = Some(100.0);
+        d.record_at(109.0, &r2).unwrap();
+        let mut r3 = record(200);
+        r3.cpu_ms = Some(1000.0);
+        d.record_at(125.0, &r3).unwrap();
+        // The range path: p50 is the second of the three cpu values
+        // (rank ceil(0.5*3) = 2), p95 the largest (rank ceil(0.95*3) =
+        // 3); the helper's default disk/ram values (identical in
+        // every record) come out at their own bin midpoint.
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        assert_eq!(v["series"]["pct_overall"]["cpu_ms_p50"], pct_mid(100.0));
+        assert_eq!(v["series"]["pct_overall"]["cpu_ms_p95"], pct_mid(1000.0));
+        assert_eq!(v["series"]["pct_overall"]["disk_read_p50"], pct_mid(1024.0));
+        assert_eq!(v["series"]["pct_overall"]["ram_p95"], pct_mid(1_048_576.0));
+        // the token percentiles cover the window the same way (the
+        // fixture's completion/cached token counts are identical in
+        // every record)
+        assert_eq!(
+            v["series"]["pct_overall"]["completion_tokens_p50"],
+            pct_mid(50.0)
+        );
+        assert_eq!(
+            v["series"]["pct_overall"]["cached_tokens_p95"],
+            pct_mid(80.0)
+        );
+        // `pct_overall_agg` is the percentile of the drawn bars
+        // themselves: two buckets here (100: cpu 10+100, completions
+        // 100, cached 160, read 2048, write 4096; 120: cpu 1000, the
+        // rest halved), so p50 is the smaller bar, p95 the larger
+        let agg = &v["series"]["pct_overall_agg"];
+        assert_eq!(agg["cpu_ms_p50"], 110.0);
+        assert_eq!(agg["cpu_ms_p95"], 1000.0);
+        assert_eq!(agg["completion_tokens_p50"], 50.0);
+        assert_eq!(agg["completion_tokens_p95"], 100.0);
+        assert_eq!(agg["cached_tokens_p50"], 80.0);
+        assert_eq!(agg["disk_read_p50"], 1024.0);
+        assert_eq!(agg["disk_read_p95"], 2048.0);
+        assert_eq!(agg["disk_write_p95"], 4096.0);
+        // the RAM gauge is identical in every record → both bars equal
+        assert_eq!(agg["ram_p50"], 1_048_576.0);
+        assert_eq!(agg["ram_p95"], 1_048_576.0);
+        // a metric with no data in the window carries nulls (not
+        // absent fields)
+        let d2 = DashboardPlugin::new(params(
+            json!({ "window_secs": 30, "bucket_secs": 10, "max_recent": 2 }),
+        ))
+        .unwrap();
+        let mut r0 = record(200);
+        r0.disk_read_bytes = None;
+        d2.record_at(100.0, &r0).unwrap();
+        let v = d2.stats(&proxy(), Some(0), BackendScope::All);
+        assert_eq!(v["series"]["pct_overall"]["disk_read_p50"], Value::Null);
+        assert_eq!(v["series"]["pct_overall"]["disk_read_p95"], Value::Null);
+        assert!(v["series"]["pct_overall"]["cpu_ms_p50"].is_number());
+        // unlike the per-request histogram (null for a metric without
+        // data), the drawn bar of a missing metric is 0 — a zero bar
+        // still counts as a sample
+        assert_eq!(v["series"]["pct_overall_agg"]["disk_read_p50"], 0.0);
+        assert_eq!(v["series"]["pct_overall_agg"]["disk_read_p95"], 0.0);
+        // The legacy trailing-window path merges the same way (records
+        // near the wall clock fall inside the 30 s window).
+        let now = now_secs() as f64;
+        let mut r4 = record(200);
+        r4.cpu_ms = Some(50.0);
+        d.record_at(now - 20.0, &r4).unwrap();
+        let mut r5 = record(200);
+        r5.cpu_ms = Some(500.0);
+        d.record_at(now - 5.0, &r5).unwrap();
+        let v = d.stats(&proxy(), None, BackendScope::All);
+        assert_eq!(v["series"]["pct_overall"]["cpu_ms_p50"], pct_mid(50.0));
+        assert_eq!(v["series"]["pct_overall"]["cpu_ms_p95"], pct_mid(500.0));
+        // the window path aggregates the same way — two bars (cpu 50,
+        // 500)
+        assert_eq!(v["series"]["pct_overall_agg"]["cpu_ms_p50"], 50.0);
+        assert_eq!(v["series"]["pct_overall_agg"]["cpu_ms_p95"], 500.0);
+        // The backend-filtered views have their own `pct_overall` (the
+        // backend index never served a request, so no sub-histograms →
+        // the key is absent; the cached scope has sub-histograms, so
+        // the key is present with null metrics).
+        let v = d.stats(&proxy(), Some(0), BackendScope::Backend(0));
+        assert!(v["series"].get("pct_overall").is_none());
+        let v = d.stats(&proxy(), None, BackendScope::Cached);
+        assert_eq!(v["series"]["pct_overall"]["cpu_ms_p50"], Value::Null);
+        assert!(v["series"]["pct_overall"]["cpu_ms_p95"].is_null());
+    }
+
     #[test]
     fn record_updates_counters_series_and_recent() {
         let d = DashboardPlugin::new(params(
@@ -1624,6 +2753,14 @@ mod tests {
         // the series carries the per-bucket peak RAM (bucket 0 holds r1+r2)
         assert_eq!(v["series"]["buckets"][0]["ram_bytes"], 150_000_000);
         assert_eq!(v["series"]["buckets"][1]["ram_bytes"], 120_000_000);
+        // the all-backend series points carry the per-request p50/p95 of
+        // the resource values (bucket 0: r1+r2 — equal cpu/disk values,
+        // ram 1e8/1.5e8 in the same bin; bucket 1: r3 alone)
+        assert_eq!(v["series"]["buckets"][0]["cpu_ms_p50"], pct_mid(12.5));
+        assert_eq!(v["series"]["buckets"][0]["cpu_ms_p95"], pct_mid(12.5));
+        assert_eq!(v["series"]["buckets"][1]["cpu_ms_p95"], pct_mid(12.5));
+        assert_eq!(v["series"]["buckets"][0]["ram_p50"], pct_mid(100_000_000.0));
+        assert_eq!(v["series"]["buckets"][0]["ram_p95"], pct_mid(100_000_000.0));
         // the recent ring carries the per-request resource fields
         assert_eq!(v["recent"][0]["cpu_ms"], 12.5);
         assert_eq!(v["recent"][1]["disk_read_bytes"], 1024);
@@ -1955,7 +3092,7 @@ mod tests {
             json!({ "window_secs": 30, "bucket_secs": 10, "max_recent": 2 }),
         ))
         .unwrap();
-        let mut mk = |be: Option<usize>, hit: bool, ts: f64| {
+        let mk = |be: Option<usize>, hit: bool, ts: f64| {
             let mut r = record(200);
             r.backend = be;
             r.cache_hit = Some(hit);
