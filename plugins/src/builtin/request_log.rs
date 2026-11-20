@@ -6,8 +6,9 @@
 //! `cs(User-Agent)`, `cs-bytes`, `cs-time`, `sc-status`, `sc-bytes`) plus
 //! the lpcache pipeline fields (`lpcache-model`, `lpcache-stream`,
 //! `lpcache-key`, `lpcache-n-words`, `lpcache-is-big`, `lpcache-backend`,
-//! `lpcache-slot`, `lpcache-restored`, `lpcache-cache-hit`,
-//! `lpcache-coalesced`, `lpcache-reason`) and the lpcache performance
+//! `lpcache-slot`, `lpcache-restored`, `lpcache-restore-call`,
+//! `lpcache-restore-candidate`, `lpcache-lcp-ratio`,
+//! `lpcache-cache-hit`, `lpcache-coalesced`, `lpcache-reason`) and the lpcache performance
 //! fields (`lpcache-prompt-tokens`, `lpcache-completion-tokens`,
 //! `lpcache-cached-tokens`, `lpcache-prefill-ms`, `lpcache-gen-ms`,
 //! `lpcache-prefill-tps`, `lpcache-gen-tps`, `lpcache-ttft-ms` —
@@ -46,7 +47,7 @@
 //! - `max_bytes` (default 10 MiB): rotation threshold; `0` = no rotation.
 //! - `keep` (default `5`): rotated generations kept (`0` = keep all).
 //! - `fields` (optional): ordered list of field names to emit — any
-//!   subset of the 33 known fields (default: all of them, W3C fields
+//!   subset of the 36 known fields (default: all of them, W3C fields
 //!   first).
 //!
 //! The `datetime` field uses UTC with millisecond precision
@@ -90,6 +91,9 @@ pub const DEFAULT_FIELDS: &[&str] = &[
     "lpcache-backend",
     "lpcache-slot",
     "lpcache-restored",
+    "lpcache-restore-call",
+    "lpcache-restore-candidate",
+    "lpcache-lcp-ratio",
     "lpcache-cache-hit",
     "lpcache-coalesced",
     "lpcache-reason",
@@ -178,6 +182,9 @@ fn field_value(record: &RequestLogRecord, field: &str) -> Option<String> {
         "lpcache-backend" => record.backend.map(|v| v.to_string()),
         "lpcache-slot" => record.slot.map(|v| v.to_string()),
         "lpcache-restored" => record.restored.map(|v| v.to_string()),
+        "lpcache-restore-call" => record.restore_call.map(|v| v.to_string()),
+        "lpcache-restore-candidate" => record.restore_candidate.clone(),
+        "lpcache-lcp-ratio" => record.lcp_ratio.map(|v| format!("{v:.3}")),
         "lpcache-cache-hit" => record.cache_hit.map(|v| v.to_string()),
         "lpcache-coalesced" => record.coalesced.map(|v| v.to_string()),
         "lpcache-reason" => record.reason.clone(),
@@ -529,6 +536,9 @@ mod tests {
             backend: Some(0),
             slot: Some(3),
             restored: Some(true),
+            restore_call: Some("ok"),
+            restore_candidate: Some("abcdef0123456789".to_string()),
+            lcp_ratio: Some(1.0),
             cache_hit: Some(false),
             coalesced: Some("leader"),
             reason: None,
@@ -598,6 +608,9 @@ mod tests {
         assert_eq!(get("sc-bytes"), "17");
         assert_eq!(get("lpcache-model"), "llama.cpp");
         assert_eq!(get("lpcache-restored"), "true");
+        assert_eq!(get("lpcache-restore-call"), "ok");
+        assert_eq!(get("lpcache-restore-candidate"), "abcdef0123456789");
+        assert_eq!(get("lpcache-lcp-ratio"), "1.000");
         assert_eq!(get("lpcache-coalesced"), "leader");
         assert_eq!(get("lpcache-reason"), "-"); // None -> not available
         // performance fields (deterministic mock values).

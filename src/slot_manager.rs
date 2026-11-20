@@ -66,6 +66,11 @@ pub struct SlotGuard {
     /// the slot effectively holds the cache, so the meta LRU touch and the
     /// request log's restored flag still apply).
     pub restored: Option<RestoreOutcome>,
+    /// `true` only when the restore decision made an actual backend
+    /// `action=restore` API call. `false` covers both "no restore
+    /// attempted" (`restored == None`) and "skipped because the slot was
+    /// already running the requested KV" (`restored == Some(Restored)`).
+    pub restore_call: bool,
     /// Holds the slot lock until the guard is dropped / released.
     #[allow(dead_code)]
     permit: OwnedSemaphorePermit,
@@ -559,6 +564,7 @@ impl SlotManager {
         let mut guard = SlotGuard {
             slot: g,
             restored: None,
+            restore_call: false,
             permit,
         };
         if let Some(key) = restore_key {
@@ -573,6 +579,7 @@ impl SlotManager {
                 );
                 guard.restored = Some(RestoreOutcome::Restored);
             } else {
+                guard.restore_call = true;
                 let outcome = self.clients[g.be].restore_slot(g.slot, key).await;
                 tracing::info!(
                     "restore_before_chat g={g} key={} ok={}",
@@ -932,9 +939,11 @@ mod tests {
         let (sm, raw) = make(1, 2);
         let g = sm.acquire(Some("key-abcdef0123456789")).await.unwrap();
         assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        assert!(g.restore_call, "the restore API call was made");
         sm.release(g);
         let g = sm.acquire(None).await.unwrap();
         assert_eq!(g.restored, None);
+        assert!(!g.restore_call, "no restore attempted, no call");
         sm.release(g);
 
         let c = &raw[0];
@@ -949,6 +958,7 @@ mod tests {
         sm.set_last_used_for_test(GSlot { be: 0, slot: 1 }, 2);
         let g = sm.acquire(Some("k2")).await.unwrap();
         assert_eq!(g.restored, Some(RestoreOutcome::Failed));
+        assert!(g.restore_call, "the failing call was made");
         sm.release(g);
     }
 
@@ -959,6 +969,7 @@ mod tests {
         let g = sm.acquire(Some("k1")).await.unwrap();
         assert_eq!(g.slot, GSlot { be: 0, slot: 0 });
         assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        assert!(g.restore_call, "first time: the API call was made");
         sm.release(g);
         // second acquire, same key: the slot is already running k1 (the
         // successful restore recorded it) -> no second backend call, but the
@@ -966,6 +977,7 @@ mod tests {
         let g = sm.acquire(Some("k1")).await.unwrap();
         assert_eq!(g.slot, GSlot { be: 0, slot: 0 });
         assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        assert!(!g.restore_call, "already running: no second API call");
         sm.release(g);
         assert_eq!(
             *raw[0].restores.lock().await,
@@ -974,6 +986,7 @@ mod tests {
         // a different key is never skipped
         let g = sm.acquire(Some("k2")).await.unwrap();
         assert_eq!(g.restored, Some(RestoreOutcome::Restored));
+        assert!(g.restore_call, "a different key still calls the backend");
         sm.release(g);
         assert_eq!(
             *raw[0].restores.lock().await,

@@ -42,7 +42,7 @@ precedence over the built-in defaults. `-h` / `--help` prints the built-in help.
 | `REQUEST_LOG_PATH` | `--request-log-path <PATH>` | `lpcache-request.log` | Request-log file location; relative paths resolve against the **current working directory**; the parent dir is created at startup |
 | `REQUEST_LOG_MAX_BYTES` | `--request-log-max-bytes <N>` | `10485760` (10 MiB) | Rotation threshold in bytes: the current file is renamed to `<path>.1` and older generations shift upward (`<path>.2`, …); the fresh current file starts with a new XLF header. `0` = no rotation |
 | `REQUEST_LOG_KEEP` | `--request-log-keep <N>` | `5` | Rotated generations retained (the oldest is dropped); `0` = keep them all |
-| `REQUEST_LOG_FIELDS` | `--request-log-fields <LIST>` | all 33 fields | Comma-separated **ordered** subset of the known XLF field names — W3C fields `datetime`, `cs-method`, `cs-uri`, `c-ip`, `cs(User-Agent)`, `cs-bytes`, `cs-time`, `sc-status`, `sc-bytes` plus the lpcache pipeline fields `lpcache-model`, `lpcache-stream`, `lpcache-key`, `lpcache-n-words`, `lpcache-is-big`, `lpcache-backend`, `lpcache-slot`, `lpcache-restored`, `lpcache-cache-hit`, `lpcache-coalesced`, `lpcache-reason` and the lpcache performance fields `lpcache-prompt-tokens`, `lpcache-completion-tokens`, `lpcache-cached-tokens` (backend `usage` — the last one is the prompt tokens served from the backend's KV cache), `lpcache-prefill-ms`, `lpcache-gen-ms`, `lpcache-prefill-tps`, `lpcache-gen-tps` (backend `timings`) and `lpcache-ttft-ms` (proxy-side time to first token, streaming only), and the lpcache resource fields `lpcache-cpu-ms`, `lpcache-disk-read-bytes`, `lpcache-disk-write-bytes`, `lpcache-ram-bytes`, `lpcache-peak-ram-bytes` (the proxy process's own CPU time and disk I/O during the request, plus its resident memory — `VmRSS`/working set — and peak resident memory — `VmHWM`/peak working set, high-water mark since process start — when the request completed; the CPU/disk values are process-wide counter deltas, so approximate under concurrency, while the memory values are point-in-time gauges; `-` where the platform cannot sample them). Missing values render as `-`; values containing whitespace/quotes are quoted+escaped per XLF. `lpcache-reason` is `-` on success, otherwise the pipeline outcome (`prefilter_reject`, `slot_timeout`, `backend_unreachable`, `backend_error`, `provider_http_<status>`, `provider_non_object`, `coalesce_leader_failed`, `save_failed`). Log I/O failures are swallowed — logging never breaks serving. Caveats: `c-ip` needs a real socket connection (Axum `ConnectInfo`); `cs-bytes` is taken from `Content-Length` (chunked requests without one log `-`) |
+| `REQUEST_LOG_FIELDS` | `--request-log-fields <LIST>` | all 36 fields | Comma-separated **ordered** subset of the known XLF field names — W3C fields `datetime`, `cs-method`, `cs-uri`, `c-ip`, `cs(User-Agent)`, `cs-bytes`, `cs-time`, `sc-status`, `sc-bytes` plus the lpcache pipeline fields `lpcache-model`, `lpcache-stream`, `lpcache-key`, `lpcache-n-words`, `lpcache-is-big`, `lpcache-backend`, `lpcache-slot`, `lpcache-restored`, `lpcache-restore-call`, `lpcache-restore-candidate` (the key the LCP scan picked as the best restore candidate — equals `lpcache-key` on an exact-key repeat, differs on a closest-prefix match), `lpcache-lcp-ratio` (that candidate's LCP ratio, 0..=1, 3 decimals), `lpcache-cache-hit`, `lpcache-coalesced`, `lpcache-reason` and the lpcache performance fields `lpcache-prompt-tokens`, `lpcache-completion-tokens`, `lpcache-cached-tokens` (backend `usage` — the last one is the prompt tokens served from the backend's KV cache), `lpcache-prefill-ms`, `lpcache-gen-ms`, `lpcache-prefill-tps`, `lpcache-gen-tps` (backend `timings`) and `lpcache-ttft-ms` (proxy-side time to first token, streaming only), and the lpcache resource fields `lpcache-cpu-ms`, `lpcache-disk-read-bytes`, `lpcache-disk-write-bytes`, `lpcache-ram-bytes`, `lpcache-peak-ram-bytes` (the proxy process's own CPU time and disk I/O during the request, plus its resident memory — `VmRSS`/working set — and peak resident memory — `VmHWM`/peak working set, high-water mark since process start — when the request completed; the CPU/disk values are process-wide counter deltas, so approximate under concurrency, while the memory values are point-in-time gauges; `-` where the platform cannot sample them). Missing values render as `-`; values containing whitespace/quotes are quoted+escaped per XLF. `lpcache-reason` is `-` on success, otherwise the pipeline outcome (`prefilter_reject`, `slot_timeout`, `backend_unreachable`, `backend_error`, `provider_http_<status>`, `provider_non_object`, `coalesce_leader_failed`, `save_failed`). Log I/O failures are swallowed — logging never breaks serving. Caveats: `c-ip` needs a real socket connection (Axum `ConnectInfo`); `cs-bytes` is taken from `Content-Length` (chunked requests without one log `-`) |
 | `PREFILTER_BLOCKLIST` | `--prefilter-blocklist <LIST>` | — | **Legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset). Comma-separated keywords (surrounding whitespace ignored, empty entries dropped). When set, requests whose message contents (string content or text content parts) contain any keyword are **rejected with `400` before any slot/backend work** — no slot is acquired, no KV cache is restored/saved, no meta file is written, and the request never joins a coalescing group. Unset/blank = no prefilter |
 | `PREFILTER_CASE_INSENSITIVE` | `--prefilter-case-insensitive <BOOL>` | `true` | **Legacy**: prefilter keyword matching is case-insensitive |
 | `PREFILTER_RESULT_CACHE_DIR` | `--prefilter-result-cache-dir <PATH>` | — | **Legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset). The **cache-result path** (dir holding one `{key}.json` per request KV cache key). When set, the result-cache prefilter answers fresh (non-expired) same-key requests with a previously cached backend result **before any slot/backend work** — no slot, no restore/save, no meta file, no coalescing group; fresh non-streaming 200 JSON results are stored under the key after the backend call; streaming requests are never served from the cache. Unset/blank = disabled |
@@ -211,13 +211,38 @@ ignored. See the `REQUEST_LOG*` rows above for the full field list.
 | `path` | `lpcache-request.log` | Log file location; relative paths resolve against the **current working directory**; the parent dir is created |
 | `max_bytes` | `10485760` (10 MiB) | Rotation threshold in bytes; `0` = no rotation |
 | `keep` | `5` | Rotated generations retained (the oldest is dropped); `0` = keep them all |
-| `fields` | all 33 fields | Ordered list of field names to emit — any subset of the known XLF fields (see `REQUEST_LOG_FIELDS`); omitted = all 33. An empty list, an unknown name, or a duplicate is a startup error |
+| `fields` | all 36 fields | Ordered list of field names to emit — any subset of the known XLF fields (see `REQUEST_LOG_FIELDS`); omitted = all 36. An empty list, an unknown name, or a duplicate is a startup error |
 
 #### `dashboard` — real-time statistics web dashboard
 
 Serves a self-contained HTML page (inline CSS + JS, no external assets) plus a
 JSON stats endpoint, fed by one record per finished request (the same records
-the request logger receives). The dashboard's own routes are excluded from the
+the request logger receives). The resource charts (CPU ms, disk read/write,
+RAM) and the token charts (completion tokens, cached prompt tokens) overlay a
+solid p50 and dashed p95 tick per bar — the per-request
+percentiles of each metric, tracked per bucket per scope (all backends, each
+backend index, cached, coalesced, coalesced groups — so the ticks and lines
+stay correct for every `backend` filter; the series points carry
+`cpu_ms_p50`/`cpu_ms_p95`, `disk_read_p50`/`disk_read_p95`,
+`disk_write_p50`/`disk_write_p95`, `ram_p50`/`ram_p95`,
+`completion_tokens_p50`/`completion_tokens_p95`,
+`cached_tokens_p50`/`cached_tokens_p95`, null per metric
+without data — a request that restored nothing counts as 0 cached tokens, so
+a p50 of 0 means at least half the requests had no cache) — plus two
+full-width line pairs per chart for the whole
+window/range of the selected scope: the per-request p50/p95
+(`series.pct_overall`, the merge of the
+scope's buckets' histograms; absent for a backend index with no traffic in
+the window) and the p50/p95 of the drawn per-bucket aggregate
+values — the bars themselves, so that pair reads against the bar heights
+(`series.pct_overall_agg`, always present; a zero-valued bar still counts
+as a sample) — presented as a two-row legend (the per-request p50/p95 pair on row 1, the drawn-bars p50/p95 pair on row 2), each legend item clickable to toggle its lines (hidden items are faded and dropped from the scale). The request-count chart has no per-request scalar, so it carries
+no percentiles. The additive resource charts (CPU ms, disk read, disk
+write) draw the window total — the sum of the drawn per-bucket values —
+next to the max in each chart's top-left corner (the peak-RAM gauge is
+not additive and keeps the max alone). The page's own URL takes a `?backend=` param with the same
+values to deep-link the backend filter (e.g. `/dashboard?backend=0`).
+The dashboard's own routes are excluded from the
 aggregates and the request log. At most one `dashboard` plugin. Unlike the
 other plugins it **rejects unknown params** — a typo'd param name is a startup
 error.

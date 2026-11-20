@@ -3005,6 +3005,15 @@ async fn request_log_writes_xlf_record() {
         rec["lpcache-restored"], "-",
         "no restore attempt on small requests"
     );
+    assert_eq!(
+        rec["lpcache-restore-call"], "-",
+        "no restore attempt on small requests"
+    );
+    assert_eq!(
+        rec["lpcache-restore-candidate"], "-",
+        "no restore attempt on small requests"
+    );
+    assert_eq!(rec["lpcache-lcp-ratio"], "-", "no restore attempt on small requests");
     assert_eq!(rec["lpcache-cache-hit"], "-", "no prefilter enabled");
     assert_eq!(rec["lpcache-coalesced"], "-");
     assert_eq!(rec["lpcache-reason"], "-", "the request completed normally");
@@ -3035,6 +3044,67 @@ async fn request_log_writes_xlf_record() {
             rec[f]
         );
     }
+}
+
+#[tokio::test]
+async fn request_log_records_restore_candidate_and_lcp_ratio() {
+    // The XLF record carries the restore decision the LCP scan made: the
+    // best candidate key it picked (which differs from the request's own
+    // key for a closest-prefix match) and the LCP ratio.
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await;
+    let app = router(state);
+    let a = words(600);
+    let body1 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": a.clone() }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(post_json_ua(&body1, "lpcache-test/1.0"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await;
+
+    // 2nd request: same prefix + a tail shorter than one block -> the LCP
+    // scan finds the first request's key as the best candidate (all 6
+    // blocks match, ratio 1.0).
+    let b = format!("{a} tail x y z");
+    let body2 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": b.clone() }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(post_json_ua(&body2, "lpcache-test/1.0"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await;
+
+    let content = std::fs::read_to_string(&log_path).expect("log file");
+    let (_fields, records) = parse_xlf(&content);
+    assert_eq!(records.len(), 2, "one record per request: {content}");
+    // 1st request: no meta existed yet -> no candidate.
+    let rec1 = &records[0];
+    assert_eq!(rec1["lpcache-key"], &expected_key(&a)[..16]);
+    assert_eq!(rec1["lpcache-restored"], "-", "no restore attempt");
+    assert_eq!(rec1["lpcache-restore-candidate"], "-", "no candidate yet");
+    assert_eq!(rec1["lpcache-lcp-ratio"], "-", "no candidate yet");
+    // 2nd request: the candidate is the first request's key (differs from
+    // the request's own key — a closest-prefix match), ratio 1.000.
+    let rec2 = &records[1];
+    assert_eq!(rec2["lpcache-key"], &expected_key(&b)[..16]);
+    assert_ne!(
+        rec2["lpcache-key"], rec2["lpcache-restore-candidate"],
+        "closest-prefix match: candidate differs from the request key"
+    );
+    assert_eq!(rec2["lpcache-restore-candidate"], &expected_key(&a)[..16]);
+    assert_eq!(rec2["lpcache-lcp-ratio"], "1.000");
+    assert_eq!(rec2["lpcache-restored"], "true");
+    assert_eq!(rec2["lpcache-restore-call"], "ok");
 }
 
 #[tokio::test]
@@ -3367,7 +3437,9 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
         "figure drawn for each (stride-selected, non-zero) bar or the hovered bar"
     );
     assert!(
-        html.contains("ctx.fillText(txt, lx, baseY-bh-4)"),
+        html.contains(
+            "ctx.fillText(txt, lx, lineMode ? baseY-(v>0?(v/max)*maxH:0)-4 : baseY-bh-4)"
+        ),
         "figure above the bar"
     );
     // the axis line under the throughput charts
@@ -3381,6 +3453,100 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
             "[\"chart-req\",\"chart-tok\",\"chart-cached\",\"chart-cpu\",\"chart-dr\",\"chart-dw\",\"chart-ram\"].forEach(id=>attachChart($(id)));"
         ),
         "hover handlers attached to all seven charts"
+    );
+    // the token charts overlay the per-request p50/p95 of each metric
+    // (completion tokens; cached prompt tokens) and the resource charts
+    // the per-request p50/p95 of each resource metric (a solid p50 /
+    // dashed p95 tick per bar plus a legend; the percentile fields are
+    // tracked per scope, so the filtered views' points carry their
+    // scope's own fields) and the window-wide p50/p95 as full-width
+    // lines — plus the p50/p95 of the drawn per-bucket aggregate
+    // values (the bars themselves) as a second full-width line pair.
+    // The additive resource charts (cpu ms, disk read, disk write)
+    // additionally draw the window total next to the max.
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-tok\"), series, \"completions\", \"completion tokens\", \"#3fb950\", -1, fmtVal, \"completion_tokens_p50\", \"completion_tokens_p95\", ov ? ov.completion_tokens_p50 : null, ov ? ov.completion_tokens_p95 : null, ag ? ag.completion_tokens_p50 : null, ag ? ag.completion_tokens_p95 : null);"
+        ),
+        "completion-tokens chart overlays the per-request percentiles"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-cached\"), series, \"cached_tokens\", \"cached tokens\", \"#d29922\", -1, fmtVal, \"cached_tokens_p50\", \"cached_tokens_p95\", ov ? ov.cached_tokens_p50 : null, ov ? ov.cached_tokens_p95 : null, ag ? ag.cached_tokens_p50 : null, ag ? ag.cached_tokens_p95 : null);"
+        ),
+        "cached-tokens chart overlays the per-request percentiles"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-cpu\"), series, \"cpu_ms\", \"cpu ms\", \"#bc8cff\", -1, fmtVal, \"cpu_ms_p50\", \"cpu_ms_p95\", ov ? ov.cpu_ms_p50 : null, ov ? ov.cpu_ms_p95 : null, ag ? ag.cpu_ms_p50 : null, ag ? ag.cpu_ms_p95 : null, true);"
+        ),
+        "cpu chart overlays the per-request percentiles and shows the window total"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-dr\"), series, \"disk_read_bytes\", \"disk read (MB)\", \"#39c5cf\", -1, fmtMBn, \"disk_read_p50\", \"disk_read_p95\", ov ? ov.disk_read_p50 : null, ov ? ov.disk_read_p95 : null, ag ? ag.disk_read_p50 : null, ag ? ag.disk_read_p95 : null, true);"
+        ),
+        "disk-read chart overlays the per-request percentiles and shows the window total"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-dw\"), series, \"disk_write_bytes\", \"disk write (MB)\", \"#db61a2\", -1, fmtMBn, \"disk_write_p50\", \"disk_write_p95\", ov ? ov.disk_write_p50 : null, ov ? ov.disk_write_p95 : null, ag ? ag.disk_write_p50 : null, ag ? ag.disk_write_p95 : null, true);"
+        ),
+        "disk-write chart overlays the per-request percentiles and shows the window total"
+    );
+    assert!(
+        html.contains(
+            "drawBars($(\"chart-ram\"), series, \"ram_bytes\", \"peak ram (MB)\", \"#f85149\", -1, fmtMBn, \"ram_p50\", \"ram_p95\", ov ? ov.ram_p50 : null, ov ? ov.ram_p95 : null, ag ? ag.ram_p50 : null, ag ? ag.ram_p95 : null);"
+        ),
+        "ram chart overlays the per-request percentiles (no total — the peak gauge is not additive)"
+    );
+    assert!(
+        html.contains("ctx.fillText(showTotal ? \"max \"+fmt(max)+\" \\u00b7 total \"+fmt(tot) : \"max \"+fmt(max), 2, 12);"),
+        "the additive charts draw the window total next to the max"
+    );
+    assert!(
+        html.contains("drawBars(cv, c.series, c.key, c.label, c.color, c.hl, c.fmt, c.p50Key, c.p95Key, c.ovP50, c.ovP95, c.agP50, c.agP95, c.showTotal);"),
+        "the hover redraw keeps the window-total flag (cached on cv._chart)"
+    );
+    assert!(
+        html.contains("const ov = s.pct_overall || null;"),
+        "the window-wide percentile object feeds the resource charts"
+    );
+    assert!(
+        html.contains("const ag = s.pct_overall_agg || null;"),
+        "the window-wide aggregate-percentile object feeds the charts"
+    );
+    assert!(
+        html.contains("line(ovP50, P50C, []);"),
+        "the window-wide p50 line is drawn across the plot"
+    );
+    assert!(
+        html.contains("agline(agP50, []);") && html.contains("agline(agP95, [6,3]);"),
+        "the drawn-bars p50/p95 lines are drawn across the plot"
+    );
+    assert!(
+        html.contains("const P50C = \"#e6edf3\", P95C = \"#d29922\", AGGC = \"#a5d6ff\";"),
+        "percentile tick colors (solid p50, dashed p95, bars pair)"
+    );
+    assert!(
+        html.contains("items.push([\"barsP95\", AGGC, [6,3], \"bars p95\", barsTxt]);"),
+        "the drawn-bars pair joins the legend (its second row)"
+    );
+    assert!(
+        html.contains("c.hide[li.k] = !c.hide[li.k];"),
+        "clicking a legend item toggles the related lines"
+    );
+    assert!(
+        html.contains("const legendRows = (hasPct?1:0) + (hasAgg?1:0),"),
+        "the two-row legend counts its rows (per-request pair + bars pair)"
+    );
+    assert!(
+        html.contains("padTop = 24 + legendRows*16, maxH = Math.max(10, baseY-padTop);"),
+        "each legend row reserves 16px of headroom below the plot"
+    );
+    assert!(
+        html.contains("new URLSearchParams(location.search).get(\"backend\")"),
+        "the page deep-links the backend filter from its own ?backend= param"
     );
     // the resource charts live in their own panel: the throughput panel
     // holds only the request/token charts, the resources panel holds the
@@ -3462,12 +3628,84 @@ async fn dashboard_counters_update_after_requests() {
     assert!(buckets[0]["disk_write_bytes"].is_u64());
     // the per-bucket peak RAM gauge (the proxy samples RSS on Linux)
     assert!(buckets[0]["ram_bytes"].is_u64());
+    // the all-backend series points carry the per-request p50/p95 of
+    // the resource and token values (a number when the proxy sampled
+    // the metric — always on Linux — null when the platform cannot
+    // sample it)
+    for f in [
+        "cpu_ms_p50",
+        "cpu_ms_p95",
+        "disk_read_p50",
+        "disk_read_p95",
+        "disk_write_p50",
+        "disk_write_p95",
+        "ram_p50",
+        "ram_p95",
+        "completion_tokens_p50",
+        "completion_tokens_p95",
+        "cached_tokens_p50",
+        "cached_tokens_p95",
+    ] {
+        assert!(
+            buckets[0][f].is_number() || buckets[0][f].is_null(),
+            "series bucket carries {f}"
+        );
+        // the all-backend series also carries the window-wide p50/p95
+        // of each metric (the merge of the buckets' histograms)
+        assert!(
+            v["series"]["pct_overall"][f].is_number() || v["series"]["pct_overall"][f].is_null(),
+            "series carries overall {f}"
+        );
+        // ... and the p50/p95 of the drawn per-bucket aggregate values
+        // (the bars themselves — always a number, zero counts)
+        assert!(
+            v["series"]["pct_overall_agg"][f].is_number(),
+            "series carries drawn-bars {f}"
+        );
+    }
+    // The backend-filtered view carries its own per-bucket p50/p95 and
+    // window-wide `pct_overall` (backend 0 served the chat request —
+    // the 404 never reached a backend).
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats?backend=0"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let vs = read_body(resp).await;
+    let sb = &vs["series"]["buckets"];
+    assert_eq!(sb.as_array().unwrap().len(), 1);
+    for f in [
+        "cpu_ms_p50",
+        "cpu_ms_p95",
+        "ram_p50",
+        "ram_p95",
+        "completion_tokens_p50",
+        "completion_tokens_p95",
+        "cached_tokens_p50",
+        "cached_tokens_p95",
+    ] {
+        assert!(
+            sb[0][f].is_number() || sb[0][f].is_null(),
+            "backend-filtered series bucket carries {f}"
+        );
+        assert!(
+            vs["series"]["pct_overall"][f].is_number() || vs["series"]["pct_overall"][f].is_null(),
+            "backend-filtered series carries overall {f}"
+        );
+        // the backend-filtered view carries its own drawn-bars p50/p95
+        // too (backend 0's bars — always a number, zero counts)
+        assert!(
+            vs["series"]["pct_overall_agg"][f].is_number(),
+            "backend-filtered series carries drawn-bars {f}"
+        );
+    }
     assert_eq!(v["series"]["window_reqs"], 2);
     assert!(v["series"]["req_per_sec"].as_f64().unwrap() > 0.0);
     // Recent requests, oldest first (the page reverses them for display);
     // no `path` column: the 404 has no model, the chat request does. The
-    // backend index is present when a slot was acquired (the 404 never
-    // reached a backend).
+    // backend index and slot are present when a slot was acquired (the
+    // 404 never reached a backend).
     let recent = v["recent"].as_array().unwrap();
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0]["status"], 200);
@@ -3475,9 +3713,11 @@ async fn dashboard_counters_update_after_requests() {
     assert_eq!(recent[0]["stream"], false);
     assert!(recent[0]["duration_secs"].as_f64().unwrap() >= 0.0);
     assert_eq!(recent[0]["backend"], 0);
+    assert_eq!(recent[0]["slot"], 0);
     assert_eq!(recent[1]["status"], 404);
     assert!(recent[1]["model"].is_null());
     assert!(recent[1]["backend"].is_null());
+    assert!(recent[1]["slot"].is_null());
 
     // The configured refresh interval reached the rendered page.
     let resp = app
@@ -3587,6 +3827,7 @@ async fn dashboard_stats_since_scopes_the_range() {
     let recent = v["recent"].as_array().unwrap();
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0]["backend"], 0);
+    assert_eq!(recent[0]["slot"], 0);
 
     // A backend that never got traffic yields zero statistics (the
     // series keeps the full timeline, all zero).
@@ -3640,7 +3881,9 @@ async fn dashboard_stats_since_scopes_the_range() {
     for scope in ["coalesced", "coalesced_groups"] {
         let resp = app
             .clone()
-            .oneshot(get_req(&format!("/dashboard/api/stats?since=0&backend={scope}")))
+            .oneshot(get_req(&format!(
+                "/dashboard/api/stats?since=0&backend={scope}"
+            )))
             .await
             .expect("resp");
         assert_eq!(resp.status(), 200, "backend={scope} accepted");
@@ -3684,8 +3927,7 @@ async fn dashboard_coalesced_scopes_track_group_records() {
     let client = Arc::new(
         LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
     );
-    let clients: Vec<Arc<dyn LlamaBackend>> =
-        vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
     let spec = lpcache::plugins::PluginSpec::new("dashboard", json!({}));
     let dashboard = lpcache::plugins::load_dashboard(
@@ -3726,7 +3968,8 @@ async fn dashboard_coalesced_scopes_track_group_records() {
     to_bytes(r2.into_body(), usize::MAX).await.expect("body");
     assert_eq!(mock.state.calls.lock().await.chat_bodies.len(), 1);
 
-    // `?backend=coalesced`: the single follower only (no backend index).
+    // `?backend=coalesced`: the single follower only (no backend index,
+    // no slot — the follower never acquires one).
     let resp = app
         .clone()
         .oneshot(get_req("/dashboard/api/stats?backend=coalesced"))
@@ -3740,6 +3983,7 @@ async fn dashboard_coalesced_scopes_track_group_records() {
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0]["coalesced"], true);
     assert!(recent[0]["backend"].is_null());
+    assert!(recent[0]["slot"].is_null());
 
     // `?backend=coalesced_groups`: the whole group — the leader (backend
     // 0, unflagged) plus the follower (no backend, flagged).
@@ -3761,8 +4005,10 @@ async fn dashboard_coalesced_scopes_track_group_records() {
     for r in recent {
         if r["coalesced"] == true {
             assert!(r["backend"].is_null());
+            assert!(r["slot"].is_null());
         } else {
             assert_eq!(r["backend"], 0);
+            assert_eq!(r["slot"], 0);
         }
     }
 
