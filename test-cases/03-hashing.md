@@ -3,7 +3,7 @@
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (244 tests) runs with
+1:1 to a test function; the full suite (302 tests) runs with
 `cargo test --workspace`.
 
 ## Module overview

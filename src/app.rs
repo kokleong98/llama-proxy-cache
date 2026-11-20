@@ -41,7 +41,7 @@
 //! request: the W3C fields (method, URI, client IP, user agent, request
 //! bytes, duration, status) are captured by the middleware, and the
 //! lpcache pipeline fields (model, stream, key, n_words, is_big, backend,
-//! slot, restored, cache_hit, coalesced, reason) are attached by the
+//! slot, restored, restore_call, cache_hit, coalesced, reason) are attached by the
 //! handlers through the response's extensions (`PipelineLog`). One W3C-XLF
 //! record is written through the `RequestLogger` plugin when the response
 //! body is done — completed, errored, or the client went away — and
@@ -298,6 +298,23 @@ pub(crate) struct PipelineLog {
     /// `lpcache-restored`: present when a KV cache restore was attempted
     /// (missing = not attempted, e.g. small requests).
     pub restored: Option<bool>,
+    /// `lpcache-restore-call`: how the restore decision turned out —
+    /// `ok` (the backend's `action=restore` call loaded the KV),
+    /// `skipped` (no backend call: the slot was already running the
+    /// requested KV), `rejected` (the backend refused the call), `failed`
+    /// (transient backend error). Missing = not attempted.
+    pub restore_call: Option<&'static str>,
+    /// `lpcache-restore-candidate`: the first 16 hex chars of the key the
+    /// LCP scan picked as the best restore candidate. Equals `key` when
+    /// the request repeats a previously cached prefix exactly; differs
+    /// when the closest cached prefix belongs to another key (a
+    /// closest-prefix match). Missing = no candidate cleared the LCP
+    /// threshold, a small request, or no KV-enabled backend.
+    pub restore_candidate: Option<String>,
+    /// `lpcache-lcp-ratio`: the longest-common-prefix ratio (0..=1) of that
+    /// candidate against the request's block hashes (present exactly when
+    /// `restore_candidate` is).
+    pub lcp_ratio: Option<f64>,
     /// `lpcache-cache-hit`: present when a prefilter ran (`true` = served
     /// from the prefilter, `false` = let through).
     pub cache_hit: Option<bool>,
@@ -322,12 +339,33 @@ fn with_pipeline_log(mut resp: Response, pl: PipelineLog) -> Response {
 }
 
 /// Fill in the slot-related fields for a request that ran on slot `g`
-/// (`restored` is present when a KV cache restore was attempted).
-fn with_slot(mut pl: PipelineLog, g: GSlot, restored: Option<bool>) -> PipelineLog {
+/// (`restored`/`restore_call` are present when a KV cache restore was
+/// attempted).
+fn with_slot(
+    mut pl: PipelineLog,
+    g: GSlot,
+    restored: Option<bool>,
+    restore_call: Option<&'static str>,
+) -> PipelineLog {
     pl.backend = Some(g.be);
     pl.slot = Some(g.slot);
     pl.restored = restored;
+    pl.restore_call = restore_call;
     pl
+}
+
+/// The `lpcache-restore-call` value for a guard's restore decision:
+/// `None` when no restore was attempted, `skipped` when the slot was
+/// already running the requested KV (no backend call), otherwise the
+/// outcome of the API call.
+fn restore_call_label(restored: Option<RestoreOutcome>, api_called: bool) -> Option<&'static str> {
+    match restored {
+        None => None,
+        Some(RestoreOutcome::Restored) if !api_called => Some("skipped"),
+        Some(RestoreOutcome::Restored) => Some("ok"),
+        Some(RestoreOutcome::Rejected) => Some("rejected"),
+        Some(RestoreOutcome::Failed) => Some("failed"),
+    }
 }
 
 /// Backend-reported performance data for one request, shared between the
@@ -496,6 +534,9 @@ impl Drop for PendingRequestLog {
             backend: self.pl.backend,
             slot: self.pl.slot,
             restored: self.pl.restored,
+            restore_call: self.pl.restore_call,
+            restore_candidate: self.pl.restore_candidate.clone(),
+            lcp_ratio: self.pl.lcp_ratio,
             cache_hit: self.pl.cache_hit,
             coalesced: self.pl.coalesced,
             reason: self.pl.reason.clone(),
@@ -914,7 +955,12 @@ async fn run_pipeline(
                         "restore_candidate basename={} ratio={ratio:.3}",
                         short16(&k)
                     );
-                    restore_key = Some(k);
+                    restore_key = Some(k.clone());
+                    // Request log: the candidate the LCP scan picked (may
+                    // differ from the request's own key — a closest-prefix
+                    // match) and how much of the prompt it covers.
+                    pl.restore_candidate = Some(short16(&k));
+                    pl.lcp_ratio = Some(ratio);
                 }
                 None => tracing::info!("restore_candidate none"),
             }
@@ -955,6 +1001,7 @@ async fn run_pipeline(
         .restored
         .as_ref()
         .map(|o| matches!(o, RestoreOutcome::Restored));
+    let mut restore_call = restore_call_label(guard.restored, guard.restore_call);
     // LRU bookkeeping: a successful restore counts as a "use" of the
     // cached entry — bump its meta timestamp so the post-save prune of
     // this very request cannot evict a cache that was just used
@@ -999,13 +1046,14 @@ async fn run_pipeline(
                                 .restored
                                 .as_ref()
                                 .map(|o| matches!(o, RestoreOutcome::Restored));
+                            restore_call = restore_call_label(g2.restored, g2.restore_call);
                             touch_restored_meta(state, &g2, &restore_key);
                             remove_stale_meta(state, &g2, &restore_key);
                             guard = g2;
                             continue;
                         }
                         None => {
-                            pl = with_slot(pl, g, restored);
+                            pl = with_slot(pl, g, restored, restore_call);
                             pl.reason = Some("backend_unreachable".into());
                             let (resp, o) = err_outcome(500, format!("backend unreachable: {e}"));
                             return (with_pipeline_log(resp, pl), Some(o));
@@ -1015,7 +1063,7 @@ async fn run_pipeline(
                 Err(e) => {
                     state.sm.mark_used(g);
                     state.sm.release(guard);
-                    pl = with_slot(pl, g, restored);
+                    pl = with_slot(pl, g, restored, restore_call);
                     pl.reason = Some("backend_error".into());
                     let (resp, o) = err_outcome(500, e.to_string());
                     return (with_pipeline_log(resp, pl), Some(o));
@@ -1041,7 +1089,7 @@ async fn run_pipeline(
                 let status =
                     StatusCode::from_u16(sc.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let val = json!({ "error": err_txt });
-                pl = with_slot(pl, g, restored);
+                pl = with_slot(pl, g, restored, restore_call);
                 pl.reason = Some(format!("provider_http_{}", sc.status));
                 return (
                     with_pipeline_log((status, axum::Json(val.clone())).into_response(), pl),
@@ -1247,7 +1295,7 @@ async fn run_pipeline(
                 futures::stream::unfold((rx, client_gone_tx), |(mut rx, gone_tx)| async move {
                     rx.recv().await.map(|item| (item, (rx, gone_tx)))
                 });
-            pl = with_slot(pl, g, restored);
+            pl = with_slot(pl, g, restored, restore_call);
             return (
                 with_pipeline_log((headers, Body::from_stream(stream)).into_response(), pl),
                 None,
@@ -1261,7 +1309,7 @@ async fn run_pipeline(
                     state.sm.mark_used(g);
                     state.sm.release(guard);
                     let body: String = body.chars().take(512).collect();
-                    pl = with_slot(pl, g, restored);
+                    pl = with_slot(pl, g, restored, restore_call);
                     pl.reason = Some(format!("provider_http_{status}"));
                     let (resp, o) =
                         err_outcome(500, format!("provider returned HTTP {status}: {body}"));
@@ -1285,13 +1333,14 @@ async fn run_pipeline(
                                 .restored
                                 .as_ref()
                                 .map(|o| matches!(o, RestoreOutcome::Restored));
+                            restore_call = restore_call_label(g2.restored, g2.restore_call);
                             touch_restored_meta(state, &g2, &restore_key);
                             remove_stale_meta(state, &g2, &restore_key);
                             guard = g2;
                             continue;
                         }
                         None => {
-                            pl = with_slot(pl, g, restored);
+                            pl = with_slot(pl, g, restored, restore_call);
                             pl.reason = Some("backend_unreachable".into());
                             let (resp, o) = err_outcome(500, format!("backend unreachable: {e}"));
                             return (with_pipeline_log(resp, pl), Some(o));
@@ -1301,7 +1350,7 @@ async fn run_pipeline(
                 Err(e) => {
                     state.sm.mark_used(g);
                     state.sm.release(guard);
-                    pl = with_slot(pl, g, restored);
+                    pl = with_slot(pl, g, restored, restore_call);
                     pl.reason = Some("backend_error".into());
                     let (resp, o) = err_outcome(500, e.to_string());
                     return (with_pipeline_log(resp, pl), Some(o));
@@ -1310,7 +1359,7 @@ async fn run_pipeline(
                     state.sm.report_success(g);
                     state.sm.mark_used(g);
                     state.sm.release(guard);
-                    pl = with_slot(pl, g, restored);
+                    pl = with_slot(pl, g, restored, restore_call);
                     pl.reason = Some("provider_non_object".into());
                     let (resp, o) = err_outcome(502, "provider non-JSON body");
                     return (with_pipeline_log(resp, pl), Some(o));
@@ -1332,7 +1381,7 @@ async fn run_pipeline(
                                 Err(b) => {
                                     let (resp, o) = *b;
                                     state.sm.release(guard);
-                                    pl = with_slot(pl, g, restored);
+                                    pl = with_slot(pl, g, restored, restore_call);
                                     pl.reason = Some("save_failed".into());
                                     return (with_pipeline_log(resp, pl), Some(o));
                                 }
@@ -1357,7 +1406,7 @@ async fn run_pipeline(
                         t0.elapsed().as_millis()
                     );
                     let val = json!({ "object": "error", "message": message, "raw": raw });
-                    pl = with_slot(pl, g, restored);
+                    pl = with_slot(pl, g, restored, restore_call);
                     return (
                         with_pipeline_log(
                             (StatusCode::OK, axum::Json(val.clone())).into_response(),
@@ -1381,7 +1430,7 @@ async fn run_pipeline(
                                 Err(b) => {
                                     let (resp, o) = *b;
                                     state.sm.release(guard);
-                                    pl = with_slot(pl, g, restored);
+                                    pl = with_slot(pl, g, restored, restore_call);
                                     pl.reason = Some("save_failed".into());
                                     return (with_pipeline_log(resp, pl), Some(o));
                                 }
@@ -1415,7 +1464,7 @@ async fn run_pipeline(
                     {
                         tracing::warn!("result_cache_store_fail key={}: {e}", short16(key));
                     }
-                    pl = with_slot(pl, g, restored);
+                    pl = with_slot(pl, g, restored, restore_call);
                     // Request log: the backend's `usage`/`timings` from the
                     // completion (llama.cpp includes them in the response).
                     if let Some(perf) = &pl.perf {

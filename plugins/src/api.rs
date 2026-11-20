@@ -348,6 +348,23 @@ pub struct RequestLogRecord {
     /// `lpcache-restored`: `true`/`false` when a KV cache restore was
     /// attempted (missing = no restore attempted, e.g. small requests).
     pub restored: Option<bool>,
+    /// `lpcache-restore-call`: how the restore decision turned out —
+    /// `ok` (the backend's `action=restore` call loaded the KV),
+    /// `skipped` (no backend call: the slot was already running the
+    /// requested KV), `rejected` (the backend refused the call),
+    /// `failed` (transient backend error). Missing = not attempted.
+    pub restore_call: Option<&'static str>,
+    /// `lpcache-restore-candidate`: the first 16 hex chars of the key the
+    /// LCP scan picked as the best restore candidate. Equals `lpcache-key`
+    /// when the request repeats a previously cached prefix exactly;
+    /// differs when the closest cached prefix belongs to another key (a
+    /// closest-prefix match). Missing = no candidate cleared the LCP
+    /// threshold, a small request, or no KV-enabled backend.
+    pub restore_candidate: Option<String>,
+    /// `lpcache-lcp-ratio`: the longest-common-prefix ratio (0..=1) of that
+    /// candidate against the request's block hashes (present exactly when
+    /// `restore_candidate` is).
+    pub lcp_ratio: Option<f64>,
     /// `lpcache-cache-hit`: `true` when a prefilter served the request
     /// (e.g. the result cache) without a backend call; `false` when a
     /// prefilter ran and let the request through (missing = no prefilter).

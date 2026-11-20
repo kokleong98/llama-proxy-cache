@@ -129,7 +129,7 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `REQUEST_LOG_PATH` | `lpcache-request.log` | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
 | `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB) | rotation threshold in bytes; the file is rotated when exceeded (`<path>.1`, `<path>.2`, …); `0` = no rotation |
 | `REQUEST_LOG_KEEP` | `5` | rotated generations retained (the oldest is dropped); `0` = keep them all |
-| `REQUEST_LOG_FIELDS` | all 33 fields | comma-separated ordered subset of the known XLF field names (W3C fields + `lpcache-*` pipeline/performance/resource fields — see [Request log](#request-log)) |
+| `REQUEST_LOG_FIELDS` | all 36 fields | comma-separated ordered subset of the known XLF field names (W3C fields + `lpcache-*` pipeline/performance/resource fields — see [Request log](#request-log)) |
 | `PREFILTER_BLOCKLIST` | —                 | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; requests whose message contents contain any are rejected with `400` before the backend (default: no prefilter) |
 | `PREFILTER_CASE_INSENSITIVE` | `true`     | **legacy**: keyword matching is case-insensitive           |
 | `PREFILTER_RESULT_CACHE_DIR` | —          | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): cache-result path (`{key}.json` per cache key); fresh same-key requests are answered from the cached backend result before the backend (default: disabled) |
@@ -192,11 +192,13 @@ lpcache performance fields, then lpcache resource fields —
 `cs-uri`, `c-ip`, `cs(User-Agent)`, `cs-bytes`, `cs-time`, `sc-status`,
 `sc-bytes`, `lpcache-model`, `lpcache-stream`, `lpcache-key`,
 `lpcache-n-words`, `lpcache-is-big`, `lpcache-backend`, `lpcache-slot`,
-`lpcache-restored`, `lpcache-cache-hit`, `lpcache-coalesced`,
-`lpcache-reason`, `lpcache-prompt-tokens`, `lpcache-completion-tokens`,
-`lpcache-cached-tokens`, `lpcache-prefill-ms`, `lpcache-gen-ms`,
-`lpcache-prefill-tps`, `lpcache-gen-tps`, `lpcache-ttft-ms`,
-`lpcache-cpu-ms`, `lpcache-disk-read-bytes`, `lpcache-disk-write-bytes`,
+`lpcache-restored`, `lpcache-restore-call`, `lpcache-restore-candidate`,
+`lpcache-lcp-ratio`, `lpcache-cache-hit`,
+`lpcache-coalesced`, `lpcache-reason`, `lpcache-prompt-tokens`,
+`lpcache-completion-tokens`, `lpcache-cached-tokens`,
+`lpcache-prefill-ms`, `lpcache-gen-ms`, `lpcache-prefill-tps`,
+`lpcache-gen-tps`, `lpcache-ttft-ms`, `lpcache-cpu-ms`,
+`lpcache-disk-read-bytes`, `lpcache-disk-write-bytes`,
 `lpcache-ram-bytes`, `lpcache-peak-ram-bytes`.
 
 - Missing values render as `-` (XLF "not available"); values containing
@@ -260,25 +262,51 @@ usually runs on). The proxy mounts two routes from the plugin:
   parameter that scopes the aggregates to `[since, now]` (served as
   `range.counters` plus the range's time series, coarsened to at most
   360 points so long ranges stay cheap) and an optional
-  `?backend=<index|cached>` query parameter that restricts them to the
-  records that ran on one backend, or (with `cached`) to the records
-  served from the result cache — they never touch a backend (absent = all
-  backends — no filtering, every statistic includes all of them); without
-  `?since` the payload is the lifetime counters plus the trailing
-  `window_secs` series
+  `?backend=<index|cached|coalesced|coalesced_groups>` query parameter
+  that restricts them to the records that ran on one backend, or (with
+  `cached`) to the records served from the result cache, (with
+  `coalesced`) to the coalesced followers, or (with
+  `coalesced_groups`) to every request of the coalesced groups — the
+  cache-served, coalesced records never touch a backend, and the
+  leaders count in both their group's and their backend's scope, so the
+  scopes are views, not a partition (absent = all backends — no
+  filtering, every statistic includes all of them); without `?since`
+  the payload is the lifetime counters plus the trailing `window_secs`
+  series
 
 The page polls the stats endpoint and renders KPI cards (incl. the
-proxy's CPU / disk / RAM metrics), a throughput panel (requests,
-completion tokens and cached tokens per bucket) and a resources panel
-(the proxy's own CPU ms, disk bytes read/written and peak RAM per
-bucket), plus the backend/slot/recent tables (the recent table carries
-the backend index of each request).
+proxy's CPU / disk / RAM metrics) at the top, and a tabbed panel below
+them: the **General** tab (shown by default) holds the throughput panel
+(requests, completion tokens and cached tokens per bucket) and a
+resources panel (the proxy's own CPU ms, disk bytes read/written and peak
+RAM per bucket), while the **Backends**, **Slots**, **Recent requests**
+and **KV Cache** tabs hold the per-backend table, the slot-occupancy
+grid, the recent-requests table (which carries the backend index and slot
+of each request) and a per-key restore table (each distinct restored
+request key with its restore count, sorted by the highest) — only one tab
+is visible at a time. Every throughput/resource chart
+also overlays the percentile lines of its metric — per-request p50
+(solid) / p95 (dashed) ticks on each bar, the window-wide per-request
+p50/p95 as full-width lines, and the p50/p95 of the plotted per-bucket
+aggregate values — with a two-row legend (the per-request p50/p95 on the
+first row, the drawn-bars p50/p95 on the second; clicking an item toggles
+its lines; hidden lines are dropped from the scale); the additive
+resource charts (cpu ms, disk read, disk write) additionally draw the
+window total next to the max in the top-left corner.
+A chart-style switch (bars / line) in the filter bar re-renders every
+chart in the selected style — bars (default, one bar per bucket) or a
+line through the per-bucket values (with point dots while the buckets
+are sparse).
 A time-filter dropdown, grouped into presets (30 seconds, 1 minute,
 5 minutes, 15 minutes) and other (custom time, all time), and a
-backend-filter dropdown (default: `all` — no filtering; an index
-or the `cached` option for the result-cache records) scope the
-cards, charts and recent table to the selected range and backend by
-polling with `?since=<unix seconds>&backend=<index|cached>`.
+backend-filter dropdown (default: `all` — no filtering; an index, or
+the `cached`, `coalesced` or `coalesced_groups` option for the
+result-cache, coalesced-follower and coalesced-group records) scope
+the cards, charts and recent table to the selected range and backend
+by polling with
+`?since=<unix seconds>&backend=<index|cached|coalesced|coalesced_groups>`.
+The page's own URL accepts the same `?backend=` values, so a filtered
+view can be deep-linked.
 
 Plugin params (all optional):
 
@@ -347,14 +375,14 @@ words appended — the second request logs
 
 The suite spans the core proxy (`lpcache`), the adapter plugin library
 (`lpcache-plugins`) and the configurator (`lpcache-config`) across unit,
-integration and doc tests — **282 passing tests** plus **2 ignored** doc
+integration and doc tests — **300 passing tests** plus **2 ignored** doc
 tests:
 
 | Suite | Location | Tests | Command |
 | --- | --- | ---: | --- |
-| Core proxy units | `src/` | 90 | `cargo test -p lpcache --lib` |
-| Plugin library units | `plugins/src/` | 92 | `cargo test -p lpcache-plugins --lib` |
-| Proxy integration (end-to-end) | `tests/api.rs` | 58 | `cargo test -p lpcache --test api` |
+| Core proxy units | `src/` | 98 | `cargo test -p lpcache --lib` |
+| Plugin library units | `plugins/src/` | 99 | `cargo test -p lpcache-plugins --lib` |
+| Proxy integration (end-to-end) | `tests/api.rs` | 61 | `cargo test -p lpcache --test api` |
 | Backend-client integration | `tests/client.rs` | 15 | `cargo test -p lpcache --test client` |
 | Configurator units | `configurator/src/` | 26 | `cargo test -p lpcache-config` |
 | Plugin doc tests | `plugins/src/` | 3 (1 + 2 ignored) | `cargo test -p lpcache-plugins --doc` |
@@ -363,27 +391,31 @@ Everything runs at once with `cargo test --workspace`. Narrow the run with a
 name filter (e.g. `cargo test -p lpcache --test api restore`) or add
 `-- --ignored` to also execute the ignored doctests.
 
-### Core proxy units — `lpcache` (90, `src/`)
+### Core proxy units — `lpcache` (98, `src/`)
 
 Unit tests live in `#[cfg(test)]` modules next to the code they cover.
 
-- **Config & CLI** (`config.rs`, 37): defaults and env fallbacks
+- **Config & CLI** (`config.rs`, 38): defaults and env fallbacks
   (`META_DIR`, `META_MAX`, `SLOT_SAVE_PATH`, `API_KEY`, non-numeric values),
   `BACKENDS` JSON parsing (incl. per-backend `slot_save_path` / `kv_cache`,
   invalid-JSON fallback), full CLI parsing (space/equal forms, extra `=`,
   last-wins, unknown/missing flags, `--help`/`--version`, usage text),
-  CLI-over-env-over-default precedence, and `PLUGINS` / legacy
+  CLI-over-env-over-default precedence, the `SLOT_ROUTING_POLICY`
+  env/CLI parsing (`lru` default, `key_affinity` / `key-affinity`,
+  invalid → default with a warning) and `PLUGINS` / legacy
   `PREFILTER_*` / `REQUEST_LOG*` spec synthesis and precedence.
 - **Hashing & meta files** (`hashing.rs`, 19): raw-prefix construction
   (join/strip, empty/missing, non-string content), word tokenization, block
   hashing, LCP ratio, SHA256 known vectors, meta-file round-trip and scanning
   (corrupt/extension/missing-dir), timestamp bump, restore-candidate
   filtering/thresholds and best-ratio pick, and LRU meta pruning.
-- **Coalescing / single-flight** (`coalesce.rs`, 4): leader/follower entry,
-  group forget, finish waking waiters with the outcome, ordered SSE append/
-  drain.
-- **Slot management** (`slot_manager.rs`, 27): slot selection and ordering
-  (free-first, used-then-oldest, multi-backend, idle-aware), restore
+- **Coalescing / single-flight** (`coalesce.rs`, 5): leader/follower entry,
+  group forget, finish waking waiters with the outcome (incl. the
+  early-finish wakeup race), ordered SSE append/drain.
+- **Slot management** (`slot_manager.rs`, 30): slot selection and ordering
+  (free-first, used-then-oldest, multi-backend, idle-aware, and the
+  `key_affinity` key-free tier — an idle slot already running the
+  requested key is picked before the free/LRU tiers), restore
   targeting and retry-slot exclusion (only `kv_cache`-enabled backends),
   per-slot last-KV tracking (a restore is skipped when the picked slot
   already runs the requested key; the tracking is updated by successful
@@ -396,7 +428,7 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   (the memory gauges and disk counters; other/malformed lines ignored),
   saturating per-field delta, and live-sampling monotonicity.
 
-### Plugin library units — `lpcache-plugins` (92, `plugins/src/`)
+### Plugin library units — `lpcache-plugins` (99, `plugins/src/`)
 
 - **Registry** (`registry.rs`, 10): builtin registration and idempotent
   global registry, custom-plugin registration, unknown/wrong-kind errors,
@@ -421,12 +453,15 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   escaping, custom-field subset/order, invalid field-list rejection, size
   rotation with `keep` bound, rotation-disabled at 0, parent-dir creation,
   lossless concurrent writes, factory params/defaults.
-- **`dashboard`** (`dashboard.rs`, 12): factory defaults/validation, stats
+- **`dashboard`** (`dashboard.rs`, 19): factory defaults/validation, stats
   path join, counters/time-series/recent updates (incl. the per-request
   and per-bucket process resource fields — CPU ms, disk bytes read/written,
   peak RAM), resource metrics absent when records lack them, `?since`
-  range scoping, `?backend` scoping (a backend index and the `cached`
-  scope for result-cache records), per-scope recent rings, long-range
+  range scoping, `?backend` scoping (a backend index and the `cached` /
+  `coalesced` / `coalesced_groups` scopes), the series percentiles
+  (per-request p50/p95 per bucket and scope, the window-wide overall
+  p50/p95, nearest-rank point aggregates, bounded histogram quantiles,
+  and the coarsening merge), per-scope recent rings, long-range
   coarsening and oldest-bucket cap, self-contained HTML, chart bar figures
   and baseline.
 - **`chain`** (`chain.rs`, 3) and **`llama` backend** (`llama.rs`, 5): chain
@@ -449,7 +484,7 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
 - **Wizard** (`wizard.rs`, 3): the menu covers every action, host/port
   parsing, backend list line shapes.
 
-### Integration tests — `lpcache` (73, `tests/`)
+### Integration tests — `lpcache` (76, `tests/`)
 
 - **`tests/client.rs` (15)** — the built-in `llama` plugin's `LlamaClient`
   against the mock backend: model-id lookup (up/down), API-key authorization
@@ -457,7 +492,7 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   non-JSON content-type, malformed/non-object bodies, HTTP errors), streaming
   (chunk reassembly, error status), save/restore status-code mapping, and
   trailing-slash base-URL normalization.
-- **`tests/api.rs` (58)** — the full proxy (axum app) in front of a mock
+- **`tests/api.rs` (61)** — the full proxy (axum app) in front of a mock
   llama.cpp backend:
   - *Basics* (2): configured model id on `/v1/models`, model defaulting.
   - *Cache lifecycle* (3): small request (no save/meta), big request (save +
@@ -471,6 +506,10 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
     failing slots not pinning all traffic.
   - *LRU pruning* (3): meta + KV file pruning, restore of surviving entries
     with fallback for pruned keys, LRU timestamp bump keeping hot entries.
+  - *Slot routing* (2): small-request successes marking the slot used so
+    the free tier moves on (regression), `key_affinity` picking the idle
+    slot already running the key and saving the redundant restore wire
+    call (1 under `lru`, 0 under `key_affinity`).
   - *`kv_cache` flag* (3): kv-disabled backends never save/restore (incl.
     stream save), restore prefers a kv-enabled backend.
   - *Coalescing* (6): identical-request merge, generation-param independence,
@@ -488,10 +527,11 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
     when the slot-save dir is unvisible (remote backend).
   - *Request log* (5): XLF record per request, stream perf fields, delivered
     stream bytes, failed request without pipeline fields, rotation + `keep`.
-  - *Dashboard* (6): page and stats JSON reachable, chart figures, counters
-    updated after requests, `?since`/`?backend` scoping (incl. the
-    `cached` scope), routes excluded from the request log and
-    aggregates, custom page path.
+  - *Dashboard* (7): page and stats JSON reachable, chart figures (incl.
+    the percentile lines/legend and the window totals), counters updated
+    after requests, `?since`/`?backend` scoping (incl. the `cached`,
+    `coalesced` and `coalesced_groups` scopes), routes excluded from the
+    request log and aggregates, custom page path.
 
 ### Functional & load testing
 

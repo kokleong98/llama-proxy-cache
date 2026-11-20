@@ -3005,6 +3005,15 @@ async fn request_log_writes_xlf_record() {
         rec["lpcache-restored"], "-",
         "no restore attempt on small requests"
     );
+    assert_eq!(
+        rec["lpcache-restore-call"], "-",
+        "no restore attempt on small requests"
+    );
+    assert_eq!(
+        rec["lpcache-restore-candidate"], "-",
+        "no restore attempt on small requests"
+    );
+    assert_eq!(rec["lpcache-lcp-ratio"], "-", "no restore attempt on small requests");
     assert_eq!(rec["lpcache-cache-hit"], "-", "no prefilter enabled");
     assert_eq!(rec["lpcache-coalesced"], "-");
     assert_eq!(rec["lpcache-reason"], "-", "the request completed normally");
@@ -3035,6 +3044,67 @@ async fn request_log_writes_xlf_record() {
             rec[f]
         );
     }
+}
+
+#[tokio::test]
+async fn request_log_records_restore_candidate_and_lcp_ratio() {
+    // The XLF record carries the restore decision the LCP scan made: the
+    // best candidate key it picked (which differs from the request's own
+    // key for a closest-prefix match) and the LCP ratio.
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await;
+    let app = router(state);
+    let a = words(600);
+    let body1 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": a.clone() }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(post_json_ua(&body1, "lpcache-test/1.0"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await;
+
+    // 2nd request: same prefix + a tail shorter than one block -> the LCP
+    // scan finds the first request's key as the best candidate (all 6
+    // blocks match, ratio 1.0).
+    let b = format!("{a} tail x y z");
+    let body2 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": b.clone() }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(post_json_ua(&body2, "lpcache-test/1.0"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await;
+
+    let content = std::fs::read_to_string(&log_path).expect("log file");
+    let (_fields, records) = parse_xlf(&content);
+    assert_eq!(records.len(), 2, "one record per request: {content}");
+    // 1st request: no meta existed yet -> no candidate.
+    let rec1 = &records[0];
+    assert_eq!(rec1["lpcache-key"], &expected_key(&a)[..16]);
+    assert_eq!(rec1["lpcache-restored"], "-", "no restore attempt");
+    assert_eq!(rec1["lpcache-restore-candidate"], "-", "no candidate yet");
+    assert_eq!(rec1["lpcache-lcp-ratio"], "-", "no candidate yet");
+    // 2nd request: the candidate is the first request's key (differs from
+    // the request's own key — a closest-prefix match), ratio 1.000.
+    let rec2 = &records[1];
+    assert_eq!(rec2["lpcache-key"], &expected_key(&b)[..16]);
+    assert_ne!(
+        rec2["lpcache-key"], rec2["lpcache-restore-candidate"],
+        "closest-prefix match: candidate differs from the request key"
+    );
+    assert_eq!(rec2["lpcache-restore-candidate"], &expected_key(&a)[..16]);
+    assert_eq!(rec2["lpcache-lcp-ratio"], "1.000");
+    assert_eq!(rec2["lpcache-restored"], "true");
+    assert_eq!(rec2["lpcache-restore-call"], "ok");
 }
 
 #[tokio::test]
@@ -3367,7 +3437,9 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
         "figure drawn for each (stride-selected, non-zero) bar or the hovered bar"
     );
     assert!(
-        html.contains("ctx.fillText(txt, lx, baseY-bh-4)"),
+        html.contains(
+            "ctx.fillText(txt, lx, lineMode ? baseY-(v>0?(v/max)*maxH:0)-4 : baseY-bh-4)"
+        ),
         "figure above the bar"
     );
     // the axis line under the throughput charts
@@ -3458,15 +3530,19 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
     );
     assert!(
         html.contains("items.push([\"barsP95\", AGGC, [6,3], \"bars p95\", barsTxt]);"),
-        "the drawn-bars pair joins the single-row legend"
+        "the drawn-bars pair joins the legend (its second row)"
     );
     assert!(
         html.contains("c.hide[li.k] = !c.hide[li.k];"),
         "clicking a legend item toggles the related lines"
     );
     assert!(
-        html.contains("const padTop = 24 + ((hasPct||hasAgg)?16:0),"),
-        "the single-row legend reserves one row of headroom"
+        html.contains("const legendRows = (hasPct?1:0) + (hasAgg?1:0),"),
+        "the two-row legend counts its rows (per-request pair + bars pair)"
+    );
+    assert!(
+        html.contains("padTop = 24 + legendRows*16, maxH = Math.max(10, baseY-padTop);"),
+        "each legend row reserves 16px of headroom below the plot"
     );
     assert!(
         html.contains("new URLSearchParams(location.search).get(\"backend\")"),
@@ -3628,8 +3704,8 @@ async fn dashboard_counters_update_after_requests() {
     assert!(v["series"]["req_per_sec"].as_f64().unwrap() > 0.0);
     // Recent requests, oldest first (the page reverses them for display);
     // no `path` column: the 404 has no model, the chat request does. The
-    // backend index is present when a slot was acquired (the 404 never
-    // reached a backend).
+    // backend index and slot are present when a slot was acquired (the
+    // 404 never reached a backend).
     let recent = v["recent"].as_array().unwrap();
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0]["status"], 200);
@@ -3637,9 +3713,11 @@ async fn dashboard_counters_update_after_requests() {
     assert_eq!(recent[0]["stream"], false);
     assert!(recent[0]["duration_secs"].as_f64().unwrap() >= 0.0);
     assert_eq!(recent[0]["backend"], 0);
+    assert_eq!(recent[0]["slot"], 0);
     assert_eq!(recent[1]["status"], 404);
     assert!(recent[1]["model"].is_null());
     assert!(recent[1]["backend"].is_null());
+    assert!(recent[1]["slot"].is_null());
 
     // The configured refresh interval reached the rendered page.
     let resp = app
@@ -3749,6 +3827,7 @@ async fn dashboard_stats_since_scopes_the_range() {
     let recent = v["recent"].as_array().unwrap();
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0]["backend"], 0);
+    assert_eq!(recent[0]["slot"], 0);
 
     // A backend that never got traffic yields zero statistics (the
     // series keeps the full timeline, all zero).
@@ -3889,7 +3968,8 @@ async fn dashboard_coalesced_scopes_track_group_records() {
     to_bytes(r2.into_body(), usize::MAX).await.expect("body");
     assert_eq!(mock.state.calls.lock().await.chat_bodies.len(), 1);
 
-    // `?backend=coalesced`: the single follower only (no backend index).
+    // `?backend=coalesced`: the single follower only (no backend index,
+    // no slot — the follower never acquires one).
     let resp = app
         .clone()
         .oneshot(get_req("/dashboard/api/stats?backend=coalesced"))
@@ -3903,6 +3983,7 @@ async fn dashboard_coalesced_scopes_track_group_records() {
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0]["coalesced"], true);
     assert!(recent[0]["backend"].is_null());
+    assert!(recent[0]["slot"].is_null());
 
     // `?backend=coalesced_groups`: the whole group — the leader (backend
     // 0, unflagged) plus the follower (no backend, flagged).
@@ -3924,8 +4005,10 @@ async fn dashboard_coalesced_scopes_track_group_records() {
     for r in recent {
         if r["coalesced"] == true {
             assert!(r["backend"].is_null());
+            assert!(r["slot"].is_null());
         } else {
             assert_eq!(r["backend"], 0);
+            assert_eq!(r["slot"], 0);
         }
     }
 

@@ -8,36 +8,36 @@ documents every test with its exact runnable filter, sync/async kind and
 source line, plus the module's fixtures/helpers, how to run just that
 module, and a coverage map of the surface it exercises.
 
-**Total: 260 test cases** — 94 lpcache unit + 92 lpcache-plugins
-unit + 59 API integration + 15 client integration.
+**Total: 273 test cases** — 98 lpcache unit + 99 lpcache-plugins
+unit + 61 API integration + 15 client integration.
 
 | # | Suite | Location | Tests | Kinds |
 |---|-------|----------|-------|-------|
 | 1 | [Configuration (env vars, CLI, precedence, `PLUGINS` specs)](01-configuration.md) | `src/config.rs` | 38 | 38 sync |
 | 2 | [Prefilter plugins (keyword, chain)](02-prefilter-plugins.md) | `plugins/src/builtin/keyword.rs`, `chain.rs` | 14 | 10 async + 4 sync |
 | 3 | [Hashing, meta files, pruning](03-hashing.md) | `src/hashing.rs` | 19 | 19 sync |
-| 4 | [Request coalescing (`SingleFlight`)](04-coalescing.md) | `src/coalesce.rs` | 4 | 3 sync + 1 async |
+| 4 | [Request coalescing (`SingleFlight`)](04-coalescing.md) | `src/coalesce.rs` | 5 | 3 sync + 2 async |
 | 5 | [llama backend client plugin](05-llama-backend-plugin.md) | `plugins/src/builtin/llama.rs` | 5 | 4 sync + 1 async |
 | 6 | [Slot management (selection, locks, breaker)](06-slot-management.md) | `src/slot_manager.rs` | 30 | 30 async |
-| 7 | [API end-to-end (proxy ↔ mock llama.cpp)](07-api-e2e.md) | `tests/api.rs` | 59 | 59 async |
+| 7 | [API end-to-end (proxy ↔ mock llama.cpp)](07-api-e2e.md) | `tests/api.rs` | 62 | 62 async |
 | 8 | [Backend client — HTTP behavior](08-backend-client.md) | `tests/client.rs` | 15 | 15 async |
 | 9 | [Result cache plugin](09-result-cache-plugin.md) | `plugins/src/builtin/result_cache.rs` | 20 | 9 sync + 11 async |
 | 10 | [Plugin registry (specs, loading, chaining)](10-plugin-registry.md) | `plugins/src/registry.rs` | 10 | 10 sync |
 | 11 | [Request log plugin (W3C-XLF format, rotation)](11-request-log-plugin.md) | `plugins/src/builtin/request_log.rs` | 14 | 14 sync |
 | 12 | [Qwen guard prefilter (Qwen3Guard-Gen safety check)](12-qwen-guard-plugin.md) | `plugins/src/builtin/qwen_guard.rs` | 17 | 8 sync + 9 async |
 
-The module pages catalog 245 of the 263 cases; the remaining 18 (the
-12 `dashboard` plugin unit tests and the 6 `procsample` unit tests,
+The module pages catalog 249 of the 275 cases; the remaining 26 (the
+20 `dashboard` plugin unit tests and the 6 `procsample` unit tests,
 which have no dedicated module pages) run
 in the same suites and pass under `cargo test --workspace`.
 
 ## How to run
 
 ```sh
-cargo test --workspace        # full regression suite (290 tests incl. 1 doctest, ~4 s)
-cargo test --lib              # 97 lpcache unit tests only
-cargo test -p lpcache-plugins # 92 plugin library unit tests
-cargo test --test api         # 59 API integration tests
+cargo test --workspace        # full regression suite (300 tests incl. 1 doctest, ~4 s)
+cargo test --lib              # 98 lpcache unit tests only
+cargo test -p lpcache-plugins # 100 plugin library unit tests
+cargo test --test api         # 62 API integration tests
 cargo test --test client      # 15 client integration tests
 cargo test -p lpcache-config  # 26 configurator unit tests
 cargo test <name-substring>   # run a single test by name filter
@@ -69,18 +69,47 @@ client-disconnect behaviour.
 | Failed requests mark the slot used | `failing_backend_slots_do_not_pin_all_traffic` (E2E; the selection effect is also asserted by the `save_after_*` unit tests) |
 | Idle-aware slot selection | `pick_skips_held_slot_in_favor_of_idle` |
 | Bounded cache pruning (`META_MAX`) | `prune_meta_*` (unit), `prune_removes_oldest_meta_and_kv_files` (E2E) |
-| Concurrent-request coalescing (Rust-only feature) | 4 unit + 6 E2E coalesce tests |
+| Concurrent-request coalescing (Rust-only feature) | 5 unit + 6 E2E coalesce tests |
 | Prefilter plugins (Rust-only feature) | 14 plugin unit tests (keyword 11, chain 3) + 8 E2E prefilter tests |
 | Result cache plugin (Rust-only feature) | 20 plugin unit + 8 E2E tests (7 result-cache, incl. `cache_streaming` and `no-cache` header bypass + 1 blocklist-over-cache chain) |
 | Plugin system (`PLUGINS` env/flag, `lpcache-plugins` registry) | 6 `PLUGINS` config tests + 10 registry tests + 8 plugin `factory_*` tests; E2E state is built via `load_prefilters` / `load_request_loggers` |
 | Per-backend `kv_cache` flag (Rust-only feature) | `backends_kv_cache_flag` (config), `acquire_excluding_respects_kv_flag` / `restore_prefers_kv_enabled_backend` / `restore_skipped_when_no_kv_enabled_backend` (unit), `kv_cache_disabled_backend_never_saves_or_restores` / `kv_cache_disabled_backend_skips_stream_save` / `kv_restore_prefers_kv_enabled_backend` (E2E) |
 | Skip redundant restores — per-slot last-KV tracking (Rust-only feature) | `restore_skipped_when_slot_already_running_key` / `save_updates_last_kv_tracking` / `failed_restore_forgets_last_kv_tracking` (unit) + the E2E assertions in `dead_backend_traffic_fails_over_to_live_backend`, `kv_restore_prefers_kv_enabled_backend`, `restore_works_after_prune_and_pruned_key_falls_back`, `restore_touches_lru_timestamp_so_prune_keeps_hot_entry` and `restore_rejected_cleans_up_stale_meta` |
 | Request log (`REQUEST_LOG*` env/flags or a `request_log` spec in `PLUGINS`, Rust-only feature) | 3 config tests + 14 plugin unit tests (section 11) + 5 E2E tests (`request_log_writes_xlf_record` — incl. the performance fields, `request_log_stream_request_counts_delivered_bytes`, `request_log_logs_failed_request_without_pipeline`, `request_log_rotates_and_bounds_keep`, `request_log_stream_writes_perf_fields`) |
-| Dashboard plugin (`dashboard` spec in `PLUGINS`, Rust-only feature) | 12 plugin unit tests (counters — incl. the process resource metrics (CPU ms / disk bytes / peak RAM), the `?backend` filter (index scopes + the `cached` scope for result-cache records), per-scope recent rings, `?since` range scoping, bucket pruning/coarsening, chart rendering, self-contained HTML) + 6 E2E tests |
+| Dashboard plugin (`dashboard` spec in `PLUGINS`, Rust-only feature) | 19 plugin unit tests (counters — incl. the process resource metrics (CPU ms / disk bytes / peak RAM), the `?backend` filter (index scopes + the `cached`, `coalesced` and `coalesced_groups` scopes), per-scope recent rings, the series percentiles (per-request and overall p50/p95, incl. the coarsening merge), `?since` range scoping, bucket pruning/coarsening, chart rendering, self-contained HTML) + 7 E2E tests |
 | KV cache save auto-retry (`SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS`, Rust-only feature) | `save_after_retries_until_success`, `save_after_retries_exhausted_propagates_error`, `save_after_retries_exhausted_500_returns_false`, `save_after_no_retry_when_retries_disabled` (unit), `save_retry_env_and_cli` (config) |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
-**Suite health (2026-11-13).** 290/290 passing, clippy clean, ~4 s wall
+**Suite health (2026-11-19).** 300/300 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
+On 2026-11-19 the dashboard charts gained the percentile overlays, the
+toggleable legend, the `?backend=` deep link and the window totals
+(+10 cases): each throughput/resource bar overlays its per-request
+p50/p95 ticks, the charts draw two full-width line pairs (the
+window-wide per-request p50/p95 and the p50/p95 of the plotted
+per-bucket aggregates — "bars"), a two-row legend on each chart (per-request
+p50/p95 on row 1, drawn-bars p50/p95 on row 2) toggles its lines (hidden
+lines are dropped from the scale), the page
+URL accepts the same `?backend=` values as the filter, and the additive
+resource charts (cpu ms, disk read, disk write) draw the window total
+next to the max (kept on hover redraws). The recent-requests table's
+backend column became a composite `backend / slot` — the backend index
+and slot the request actually ran on (`-` where no slot was acquired:
+prefilter rejections, coalesced followers, non-chat routes). New cases:
+7 `dashboard` unit
+tests (`pct_hist_quantiles_are_bounded_and_merge`,
+`point_agg_percentiles_nearest_rank`,
+`series_buckets_track_per_request_percentiles`,
+`series_overall_percentiles_cover_the_window`,
+`series_scoped_percentiles_track_each_backend`,
+`series_coarsening_merges_percentiles`,
+`backend_filter_coalesced_scopes_select_group_records`) and E2E
+`dashboard_coalesced_scopes_track_group_records` (`?backend=coalesced`
+= the followers only, `?backend=coalesced_groups` = the whole group);
+`coalesce::tests::early_finish_does_not_lose_the_wakeup` (the wakeup
+race when `finish` lands before the waiter registers) and
+`small_requests_move_on_to_the_next_free_slot` (a successful small
+request marks its slot used, so the free tier moves on instead of
+pinning all traffic to slot 0).
 On 2026-11-13 the `SLOT_ROUTING_POLICY` setting (`lru` default,
 `key_affinity` opt-in) made the slot pick key-aware (+5 cases): under
 `key_affinity`, a request that carries a KV restore key is picked on an

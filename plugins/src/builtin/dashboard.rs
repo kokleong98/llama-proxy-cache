@@ -56,21 +56,28 @@
 //!   aggregate values (the bars themselves), and the page draws both
 //!   as full-width line pairs on the resource and token charts;
 //! - **recent requests** — a ring buffer of the last `max_recent`
-//!   finished requests (status, backend index, duration, key, flags,
-//!   tokens, timings); each backend scope (all backends, each backend
+//!   finished requests (status, backend index, duration, key, the LCP
+//!   ratio of the best restore candidate — with the candidate key when it
+//!   differs from the request's own key — flags, tokens, timings); each
+//!   backend scope (all backends, each backend
 //!   index, the `cached` scope, the `coalesced` scope and the
 //!   `coalesced_groups` scope) keeps its own ring, so selecting a
 //!   filter keeps showing that scope's recent rows even after they have
 //!   rotated out of the all-backends ring.
 //!
 //! The page polls the stats endpoint every `refresh_ms` and renders
-//! stat cards, a throughput bar-chart panel (requests, completion
-//! tokens and cached tokens per bucket), a resources bar-chart panel
-//! (the proxy's own CPU ms, disk bytes read/written and peak RAM per
-//! bucket — the additive cpu/disk charts also draw the window total
-//! next to the max), the backend table, a per-backend slot occupancy grid
-//! (each backend's slots grouped under its label) and the
-//! recent-requests table (with the backend index of each request). A
+//! stat cards, then a tabbed panel whose "General" tab stacks the
+//! throughput bar-chart panel (its three charts — requests, completion
+//! tokens and cached tokens per bucket — laid out in one row of three
+//! columns) above the resources bar-chart panel (one row of four
+//! columns of the proxy's own CPU ms, peak RAM, disk bytes read and disk
+//! bytes written per bucket — the additive cpu/disk charts also draw the
+//! window total next to the max); the remaining tabs hold the backend table, the
+//! per-backend slot occupancy grid (each backend's slots grouped under
+//! its label), the recent-requests table (with the backend index and slot
+//! of each request) and the KV-cache table (each distinct restored request
+//! key with its lifetime restore count, its created time, the last-restore
+//! time, and the backend/slot that served it, sorted by the highest count). A
 //! time-filter dropdown, grouped into presets (30 seconds, 1 minute, 5
 //! minutes, 15 minutes) and other (custom time, or all time), and a
 //! backend-filter dropdown (default: all backends — no filtering; an
@@ -102,6 +109,7 @@ use crate::api::{BackendScope, Dashboard, ProxyStatus, RequestLogRecord};
 use crate::registry::{PluginError, PluginFactory};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -125,6 +133,30 @@ pub const MAX_BUCKETS: usize = 50_000;
 /// longer ranges are coarsened (merged into a multiple of `bucket_secs`)
 /// down to this many points, keeping the payload small.
 pub const MAX_SERIES_POINTS: usize = 360;
+/// Hard cap on the distinct restored keys retained in the per-key KV
+/// restore tally (the "KV Cache" tab): on overflow the lowest-count key
+/// is dropped, so the most-restored keys are always shown.
+pub const MAX_KV_KEYS: usize = 512;
+
+/// Per-key state for the "KV Cache" tab: how many times the key was served
+/// via a successful KV restore (lifetime), the backend/slot that served the
+/// most recent restore, and when the key first appeared in the tally (its
+/// first successful restore — the "created" time) and was most recently
+/// restored (unix seconds).
+#[derive(Debug, Clone, Copy)]
+pub struct KvEntry {
+    /// Lifetime count of successful KV restores for this key.
+    pub count: u64,
+    /// Unix seconds when this key first appeared in the tally (its first
+    /// successful restore) — the "created" time shown on the KV Cache tab.
+    pub created_ts: u64,
+    /// Unix seconds of the most recent successful restore of this key.
+    pub last_ts: u64,
+    /// The backend index that served the most recent restore.
+    pub backend: Option<usize>,
+    /// The slot that served the most recent restore.
+    pub slot: Option<usize>,
+}
 
 fn default_path() -> String {
     DEFAULT_PATH.to_string()
@@ -565,9 +597,29 @@ pub struct RecentRow {
     /// The backend index the request ran on (`None` = no backend work —
     /// e.g. a prefilter rejection).
     pub backend: Option<usize>,
+    /// The slot id the request ran on (`None` = no slot was acquired for
+    /// the request — it never reached a backend, or it joined a
+    /// coalesced group as a follower).
+    pub slot: Option<usize>,
     pub stream: bool,
     /// A KV cache restore was attempted and succeeded.
     pub restored: bool,
+    /// `lpcache-restore-call` for this request: `ok` (the backend's
+    /// `action=restore` call loaded the KV), `skipped` (no call — the slot
+    /// was already running the requested KV), `rejected`, `failed`;
+    /// missing = no restore was attempted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_call: Option<String>,
+    /// `lpcache-restore-candidate` for this request: first 16 hex chars of
+    /// the key the LCP scan picked as the best restore candidate (differs
+    /// from `key` when the closest cached prefix belongs to another key);
+    /// missing = no candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_candidate: Option<String>,
+    /// `lpcache-lcp-ratio` for this request (0..=1, present exactly when
+    /// `restore_candidate` is).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lcp_ratio: Option<f64>,
     /// The prefilter served the request from its result cache.
     pub cache_hit: bool,
     /// The request joined a coalesced group as a follower.
@@ -1013,6 +1065,16 @@ pub struct Inner {
     /// view. Each scope keeps its own ring, so a filter's rows are not
     /// evicted by traffic on other backends.
     pub recent_by_be: Vec<Vec<RecentRow>>,
+    /// Lifetime per-key KV restore tally: each distinct restored request
+    /// key → how many times it was served via a successful KV restore, when
+    /// it was first seen (created), the backend/slot that served the most
+    /// recent restore, and its time.
+    /// Backs the "KV Cache" tab (sorted by the highest restored count).
+    /// Bounded to [`MAX_KV_KEYS`] distinct keys — on overflow the
+    /// lowest-count key is dropped, so the top-restored keys survive. Not
+    /// scoped by `?since`/`?backend` (the KV cache is a live state, like
+    /// the meta files).
+    pub restore_counts: HashMap<String, KvEntry>,
 }
 
 impl Inner {
@@ -1028,6 +1090,14 @@ impl Inner {
         max_recent: usize,
     ) {
         self.counters.add(record);
+        // The per-key KV restore tally (the "KV Cache" tab): count a
+        // restored request under its own KV cache key.
+        if record.restored == Some(true)
+            && let Some(key) = record.key.as_deref()
+            && !key.is_empty()
+        {
+            self.touch_restore_count(key.to_string(), now, record.backend, record.slot);
+        }
         if let Some(be) = record.backend {
             if be >= self.by_be.len() {
                 self.by_be.resize(be + 1, Counters::default());
@@ -1066,8 +1136,12 @@ impl Inner {
                 model: record.model.clone(),
                 key: record.key.clone(),
                 backend: record.backend,
+                slot: record.slot,
                 stream: record.stream.unwrap_or(false),
                 restored: record.restored == Some(true),
+                restore_call: record.restore_call.map(|s| s.to_string()),
+                restore_candidate: record.restore_candidate.clone(),
+                lcp_ratio: record.lcp_ratio,
                 cache_hit: record.cache_hit == Some(true),
                 coalesced: record.coalesced == Some("follower"),
                 reason: record.reason.clone(),
@@ -1100,6 +1174,51 @@ impl Inner {
                     self.recent_by_be.resize(be + 1, Vec::new());
                 }
                 push_recent(&mut self.recent_by_be[be], row, max_recent);
+            }
+        }
+    }
+
+    /// Record one successful restore of `key` at `now` (unix seconds),
+    /// served by `backend`/`slot`, keeping the map bounded to
+    /// [`MAX_KV_KEYS`] distinct keys: an existing key's count is bumped and
+    /// its last-restore fields updated (its first-seen "created" time is
+    /// kept); a new key records `now` as its creation time and, when the cap
+    /// is reached, first evicts the lowest-count key (so the most-restored
+    /// keys survive).
+    fn touch_restore_count(
+        &mut self,
+        key: String,
+        now: u64,
+        backend: Option<usize>,
+        slot: Option<usize>,
+    ) {
+        match self.restore_counts.get_mut(&key) {
+            Some(e) => {
+                e.count += 1;
+                e.last_ts = now;
+                e.backend = backend;
+                e.slot = slot;
+            }
+            None => {
+                if self.restore_counts.len() >= MAX_KV_KEYS
+                    && let Some(min_key) = self
+                        .restore_counts
+                        .iter()
+                        .min_by_key(|(_, e)| e.count)
+                        .map(|(k, _)| k.clone())
+                {
+                    self.restore_counts.remove(&min_key);
+                }
+                self.restore_counts.insert(
+                    key,
+                    KvEntry {
+                        count: 1,
+                        created_ts: now,
+                        last_ts: now,
+                        backend,
+                        slot,
+                    },
+                );
             }
         }
     }
@@ -1384,6 +1503,27 @@ impl DashboardPlugin {
             BackendScope::All => &inner.recent,
         };
         payload["recent"] = serde_json::to_value(recent).unwrap_or(Value::Null);
+        // The per-key KV restore tally (the "KV Cache" tab): each distinct
+        // restored request key with how often it was restored, sorted by
+        // the highest restored count (ties broken by key for a stable
+        // order). Lifetime — not scoped by `since`/`scope`, since the KV
+        // cache is a live state like the meta files.
+        let mut kv: Vec<(&String, &KvEntry)> = inner.restore_counts.iter().collect();
+        kv.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+        let kv_json: Vec<Value> = kv
+            .iter()
+            .map(|(k, e)| {
+                json!({
+                    "key": k,
+                    "count": e.count,
+                    "created_ts": e.created_ts,
+                    "last_ts": e.last_ts,
+                    "backend": e.backend,
+                    "slot": e.slot,
+                })
+            })
+            .collect();
+        payload["kv_cache"] = serde_json::to_value(kv_json).unwrap_or(Value::Null);
         payload
     }
 }
@@ -1465,8 +1605,22 @@ main { padding:16px 22px 30px; display:flex; flex-direction:column; gap:14px; ma
 .card .v { font-size:20px; font-weight:600; margin-top:2px; }
 .card .s { color:var(--dim); font-size:11px; margin-top:2px; min-height:14px; }
 .panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px 14px; }
+/* The chart panels (throughput + resources) carry a thicker, lighter
+   border so their bounds read clearly against the page background. */
+.chartpanel { border:2px solid #586069; }
 .panel h2 { font-size:13px; margin:0 0 10px; color:var(--dim); text-transform:uppercase; letter-spacing:.05em; }
 table { width:100%; border-collapse:collapse; font-size:12.5px; }
+/* the recent table is wide (15 nowrap columns — incl. the key and the
+   restore ratio/candidate): keep it at its natural width and scroll it
+   inside the panel instead of overflowing the panel's edge. */
+#recent { overflow-x:auto; }
+#recent table { min-width:max-content; }
+/* The KV Cache tab's table: monospace keys, right-aligned tabular counts,
+   and a one-line summary above the table. */
+#kv-cache { overflow-x:auto; }
+#kv-cache .key { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+#kv-cache td.num { text-align:right; font-variant-numeric:tabular-nums; }
+.kvsum { color:var(--dim); font-size:12px; margin-bottom:8px; }
 th { text-align:left; color:var(--dim); font-weight:600; padding:4px 8px; border-bottom:1px solid var(--border); white-space:nowrap; }
 td { padding:4px 8px; border-bottom:1px solid #21262d; white-space:nowrap; }
 tr:last-child td { border-bottom:none; }
@@ -1485,7 +1639,7 @@ tr:last-child td { border-bottom:none; }
 .slot.down { background:rgba(248,81,73,.25); border-color:var(--err); color:var(--text); }
 .chartwrap { margin-bottom:8px; }
 .chartwrap .cap { display:flex; justify-content:space-between; color:var(--dim); font-size:11px; margin-bottom:4px; }
-canvas { width:100%; height:132px; display:block; }
+canvas { width:100%; height:148px; display:block; }
 .bartip { position:fixed; z-index:50; pointer-events:none; display:none; background:#1c2128; border:1px solid var(--border); border-radius:6px; padding:6px 10px; font-size:12px; box-shadow:0 6px 16px rgba(0,0,0,.45); min-width:104px; }
 .bartip .tt-h { display:flex; justify-content:space-between; gap:14px; color:var(--dim); font-size:10.5px; margin-bottom:3px; white-space:nowrap; }
 .bartip .tt-v { font-size:16px; font-weight:600; }
@@ -1498,8 +1652,39 @@ footer { color:var(--dim); font-size:11px; text-align:center; padding:0 0 18px; 
 .fsel:hover, .fsel:focus { border-color:var(--accent); outline:none; }
 #custom-wrap { display:flex; align-items:center; gap:6px; }
 #custom-secs { width:90px; background:var(--bg); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:3px 8px; font-size:12px; }
+.seg { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+.seg button { background:var(--bg); border:0; color:var(--dim); padding:4px 10px; font-size:12px; cursor:pointer; }
+.seg button + button { border-left:1px solid var(--border); }
+.seg button:hover { color:var(--text); }
+.seg button.on { background:rgba(88,166,255,.15); color:var(--accent); }
 #custom-apply { background:#21262d; border:1px solid var(--border); color:var(--text); border-radius:6px; padding:3px 10px; font-size:12px; cursor:pointer; }
 #custom-apply:hover { border-color:var(--accent); }
+/* Tabbed panel: a single tab bar above a stack of panes; only the
+   active pane is shown (the [hidden] attribute hides the rest). */
+.tabs { display:flex; flex-direction:column; }
+.tabbar { display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:14px; }
+.tabbtn { background:transparent; border:0; color:var(--dim); font-size:13px; font-weight:600; padding:8px 14px; cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-1px; }
+.tabbtn:hover { color:var(--text); }
+.tabbtn.on { color:var(--text); border-bottom-color:var(--accent); }
+.tabpane { display:flex; flex-direction:column; gap:14px; }
+.tabpane[hidden] { display:none; }
+/* The General tab stacks the throughput panel above the resources
+   panel (a single column). */
+.generow { display:flex; flex-direction:column; gap:14px; }
+/* The throughput panel's three charts sit in one row of three equal
+   columns (requests / completion tokens / cached tokens); the resources
+   panel's four charts sit in one row of four equal columns (cpu / peak
+   ram / disk read / disk write). Narrow screens collapse to a single
+   column so the charts keep their width. */
+.chartrow, .resgrid { display:grid; gap:10px; }
+.chartrow { grid-template-columns:repeat(3,1fr); }
+.resgrid { grid-template-columns:repeat(4,1fr); }
+.chartrow .chartwrap, .resgrid .chartwrap { margin-bottom:0; }
+.chartrow .cap, .resgrid .cap { flex-wrap:wrap; gap:2px 8px; }
+/* a vertical bar between the chart cells in each row (dropped when the
+   rows collapse to a single column on narrow screens) */
+.chartrow .chartwrap + .chartwrap, .resgrid .chartwrap + .chartwrap { border-left:1px solid #3d444d; padding-left:10px; }
+@media (max-width: 900px) { .chartrow, .resgrid { grid-template-columns:1fr; } .chartrow .chartwrap + .chartwrap, .resgrid .chartwrap + .chartwrap { border-left:0; padding-left:0; } }
 </style>
 </head>
 <body>
@@ -1531,6 +1716,11 @@ const PAGE_BODY: &str = r##"
     </span>
     <span class="flbl">backend</span>
     <select id="backend" class="fsel" aria-label="backend filter"><option value="">all</option></select>
+    <span class="flbl">chart</span>
+    <span class="seg" id="chartmode" aria-label="chart style">
+      <button type="button" data-mode="bar" class="on">bars</button>
+      <button type="button" data-mode="line">line</button>
+    </span>
   </section>
   <section class="cards">
     <div class="card"><div class="lbl">requests</div><div class="v" id="c-req-v">&ndash;</div><div class="s" id="c-req-s"></div></div>
@@ -1550,22 +1740,40 @@ const PAGE_BODY: &str = r##"
     <div class="card"><div class="lbl">disk write</div><div class="v" id="c-dw-v">&ndash;</div><div class="s" id="c-dw-s">proxy process</div></div>
     <div class="card"><div class="lbl">peak ram</div><div class="v" id="c-ram-v">&ndash;</div><div class="s" id="c-ram-s">proxy process</div></div>
   </section>
-  <section class="panel">
-    <h2>throughput</h2>
-    <div class="chartwrap"><div class="cap"><span>requests per bucket</span><span id="cap-req"></span></div><canvas id="chart-req"></canvas></div>
-    <div class="chartwrap"><div class="cap"><span>completion tokens per bucket</span><span id="cap-tok"></span></div><canvas id="chart-tok"></canvas></div>
-    <div class="chartwrap"><div class="cap"><span>cached (restored) prompt tokens per bucket</span><span id="cap-cached"></span></div><canvas id="chart-cached"></canvas></div>
+  <section class="tabs">
+    <div class="tabbar" role="tablist">
+      <button type="button" class="tabbtn on" data-tab="general" role="tab" aria-controls="tab-general">General</button>
+      <button type="button" class="tabbtn" data-tab="backends" role="tab" aria-controls="tab-backends">Backends</button>
+      <button type="button" class="tabbtn" data-tab="slots" role="tab" aria-controls="tab-slots">Slots</button>
+      <button type="button" class="tabbtn" data-tab="recent" role="tab" aria-controls="tab-recent">Recent requests</button>
+      <button type="button" class="tabbtn" data-tab="kv" role="tab" aria-controls="tab-kv">KV Cache</button>
+    </div>
+    <div class="tabpane" id="tab-general" role="tabpanel">
+      <div class="generow">
+        <section class="panel chartpanel">
+          <h2>throughput</h2>
+          <div class="chartrow">
+            <div class="chartwrap"><div class="cap"><span>requests per bucket</span><span id="cap-req"></span></div><canvas id="chart-req"></canvas></div>
+            <div class="chartwrap"><div class="cap"><span>completion tokens per bucket</span><span id="cap-tok"></span></div><canvas id="chart-tok"></canvas></div>
+            <div class="chartwrap"><div class="cap"><span>cached (restored) prompt tokens per bucket</span><span id="cap-cached"></span></div><canvas id="chart-cached"></canvas></div>
+          </div>
+        </section>
+        <section class="panel chartpanel">
+          <h2>resources</h2>
+          <div class="resgrid">
+            <div class="chartwrap"><div class="cap"><span>cpu ms per bucket</span><span id="cap-cpu"></span></div><canvas id="chart-cpu"></canvas></div>
+            <div class="chartwrap"><div class="cap"><span>peak ram (MB) per bucket</span><span id="cap-ram"></span></div><canvas id="chart-ram"></canvas></div>
+            <div class="chartwrap"><div class="cap"><span>disk read (MB) per bucket</span><span id="cap-dr"></span></div><canvas id="chart-dr"></canvas></div>
+            <div class="chartwrap"><div class="cap"><span>disk write (MB) per bucket</span><span id="cap-dw"></span></div><canvas id="chart-dw"></canvas></div>
+          </div>
+        </section>
+      </div>
+    </div>
+    <div class="tabpane" id="tab-backends" role="tabpanel" hidden><section class="panel"><h2>backends</h2><div id="backends"></div></section></div>
+    <div class="tabpane" id="tab-slots" role="tabpanel" hidden><section class="panel"><h2>slots</h2><div id="slots" class="slotgroups"></div></section></div>
+    <div class="tabpane" id="tab-recent" role="tabpanel" hidden><section class="panel"><h2>recent requests</h2><div id="recent"></div></section></div>
+    <div class="tabpane" id="tab-kv" role="tabpanel" hidden><section class="panel"><h2>kv cache &mdash; most restored keys</h2><div id="kv-cache"></div></section></div>
   </section>
-  <section class="panel">
-    <h2>resources</h2>
-    <div class="chartwrap"><div class="cap"><span>cpu ms per bucket</span><span id="cap-cpu"></span></div><canvas id="chart-cpu"></canvas></div>
-    <div class="chartwrap"><div class="cap"><span>disk read (MB) per bucket</span><span id="cap-dr"></span></div><canvas id="chart-dr"></canvas></div>
-    <div class="chartwrap"><div class="cap"><span>disk write (MB) per bucket</span><span id="cap-dw"></span></div><canvas id="chart-dw"></canvas></div>
-    <div class="chartwrap"><div class="cap"><span>peak ram (MB) per bucket</span><span id="cap-ram"></span></div><canvas id="chart-ram"></canvas></div>
-  </section>
-  <section class="panel"><h2>backends</h2><div id="backends"></div></section>
-  <section class="panel"><h2>slots</h2><div id="slots" class="slotgroups"></div></section>
-  <section class="panel"><h2>recent requests</h2><div id="recent"></div></section>
 </main>
 <footer id="foot"></footer>
 "##;
@@ -1588,6 +1796,11 @@ let CUSTOM_SECS = 600;
 // group and never touch a backend); "coalesced_groups" = the leaders
 // and followers of the coalesced groups.
 let BE = null;
+// Chart style: "bar" (default — one bar per bucket) or "line" (a
+// polyline through the per-bucket values with point dots); the chart
+// switch in the filter bar re-renders every chart in the selected
+// style (hover state is kept per chart).
+let CHART_MODE = "bar";
 function rangeSecs(){
   if(FILTER==="all") return null;
   if(FILTER==="custom") return CUSTOM_SECS;
@@ -1688,8 +1901,9 @@ function hideTip(){ if(tip) tip.style.display = "none"; }
 // listed in the legend. `agP50`/`agP95` are the window-wide p50/p95 of
 // the drawn per-bucket aggregate values (the bars themselves) — when
 // not null they are drawn as a second full-width line pair (solid p50 /
-// dashed p95, in the bars color) and the same single-row legend carries
-// the bars pair ("bars p50" / "bars p95" + "bars X / Y"). The figure of each bar is
+// dashed p95, in the bars color) and the two-row legend carries the bars
+// pair ("bars p50" / "bars p95" + "bars X / Y") on its second row (the
+// per-request "p50" / "p95" pair sits on the first). The figure of each bar is
 // drawn on top of it; an adaptive stride skips labels when buckets are dense
 // so the figures never overlap. Chart geometry is cached on the canvas
 // (cv._chart) so the hover handlers can re-render on mousemove.
@@ -1738,22 +1952,26 @@ function drawBars(cv, series, key, label, color, hl, fmt, p50Key, p95Key, ovP50,
   if(!hide.barsP50 && agP50!=null && agP50>max) max=agP50;
   if(!hide.barsP95 && agP95!=null && agP95>max) max=agP95;
   const bw = w/n, baseY = h-5;
-  // When the percentile legend (below) is shown it right-aligns in the top
-  // strip; push the plot down by a full row so the figure of the tallest
-  // bar (drawn 4 px above its top) always keeps a blank row clear of the
-  // legend text instead of overlapping it.
-  const padTop = 24 + ((hasPct||hasAgg)?16:0), maxH = Math.max(10, baseY-padTop);
-  ctx.font = "10px sans-serif";
+  // The percentile legend (below) sits in the top strip on up to two rows
+  // (row 1: the per-request p50/p95 pair; row 2: the drawn-bars p50/p95
+  // pair), each right-aligned. Push the plot down one 16px row per legend
+  // row so the figure of the tallest bar (drawn 4px above its top) always
+  // keeps a blank row clear of the legend text instead of overlapping it.
+  const legendRows = (hasPct?1:0) + (hasAgg?1:0),
+        padTop = 24 + legendRows*16, maxH = Math.max(10, baseY-padTop);
+  ctx.font = "700 11px sans-serif";
   const charW = Math.max(4, ctx.measureText("0").width);
   const stride = Math.max(1, Math.ceil((String(max).length*charW + 6) / bw));
+  const lineMode = CHART_MODE === "line";
   values.forEach((v,i)=>{
     const bh = v>0 ? Math.max(2, Math.round((v/max)*maxH)) : 0;
     const x = i*bw+1, bwid = Math.max(1, bw-2);
     const hov = (i===hl);
-    ctx.fillStyle = color;
-    ctx.fillRect(x, baseY-bh, bwid, bh);
-    if(hov && bh>0){ ctx.save(); ctx.globalAlpha=.28; ctx.fillStyle="#ffffff"; ctx.fillRect(x, baseY-bh, bwid, bh); ctx.restore(); }
-    if(hasPct){
+    if(!lineMode){
+      ctx.fillStyle = color;
+      ctx.fillRect(x, baseY-bh, bwid, bh);
+      if(hov && bh>0){ ctx.save(); ctx.globalAlpha=.28; ctx.fillStyle="#ffffff"; ctx.fillRect(x, baseY-bh, bwid, bh); ctx.restore(); }
+      if(hasPct){
       // a solid p50 / dashed p95 tick across the bar at the per-request
       // value (skipped for buckets without data for the metric)
       const tick = (val, col, dash)=>{
@@ -1765,16 +1983,39 @@ function drawBars(cv, series, key, label, color, hl, fmt, p50Key, p95Key, ovP50,
       };
       if(!hide.p50) tick(p50s ? p50s[i] : null, P50C, []);
       if(!hide.p95) tick(p95s ? p95s[i] : null, P95C, [3,2]);
+      }
     }
     if((i % stride === 0 && v>0) || hov){
       const txt = fmt(v);
-      ctx.font = (hov ? "700 " : "")+"10px sans-serif";
+      ctx.font = "700 11px sans-serif";
       const tw = ctx.measureText(txt).width;
       const lx = Math.max(1, Math.min(w-tw-1, x + bwid/2 - tw/2));
-      ctx.fillStyle = hov ? "#ffffff" : "#8b949e";
-      ctx.fillText(txt, lx, baseY-bh-4);
+      ctx.fillStyle = hov ? "#ffffff" : "#e6edf3";
+      // bar mode: the figure sits 4px above the bar top; line mode:
+      // 4px above the point (the value's y on the line)
+      ctx.fillText(txt, lx, lineMode ? baseY-(v>0?(v/max)*maxH:0)-4 : baseY-bh-4);
     }
   });
+  if(lineMode){
+    // Line mode: a polyline through the per-bucket values (points at
+    // each bucket's centre) with a dot per point while the buckets are
+    // sparse enough to stay readable (the per-bar percentile ticks are
+    // skipped — the window-wide percentile lines below still apply).
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.lineJoin = "round";
+    ctx.beginPath();
+    values.forEach((v,i)=>{
+      const x = i*bw + bw/2, y = baseY - (v>0 ? (v/max)*maxH : 0);
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+    if(bw >= 6){
+      ctx.fillStyle = color;
+      values.forEach((v,i)=>{
+        const x = i*bw + bw/2, y = baseY - (v>0 ? (v/max)*maxH : 0);
+        ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI*2); ctx.fill();
+      });
+    }
+  }
   if(ovP50!=null || ovP95!=null){
     // The window-wide percentile lines: full-width across the whole plot
     // (unlike the per-bar ticks) at the p50/p95 of every request in the
@@ -1806,13 +2047,24 @@ function drawBars(cv, series, key, label, color, hl, fmt, p50Key, p95Key, ovP50,
   }
   if(hl!=null && hl>=0 && hl<n){
     const v = values[hl], bh = v>0 ? Math.max(2, Math.round((v/max)*maxH)) : 0;
-    const x = hl*bw+1, bwid = Math.max(1, bw-2);
-    ctx.strokeStyle = "#e6edf3"; ctx.lineWidth = 1;
-    if(bh>0) ctx.strokeRect(x+.5, baseY-bh+.5, bwid-1, bh-1);
-    else { ctx.fillStyle="#e6edf3"; ctx.fillRect(x, baseY-1, bwid, 1); }
+    if(lineMode){
+      // line mode: a dashed guide through the bucket centre plus a
+      // filled ring on the hovered point
+      const x = hl*bw + bw/2, y = baseY - (v>0 ? (v/max)*maxH : 0);
+      ctx.strokeStyle = "#e6edf3"; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(x+.5, padTop-6); ctx.lineTo(x+.5, baseY); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#e6edf3";
+      ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI*2); ctx.fill();
+    } else {
+      const x = hl*bw+1, bwid = Math.max(1, bw-2);
+      ctx.strokeStyle = "#e6edf3"; ctx.lineWidth = 1;
+      if(bh>0) ctx.strokeRect(x+.5, baseY-bh+.5, bwid-1, bh-1);
+      else { ctx.fillStyle="#e6edf3"; ctx.fillRect(x, baseY-1, bwid, 1); }
+    }
   }
-  ctx.font = "11px sans-serif";
-  ctx.fillStyle = "#8b949e";
+  ctx.font = "700 11px sans-serif";
+  ctx.fillStyle = "#e6edf3";
   // The additive charts (cpu ms, disk read, disk write) also carry the
   // window total — the sum of the drawn per-bucket values — right of the
   // max; the non-additive charts (request count, token sums, peak RAM)
@@ -1821,15 +2073,19 @@ function drawBars(cv, series, key, label, color, hl, fmt, p50Key, p95Key, ovP50,
   ctx.fillText(showTotal ? "max "+fmt(max)+" \u00b7 total "+fmt(tot) : "max "+fmt(max), 2, 12);
   let legItems = [];
   if(hasPct || hasAgg){
-    // legend for the percentile overlays, right-aligned in the top strip
-    // on a single row (solid = p50, dashed = p95; "all X / Y" = the
-    // window-wide per-request values drawn as full-width lines across
-    // the plot; "bars X / Y" = the p50/p95 of the drawn per-bucket
-    // aggregate values — the second line pair). Each item is clickable:
-    // it toggles the related lines (hidden items are drawn faded and
-    // dropped from the scale).
-    ctx.font = "10px sans-serif";
-    const SW = 11, G1 = 6, G2 = 12;
+    // legend for the percentile overlays, right-aligned in the top strip on
+    // up to TWO rows (solid = p50, dashed = p95; "all X / Y" = the
+    // window-wide per-request values drawn as full-width lines across the
+    // plot; "bars X / Y" = the p50/p95 of the drawn per-bucket aggregate
+    // values — the second line pair). Row 1 carries the per-request pair
+    // ("p50" / "p95"); row 2 carries the bars pair ("bars p50" / "bars
+    // p95"). Each row right-aligns independently, so the wide trailing
+    // values never crowd the "max" figure on the left, and the plot (see
+    // padTop) is pushed below both rows. Each item is clickable: it
+    // toggles the related lines (hidden items are drawn faded and dropped
+    // from the scale).
+    ctx.font = "700 10px sans-serif";
+    const SW = 11, G1 = 6, G2 = 12, ROWH = 16;
     const wTxt = t => ctx.measureText(t).width;
     const allTxt = (ovP50>0 || ovP95>0)
       ? "all "+fmt(ovP50||0)+" / "+fmt(ovP95||0) : "";
@@ -1844,20 +2100,30 @@ function drawBars(cv, series, key, label, color, hl, fmt, p50Key, p95Key, ovP50,
       items.push(["barsP50", AGGC, [], "bars p50", ""]);
       items.push(["barsP95", AGGC, [6,3], "bars p95", barsTxt]);
     }
-    const legendW = items.reduce((s,it)=>s + SW+G1+wTxt(it[3]) + (it[4] ? G2+wTxt(it[4]) : 0) + G2, 0);
-    let lx = Math.max(2, w - legendW - 6);
-    ctx.lineWidth = 2; ctx.fillStyle = "#8b949e";
+    // the per-request pair (keys not starting with "b") sits on row 1, the
+    // bars pair on row 2; each row is right-aligned on its own.
+    const rowOf = it => (it[0].charAt(0)==="b" ? 1 : 0);
+    const rowW = [0, 0];
     for(const it of items){
-      ctx.save(); ctx.globalAlpha = hide[it[0]] ? .35 : 1;
-      ctx.strokeStyle = it[1]; ctx.setLineDash(it[2]);
-      ctx.beginPath(); ctx.moveTo(lx, 9); ctx.lineTo(lx+SW, 9); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillText(it[3], lx+SW+G1, 12);
-      ctx.restore();
-      legItems.push({k: it[0], x: lx, y: 2, w: SW+G1+wTxt(it[3]), h: 14});
-      lx += SW+G1+wTxt(it[3]);
-      if(it[4]){ ctx.fillText(it[4], lx+G2, 12); lx += G2+wTxt(it[4]); }
-      lx += G2;
+      rowW[rowOf(it)] += SW+G1+wTxt(it[3]) + (it[4] ? G2+wTxt(it[4]) : 0) + G2;
+    }
+    ctx.lineWidth = 2; ctx.fillStyle = "#c9d1d9";
+    for(let r=0; r<2; r++){
+      const yBase = 12 + r*ROWH;   // text baseline: row 1 -> 12, row 2 -> 28
+      let lx = Math.max(2, w - rowW[r] - 6);
+      for(const it of items){
+        if(rowOf(it)!==r) continue;
+        ctx.save(); ctx.globalAlpha = hide[it[0]] ? .35 : 1;
+        ctx.strokeStyle = it[1]; ctx.setLineDash(it[2]);
+        ctx.beginPath(); ctx.moveTo(lx, yBase-3); ctx.lineTo(lx+SW, yBase-3); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillText(it[3], lx+SW+G1, yBase);
+        ctx.restore();
+        legItems.push({k: it[0], x: lx, y: yBase-10, w: SW+G1+wTxt(it[3]), h: 14});
+        lx += SW+G1+wTxt(it[3]);
+        if(it[4]){ ctx.fillText(it[4], lx+G2, yBase); lx += G2+wTxt(it[4]); }
+        lx += G2;
+      }
     }
   }
   ctx.strokeStyle = "#30363d";
@@ -2035,24 +2301,52 @@ function render(d){
   if(ranged) rows = rows.filter(r=>r.ts >= (d.range.since==null ? 0 : d.range.since));
   if(!rows.length){ $("recent").innerHTML = '<div class="empty">no finished requests yet</div>'; }
   else {
-    let rt = "<table><tr><th>time</th><th>status</th><th>backend</th><th>duration</th><th>model</th><th>key</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w (MB)</th><th>ram (MB)</th><th>note</th></tr>";
+    let rt = "<table><tr><th>time</th><th>status</th><th>backend / slot</th><th>duration</th><th>model</th><th>key</th><th>restore</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w (MB)</th><th>ram (MB)</th><th>note</th></tr>";
     rows.forEach(r=>{
       const flags = [];
       if(r.cache_hit) flags.push('<span class="badge b-acc">cache</span>');
-      if(r.restored) flags.push('<span class="badge b-ok">restore</span>');
+      if(r.restore_call==="ok") flags.push('<span class="badge b-ok">restore</span>');
+      else if(r.restore_call==="skipped") flags.push('<span class="badge b-dim">warm</span>');
+      else if(r.restore_call==="rejected") flags.push('<span class="badge b-err">restore-rej</span>');
+      else if(r.restore_call==="failed") flags.push('<span class="badge b-err">restore-fail</span>');
       if(r.coalesced) flags.push('<span class="badge b-dim">follower</span>');
       if(r.stream) flags.push('<span class="badge b-dim">stream</span>');
-      const when = new Date(r.ts*1000).toLocaleTimeString();
+      const when = new Date(r.ts*1000).toLocaleString();
       const toks = r.prompt_tokens!=null ? r.prompt_tokens+" / "+(r.completion_tokens!=null?r.completion_tokens:"?")+" / "+(r.cached_tokens!=null?r.cached_tokens:0) : "\u2013";
       const cpu = r.cpu_ms!=null ? r.cpu_ms.toFixed(1)+" ms" : "\u2013";
       const diow = (r.disk_read_bytes!=null || r.disk_write_bytes!=null) ? fmtMB(r.disk_read_bytes||0)+" / "+fmtMB(r.disk_write_bytes||0) : "\u2013";
       const ram = r.ram_bytes!=null ? fmtMB(r.ram_bytes) : "\u2013";
-      rt += "<tr><td>"+when+"</td><td>"+statusBadge(r.status)+"</td><td>"+(r.backend==null?"\u2013":r.backend)+"</td><td>"+fmtDur(r.duration_secs)+"</td><td>"+esc(r.model)+"</td><td>"+(r.key?esc(r.key):"\u2013")+"</td><td>"+flags.join(" ")+"</td><td>"+toks+"</td><td>"+(r.ttft_ms!=null?Math.round(r.ttft_ms)+" ms":"\u2013")+"</td><td>"+(r.gen_tps!=null?r.gen_tps.toFixed(1):"\u2013")+"</td><td>"+cpu+"</td><td>"+diow+"</td><td>"+ram+"</td><td>"+(r.reason?esc(r.reason):"")+"</td></tr>";
+      // restore cell: the LCP ratio of the best restore candidate, plus
+      // the candidate key when it differs from the request key (a
+      // closest-prefix match; an exact-key repeat shows the ratio only).
+      const rst = r.lcp_ratio!=null ? r.lcp_ratio.toFixed(3)+((r.restore_candidate && r.restore_candidate!==r.key)?" \u2192 "+esc(r.restore_candidate):"") : "\u2013";
+      rt += "<tr><td>"+when+"</td><td>"+statusBadge(r.status)+"</td><td>"+(r.backend==null&&r.slot==null?"\u2013":(r.backend==null?"\u2013":r.backend)+" / "+(r.slot==null?"\u2013":r.slot))+"</td><td>"+fmtDur(r.duration_secs)+"</td><td>"+esc(r.model)+"</td><td>"+(r.key?esc(r.key):"\u2013")+"</td><td>"+rst+"</td><td>"+flags.join(" ")+"</td><td>"+toks+"</td><td>"+(r.ttft_ms!=null?Math.round(r.ttft_ms)+" ms":"\u2013")+"</td><td>"+(r.gen_tps!=null?r.gen_tps.toFixed(1):"\u2013")+"</td><td>"+cpu+"</td><td>"+diow+"</td><td>"+ram+"</td><td>"+(r.reason?esc(r.reason):"")+"</td></tr>";
     });
     rt += "</table>";
     $("recent").innerHTML = rt;
   }
-  $("foot").textContent = "filter "+rangeLabel()+(BE==null?"":(BE==="cached"?" \u00b7 cached results":(BE==="coalesced"?" \u00b7 coalesced followers":(BE==="coalesced_groups"?" \u00b7 coalesced groups":" \u00b7 backend "+BE))))+" \u00b7 buckets "+s.bucket_secs+" s \u00b7 poll "+d.refresh_ms+" ms";
+  // KV Cache tab: the per-key restore tally, sorted by the highest
+  // restored count (the server sends it pre-sorted; re-assert the order
+  // defensively). Lifetime — every distinct key restored since proxy
+  // start (bounded server-side to the top N by count).
+  {
+    const kv = (d.kv_cache||[]).slice().sort((a,b)=> (b.count-a.count) || (a.key<b.key?-1:(a.key>b.key?1:0)));
+    const ksum = $("kv-cache");
+    if(!kv.length){
+      ksum.innerHTML = '<div class="empty">no KV restores yet</div>';
+    } else {
+      const totalRestores = kv.reduce((s,r)=> s + r.count, 0);
+      let kt = "<table><tr><th>#</th><th>key</th><th>restored</th><th>created</th><th>last restored</th><th>backend</th><th>slot</th></tr>";
+      kv.forEach((r,i)=>{
+        const created = r.created_ts!=null ? new Date(r.created_ts*1000).toLocaleString() : "\u2013";
+        const last = r.last_ts!=null ? new Date(r.last_ts*1000).toLocaleString() : "\u2013";
+        kt += "<tr><td class=\"num\">"+(i+1)+"</td><td class=\"key\">"+esc(r.key)+"</td><td class=\"num\">"+fmtN(r.count)+"</td><td>"+created+"</td><td>"+last+"</td><td class=\"num\">"+(r.backend==null?"\u2013":r.backend)+"</td><td class=\"num\">"+(r.slot==null?"\u2013":r.slot)+"</td></tr>";
+      });
+      kt += "</table>";
+      ksum.innerHTML = "<div class=\"kvsum\">"+kv.length+" distinct key(s)\u00b7 restored "+fmtN(totalRestores)+" \u2192 all time</div>"+kt;
+    }
+  }
+  $("foot").textContent = "filter "+rangeLabel()+(BE==null?"":(BE=="cached"?" \u00b7 cached results":(BE=="coalesced"?" \u00b7 coalesced followers":(BE=="coalesced_groups"?" \u00b7 coalesced groups":" \u00b7 backend "+BE))))+" \u00b7 buckets "+s.bucket_secs+" s \u00b7 poll "+d.refresh_ms+" ms";
   $("live").textContent = "\u25cf live";
   $("live").className = "";
 }
@@ -2098,6 +2392,34 @@ $("backend").addEventListener("change", ()=>{
   poll();
 });
 ["chart-req","chart-tok","chart-cached","chart-cpu","chart-dr","chart-dw","chart-ram"].forEach(id=>attachChart($(id)));
+// The chart-style switch (bars / line) in the filter bar re-renders
+// every chart in the selected style (the per-chart hover state and
+// legend toggles are kept — they live on cv._chart).
+$("chartmode").addEventListener("click", e=>{
+  const b = e.target.closest("button[data-mode]");
+  if(!b || b.dataset.mode===CHART_MODE) return;
+  CHART_MODE = b.dataset.mode;
+  $("chartmode").querySelectorAll("button").forEach(btn=>btn.classList.toggle("on", btn===b));
+  ["chart-req","chart-tok","chart-cached","chart-cpu","chart-dr","chart-dw","chart-ram"].forEach(id=>redrawChart($(id)));
+});
+// The tabbed panel: clicking a tab shows its pane and hides the rest.
+// Re-drawing the General tab's charts on activation lets their canvases
+// pick up the now-correct width (a canvas in a hidden pane reports a
+// zero clientWidth, so a chart first drawn while hidden would be blank).
+document.querySelectorAll(".tabbtn").forEach(btn=>{
+  btn.addEventListener("click", ()=>{
+    const tab = btn.dataset.tab;
+    if(!tab) return;
+    document.querySelectorAll(".tabbtn").forEach(b=>b.classList.toggle("on", b===btn));
+    document.querySelectorAll(".tabpane").forEach(pane=>{
+      if(pane.id === "tab-"+tab) pane.removeAttribute("hidden");
+      else pane.setAttribute("hidden","");
+    });
+    if(tab==="general"){
+      ["chart-req","chart-tok","chart-cached","chart-cpu","chart-dr","chart-dw","chart-ram"].forEach(id=>redrawChart($(id)));
+    }
+  });
+});
 tick();
 </script>
 </body>
@@ -2720,6 +3042,13 @@ mod tests {
         let mut r2 = record(200);
         r2.ram_bytes = Some(150_000_000);
         r2.peak_ram_bytes = Some(400_000_000);
+        r2.backend = Some(0);
+        r2.slot = Some(1);
+        r2.restore_call = Some("ok");
+        // r2's restore candidate differs from its own key (a
+        // closest-prefix match covering 85.7% of the prompt)
+        r2.restore_candidate = Some("cd34ef56ab78ab12".to_string());
+        r2.lcp_ratio = Some(0.857);
         d.record_at(109.0, &r2).unwrap();
         let mut r3 = record(400);
         r3.ram_bytes = Some(120_000_000);
@@ -2733,6 +3062,18 @@ mod tests {
         assert_eq!(v["counters"]["cache_hits"], 0);
         assert_eq!(v["counters"]["restored"], 3);
         assert_eq!(v["counters"]["coalesced_followers"], 3);
+        // the per-key KV restore tally (the "KV Cache" tab): all three
+        // restored records share the test key, so it has a count of 3; the
+        // entry records the last restore's time — r3 (t=125) is the latest,
+        // so its (null) backend/slot win over r2's
+        let kv0 = v["kv_cache"].as_array().unwrap();
+        assert_eq!(kv0.len(), 1);
+        assert_eq!(kv0[0]["key"], "ab12cd34ef56ab78");
+        assert_eq!(kv0[0]["count"], 3);
+        assert_eq!(kv0[0]["created_ts"], 100);
+        assert_eq!(kv0[0]["last_ts"], 125);
+        assert!(kv0[0]["backend"].is_null());
+        assert!(kv0[0]["slot"].is_null());
         assert_eq!(v["counters"]["tokens"]["completion"], 150);
         assert_eq!(v["counters"]["avg_ttft_ms"], 120.0);
         // process resource metrics (the per-request deltas)
@@ -2767,6 +3108,22 @@ mod tests {
         assert_eq!(v["recent"][1]["disk_write_bytes"], 2048);
         assert_eq!(v["recent"][0]["ram_bytes"], 150_000_000);
         assert_eq!(v["recent"][1]["peak_ram_bytes"], 420_000_000);
+        // the recent ring carries the per-request backend index / slot
+        // (r2 ran on backend 0 slot 1; r3 never reached a backend)
+        assert_eq!(v["recent"][0]["backend"], 0);
+        assert_eq!(v["recent"][0]["slot"], 1);
+        assert!(v["recent"][1]["backend"].is_null());
+        assert!(v["recent"][1]["slot"].is_null());
+        // the recent ring carries the restore-call indicator (r2's restore
+        // API call succeeded; r3 never attempted a restore)
+        assert_eq!(v["recent"][0]["restore_call"], "ok");
+        assert!(v["recent"][1]["restore_call"].is_null());
+        // the recent ring carries the restore candidate + LCP ratio (r2
+        // restored a closest prefix under another key; r3 had none)
+        assert_eq!(v["recent"][0]["restore_candidate"], "cd34ef56ab78ab12");
+        assert!((v["recent"][0]["lcp_ratio"].as_f64().unwrap() - 0.857).abs() < 1e-9);
+        assert!(v["recent"][1]["restore_candidate"].is_null());
+        assert!(v["recent"][1]["lcp_ratio"].is_null());
         assert_eq!(v["series"]["buckets"].as_array().unwrap().len(), 2);
         assert_eq!(v["series"]["buckets"][0]["t"], 100);
         assert_eq!(v["series"]["buckets"][0]["reqs"], 2);
@@ -2783,6 +3140,72 @@ mod tests {
         // success_rate = 2/3
         let r = v["counters"]["success_rate"].as_f64().unwrap();
         assert!((r - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kv_cache_tab_tracks_per_key_restore_counts_sorted_and_bounded() {
+        let d = DashboardPlugin::new(params(json!({ "max_recent": 0 }))).unwrap();
+        // kA restored 3 times, kB once, kC twice.
+        for (key, n) in [("kA", 3), ("kB", 1), ("kC", 2)] {
+            for _ in 0..n {
+                let mut r = record(200);
+                r.key = Some(key.to_string());
+                d.record_now(&r).unwrap();
+            }
+        }
+        // A request that restored nothing must not enter the tally.
+        let mut r = record(200);
+        r.key = Some("kD".into());
+        r.restored = Some(false);
+        d.record_now(&r).unwrap();
+        // An empty key must not enter the tally.
+        let mut r = record(200);
+        r.key = Some(String::new());
+        r.restored = Some(true);
+        d.record_now(&r).unwrap();
+        let v = d.stats(&proxy(), Some(0), BackendScope::All);
+        let kv = v["kv_cache"].as_array().unwrap().to_vec();
+        // Sorted by the highest restored count: kA (3), kC (2), kB (1);
+        // kD (not restored) and the empty key are excluded.
+        assert_eq!(kv.len(), 3);
+        assert_eq!(kv[0]["key"], "kA");
+        assert_eq!(kv[0]["count"], 3);
+        assert_eq!(kv[1]["key"], "kC");
+        assert_eq!(kv[1]["count"], 2);
+        assert_eq!(kv[2]["key"], "kB");
+        assert_eq!(kv[2]["count"], 1);
+        // The tally is lifetime (present regardless of `since`).
+        assert_eq!(
+            d.stats(&proxy(), None, BackendScope::All)["kv_cache"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        // Bounded: bumping an existing key never evicts; a new key at the
+        // cap evicts a lowest-count key, and a higher-count key survives.
+        let mut e = Inner::default();
+        for i in 0..MAX_KV_KEYS {
+            e.touch_restore_count(format!("key-{i}"), 0, None, None); // each count 1
+        }
+        assert_eq!(e.restore_counts.len(), MAX_KV_KEYS);
+        e.touch_restore_count("key-0".to_string(), 5, Some(1), Some(2)); // existing -> bump to 2
+        assert_eq!(e.restore_counts.len(), MAX_KV_KEYS);
+        // an existing key's count bumps AND its last-restore fields update
+        assert_eq!(e.restore_counts.get("key-0").unwrap().count, 2);
+        assert_eq!(e.restore_counts.get("key-0").unwrap().last_ts, 5);
+        assert_eq!(e.restore_counts.get("key-0").unwrap().backend, Some(1));
+        assert_eq!(e.restore_counts.get("key-0").unwrap().slot, Some(2));
+        // a key's "created" time is its first-seen (first-restore) time and is
+        // NOT updated by later restores
+        assert_eq!(e.restore_counts.get("key-0").unwrap().created_ts, 0);
+        e.touch_restore_count("key-new".to_string(), 9, Some(0), Some(4)); // new -> evicts a count-1 key
+        assert_eq!(e.restore_counts.len(), MAX_KV_KEYS);
+        assert_eq!(e.restore_counts.get("key-new").unwrap().count, 1);
+        assert_eq!(e.restore_counts.get("key-0").unwrap().count, 2);
+        // a brand-new key records its creation time as the current `now`
+        assert_eq!(e.restore_counts.get("key-new").unwrap().created_ts, 9);
     }
 
     #[test]
@@ -2869,6 +3292,11 @@ mod tests {
         let mut r1 = record(200);
         r1.backend = Some(0);
         r1.ram_bytes = Some(100_000_000);
+        // The restore decision fields must survive the per-scope recent
+        // rings as well (not only the all-backends ring).
+        r1.restore_call = Some("ok");
+        r1.restore_candidate = Some("ab12cd34ef56ab78".into());
+        r1.lcp_ratio = Some(1.0);
         d.record_at(100.0, &r1).unwrap();
         let mut r2 = record(200);
         r2.backend = Some(1);
@@ -2892,6 +3320,10 @@ mod tests {
         assert_eq!(buckets[1]["reqs"], 1);
         assert_eq!(buckets[2]["reqs"], 1);
         assert_eq!(v["recent"].as_array().unwrap().len(), 4);
+        // the restore decision fields ride on the all-backends rows
+        assert_eq!(v["recent"][0]["restore_call"], "ok");
+        assert_eq!(v["recent"][0]["restore_candidate"], "ab12cd34ef56ab78");
+        assert_eq!(v["recent"][0]["lcp_ratio"], 1.0);
 
         // Backend 0: its records only — counters, series and recent.
         let v = d.stats(&proxy(), Some(0), BackendScope::Backend(0));
@@ -2915,6 +3347,11 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0]["backend"], 0);
         assert_eq!(recent[1]["backend"], 0);
+        // the backend-scoped ring keeps the restore decision fields too
+        // (regression: the filtered view must not drop the ratio/key)
+        assert_eq!(recent[0]["restore_call"], "ok");
+        assert_eq!(recent[0]["restore_candidate"], "ab12cd34ef56ab78");
+        assert_eq!(recent[0]["lcp_ratio"], 1.0);
 
         // Backend 1: its single record.
         let v = d.stats(&proxy(), Some(0), BackendScope::Backend(1));
@@ -3199,6 +3636,10 @@ mod tests {
         assert!(page.contains("<select id=\"backend\""));
         assert!(page.contains("<option value=\"\">all</option>"));
         assert!(page.contains("renderBackendSel(p);"));
+        // the tabbed panel: the KV Cache tab (the per-key restore tally)
+        assert!(page.contains("data-tab=\"kv\""));
+        assert!(page.contains("id=\"tab-kv\""));
+        assert!(page.contains("id=\"kv-cache\""));
         // inline favicon (prevents the browser's automatic /favicon.ico
         // request from surfacing as a 404 in the stats and request log)
         assert!(page.contains("<link rel=\"icon\" href=\"data:image/svg+xml"));
@@ -3247,16 +3688,19 @@ mod tests {
             "figure drawn for each (stride-selected, non-zero) bar or the hovered bar"
         );
         assert!(
-            page.contains("ctx.fillText(txt, lx, baseY-bh-4)"),
-            "figure above the bar"
+            page.contains(
+                "ctx.fillText(txt, lx, lineMode ? baseY-(v>0?(v/max)*maxH:0)-4 : baseY-bh-4)"
+            ),
+            "figure above the bar (or the line point in line mode)"
         );
         // the axis line under the throughput charts
         assert!(
             page.contains("ctx.moveTo(0,h-3.5); ctx.lineTo(w,h-3.5); ctx.stroke();"),
             "baseline under the bars"
         );
-        // the on-bar figures need headroom: the canvas is 132px tall (was 110)
-        assert!(page.contains("canvas { width:100%; height:132px; display:block; }"));
+        // the on-bar figures + the two-row legend need headroom: the canvas
+        // is 148px tall (was 132)
+        assert!(page.contains("canvas { width:100%; height:148px; display:block; }"));
         // hover highlight + tooltip wired to every chart canvas
         assert!(page.contains("function attachChart(cv)"));
         assert!(
@@ -3289,5 +3733,42 @@ mod tests {
             );
         }
         assert!(!res.contains("canvas id=\"chart-req\""));
+    }
+
+    #[test]
+    fn throughput_charts_support_bar_line_toggle() {
+        // The filter bar carries a bars/line chart-style switch that
+        // re-renders every chart: bar mode draws one bar per bucket,
+        // line mode a polyline through the per-bucket values (dots
+        // while sparse) with a dashed guide + ring on hover.
+        let d = DashboardPlugin::new(params(json!({}))).unwrap();
+        let page = d.html();
+        // the switch in the filter bar (bars selected by default)
+        assert!(page.contains("id=\"chartmode\""), "switch element");
+        assert!(page.contains("data-mode=\"bar\" class=\"on\""), "bars is the default");
+        assert!(page.contains("data-mode=\"line\""), "line option");
+        // the style state, defaulting to bars
+        assert!(page.contains("let CHART_MODE = \"bar\";"), "chart-style state");
+        // line-mode rendering in the shared chart renderer
+        assert!(
+            page.contains("const lineMode = CHART_MODE === \"line\";"),
+            "line-mode branch"
+        );
+        assert!(
+            page.contains("ctx.arc(x, y, 2, 0, Math.PI*2); ctx.fill();"),
+            "point dots in line mode"
+        );
+        assert!(
+            page.contains("ctx.setLineDash([3,3])"),
+            "dashed hover guide in line mode"
+        );
+        // the switch re-renders all seven charts in the new style
+        assert!(
+            page.contains("$(\"chartmode\").addEventListener(\"click\""),
+            "toggle handler wired"
+        );
+        // the switch styling
+        assert!(page.contains(".seg { display:inline-flex"), "switch styling");
+        assert!(page.contains(".seg button.on"), "active switch styling");
     }
 }
