@@ -29,7 +29,7 @@
 //! assert_eq!(prefilter.name(), "keyword");
 //! ```
 
-use crate::api::{Dashboard, LlamaBackend, Prefilter, RequestLogger};
+use crate::api::{Dashboard, LlamaBackend, PayloadLogger, Prefilter, RequestLogger};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -131,6 +131,16 @@ pub trait PluginFactory: Send + Sync {
         &self,
         params: &Value,
     ) -> Result<Option<Arc<dyn RequestLogger>>, PluginError> {
+        let _ = params;
+        Ok(None)
+    }
+
+    /// Build a request-payload logger, or `Ok(None)` when this plugin does
+    /// not provide one.
+    fn create_payload_logger(
+        &self,
+        params: &Value,
+    ) -> Result<Option<Arc<dyn PayloadLogger>>, PluginError> {
         let _ = params;
         Ok(None)
     }
@@ -264,6 +274,27 @@ impl Registry {
         factory.create_request_logger(&spec.params)
     }
 
+    /// Instantiate the spec's plugin as a request-payload logger.
+    ///
+    /// Returns `Ok(None)` when the plugin is registered but does not
+    /// provide a payload logger (a payload-logger spec mixed into a
+    /// prefilter list, or vice versa — the loaders skip such specs);
+    /// `Err(PluginError::UnknownPlugin)` when no plugin is registered
+    /// under the spec's name at all.
+    pub fn create_payload_logger(
+        &self,
+        spec: &PluginSpec,
+    ) -> Result<Option<Arc<dyn PayloadLogger>>, PluginError> {
+        let factory = self
+            .factories
+            .lock()
+            .expect("plugin registry poisoned")
+            .get(&spec.name)
+            .cloned()
+            .ok_or_else(|| PluginError::UnknownPlugin(spec.name.clone()))?;
+        factory.create_payload_logger(&spec.params)
+    }
+
     /// Instantiate the spec's plugin as a dashboard adapter.
     ///
     /// Returns `Ok(None)` when the plugin is registered but does not
@@ -368,6 +399,36 @@ pub fn load_request_loggers(
     Ok(logger)
 }
 
+/// Load the request-payload-logger plugin from `specs`: the first spec
+/// whose plugin provides a payload logger (zero specs of that kind →
+/// `Ok(None)` = payload logging disabled). Specs for other adapter kinds
+/// are skipped; an unknown plugin name is an error, as is a second
+/// payload-logger spec.
+pub fn load_payload_loggers(
+    registry: &Registry,
+    specs: &[PluginSpec],
+) -> Result<Option<Arc<dyn PayloadLogger>>, PluginError> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut logger: Option<Arc<dyn PayloadLogger>> = None;
+    for spec in specs {
+        // Specs for other adapter kinds (e.g. a prefilter) return None —
+        // skip.
+        let Some(l) = registry.create_payload_logger(spec)? else {
+            continue;
+        };
+        if logger.is_some() {
+            return Err(PluginError::BadParams {
+                name: spec.name.clone(),
+                message: "only one payload logger plugin is supported".to_string(),
+            });
+        }
+        logger = Some(l);
+    }
+    Ok(logger)
+}
+
 /// Load the dashboard plugin from `specs`: the first spec whose plugin
 /// provides a dashboard (zero specs of that kind → `Ok(None)` = the
 /// dashboard is disabled). Specs for other adapter kinds are skipped; an
@@ -420,6 +481,19 @@ mod tests {
         }
     }
 
+    fn payload_logger_of(
+        r: Result<Option<Arc<dyn PayloadLogger>>, PluginError>,
+    ) -> Option<Arc<dyn PayloadLogger>> {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("expected Ok: {e}"),
+        }
+    }
+
+    fn payload_spec(dir: &str) -> PluginSpec {
+        PluginSpec::new("payload_log", json!({ "dir": dir }))
+    }
+
     #[test]
     fn with_builtins_registers_all_builtin_plugins() {
         let reg = Registry::with_builtins();
@@ -430,6 +504,7 @@ mod tests {
                 "dashboard".to_string(),
                 "keyword".to_string(),
                 "llama".to_string(),
+                "payload_log".to_string(),
                 "qwen_guard".to_string(),
                 "request_log".to_string(),
                 "result_cache".to_string()
@@ -478,6 +553,50 @@ mod tests {
             Ok(_) => panic!("expected an error"),
         };
         assert!(matches!(err, PluginError::BadParams { .. }));
+    }
+
+    #[test]
+    fn load_payload_loggers_zero_one_many() {
+        let reg = Registry::with_builtins();
+        // zero specs -> no payload logger (the default)
+        assert!(payload_logger_of(load_payload_loggers(&reg, &[])).is_none());
+        // one spec -> that adapter; specs of other kinds are skipped
+        let specs = vec![
+            keyword_spec("a"),
+            payload_spec("/tmp/payloads"),
+            PluginSpec::new("request_log", json!({ "path": "req.log" })),
+        ];
+        let Some(l) = payload_logger_of(load_payload_loggers(&reg, &specs)) else {
+            panic!("expected a payload logger");
+        };
+        assert_eq!(l.name(), "payload_log");
+        // a known non-payload-logger plugin is skipped (no logger at all),
+        assert!(
+            payload_logger_of(load_payload_loggers(
+                &reg,
+                &[keyword_spec("a"), payload_spec("/tmp/payloads").clone()]
+            ))
+            .is_some()
+        );
+        assert!(payload_logger_of(load_payload_loggers(&reg, &[keyword_spec("a")])).is_none());
+        // a second payload-logger spec is an error,
+        let err = match load_payload_loggers(&reg, &[payload_spec("a"), payload_spec("b")]) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, PluginError::BadParams { .. }));
+        // an unknown plugin name is an error,
+        let err = match load_payload_loggers(
+            &reg,
+            &[PluginSpec {
+                name: "missing".to_string(),
+                params: Value::Object(Default::default()),
+            }],
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, PluginError::UnknownPlugin(_)));
     }
 
     #[test]

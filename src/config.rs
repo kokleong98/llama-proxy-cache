@@ -6,6 +6,14 @@
 //! - `LLAMA_URL` / `N_SLOTS`: fallback when `BACKENDS` is not set
 //!   (defaults `http://127.0.0.1:8000`, `1`).
 //! - `WORDS_PER_BLOCK` (100), `BIG_THRESHOLD_WORDS` (500), `LCP_TH` (0.1)
+//! - `SKIP_SAVE_ON_SELF_RESTORE` (`true`; when a big request successfully
+//!   restores its own key — the LCP candidate equals the request key — the
+//!   post-request `action=save` + meta write are skipped: a cold restore's
+//!   200 already proved the KV file's presence, and a warm "already
+//!   running" no-op restore skips the save while the key's meta file is
+//!   still on disk (a missing meta file makes the save re-write the pair,
+//!   healing it); a ratio-1.0 *prefix* match, i.e. a multi-turn extension,
+//!   is not a self-restore and still saves)
 //! - `META_DIR` (`kv_meta`, joined to the current working directory)
 //! - `META_MAX` (10; LRU bound on the number of meta files kept,
 //!   0 = unlimited)
@@ -77,6 +85,12 @@
 //!   `lpcache-cpu-ms`, `lpcache-disk-read-bytes`,
 //!   `lpcache-disk-write-bytes`, `lpcache-ram-bytes`,
 //!   `lpcache-peak-ram-bytes`; default: all of them)
+//! - `REQUEST_PAYLOAD_DIR` (optional; when set, each chat request's raw
+//!   payload is written to a unique file in this directory as it arrives
+//!   (before parsing, prefiltering or backend dispatch — malformed and
+//!   rejected requests are captured too; relative paths resolve against
+//!   the current working directory, the directory is created at startup)
+//!   — the built-in `payload_log` plugin)
 //! - `LOG_LEVEL` (`INFO`)
 //!
 //! Every variable can also be set with a command-line flag (see [`Cli`]);
@@ -93,6 +107,7 @@ pub const DEFAULT_N_SLOTS: usize = 1;
 pub const DEFAULT_WORDS_PER_BLOCK: usize = 100;
 pub const DEFAULT_BIG_THRESHOLD_WORDS: usize = 500;
 pub const DEFAULT_LCP_TH: f64 = 0.1;
+pub const DEFAULT_SKIP_SAVE_ON_SELF_RESTORE: bool = true;
 pub const DEFAULT_META_DIR: &str = "kv_meta";
 pub const DEFAULT_META_MAX: usize = 10;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: f64 = 600.0;
@@ -187,6 +202,13 @@ pub struct Config {
     pub words_per_block: usize,
     pub big_threshold_words: usize,
     pub lcp_th: f64,
+    /// `SKIP_SAVE_ON_SELF_RESTORE`: when true, a big request that
+    /// successfully restored its own key skips the post-request KV save +
+    /// meta write (a cold restore's 200 proved the file's presence; a warm
+    /// "already running" no-op restore skips while the key's meta file is
+    /// still on disk and heals it by saving when the meta is gone). See the
+    /// module docs for the exact condition.
+    pub skip_save_on_self_restore: bool,
     pub meta_dir: PathBuf,
     /// LRU bound on the number of meta files kept (0 = unlimited).
     pub meta_max: usize,
@@ -256,6 +278,12 @@ pub struct Config {
     /// `REQUEST_LOG_FIELDS`: ordered subset of XLF field names to emit
     /// (empty = all known fields).
     pub request_log_fields: Vec<String>,
+    /// `REQUEST_PAYLOAD_DIR`: when set, each chat request's raw payload
+    /// is written to a unique file in this directory as it arrives (the
+    /// built-in `payload_log` plugin; relative paths resolve against the
+    /// current working directory, the directory is created at startup).
+    /// `None` = payload logging disabled (the default).
+    pub request_payload_dir: Option<PathBuf>,
 }
 
 /// Command-line options, one-to-one with the environment variables above.
@@ -272,6 +300,8 @@ pub struct Cli {
     pub words_per_block: Option<String>,
     pub big_threshold_words: Option<String>,
     pub lcp_th: Option<String>,
+    /// Maps to `SKIP_SAVE_ON_SELF_RESTORE` (`true`/`false`, or `1`/`0`).
+    pub skip_save_on_self_restore: Option<String>,
     pub meta_dir: Option<String>,
     pub meta_max: Option<String>,
     pub slot_save_path: Option<String>,
@@ -316,6 +346,9 @@ pub struct Cli {
     pub request_log_keep: Option<String>,
     /// Maps to `REQUEST_LOG_FIELDS` (comma-separated field subset).
     pub request_log_fields: Option<String>,
+    /// Maps to `REQUEST_PAYLOAD_DIR` (the payload-log directory; unset =
+    /// payload logging disabled).
+    pub request_payload_dir: Option<String>,
 }
 
 impl Config {
@@ -336,6 +369,7 @@ impl Config {
             words_per_block,
             big_threshold_words,
             lcp_th,
+            skip_save_on_self_restore: DEFAULT_SKIP_SAVE_ON_SELF_RESTORE,
             meta_dir,
             meta_max: DEFAULT_META_MAX,
             slot_save_path: None,
@@ -359,6 +393,7 @@ impl Config {
             request_log_max_bytes: DEFAULT_REQUEST_LOG_MAX_BYTES,
             request_log_keep: DEFAULT_REQUEST_LOG_KEEP,
             request_log_fields: Vec::new(),
+            request_payload_dir: None,
         }
     }
 
@@ -372,6 +407,13 @@ impl Config {
     /// (`COALESCE_REQUESTS`).
     pub fn with_coalesce_requests(mut self, on: bool) -> Self {
         self.coalesce_requests = on;
+        self
+    }
+
+    /// Override the self-restore save-skip flag
+    /// (`SKIP_SAVE_ON_SELF_RESTORE`).
+    pub fn with_skip_save_on_self_restore(mut self, on: bool) -> Self {
+        self.skip_save_on_self_restore = on;
         self
     }
 
@@ -441,6 +483,13 @@ impl Config {
         self
     }
 
+    /// Enable the request payload log (`REQUEST_PAYLOAD_DIR`) with the
+    /// given directory; `None` disables it (the default).
+    pub fn with_request_payload_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.request_payload_dir = dir;
+        self
+    }
+
     /// The prefilter plugin specs to load from the `lpcache-plugins`
     /// registry, in evaluation order:
     /// - when `PLUGINS` is set, its JSON array is parsed and used as-is
@@ -453,7 +502,9 @@ impl Config {
     ///
     /// When `REQUEST_LOG` is enabled and the list does not already contain
     /// a `request_log` spec, one is appended (a spec in `PLUGINS` always
-    /// wins: its params are used as-is).
+    /// wins: its params are used as-is). When `REQUEST_PAYLOAD_DIR` is set
+    /// and the list does not already contain a `payload_log` spec, one is
+    /// appended the same way.
     ///
     /// An empty list means no prefilter and no request logging (the
     /// default). `Err` when `PLUGINS` is set but is not a JSON array of
@@ -494,6 +545,9 @@ impl Config {
         if self.request_log_enabled && !specs.iter().any(|s| s.name == "request_log") {
             specs.push(self.request_log_spec());
         }
+        if self.request_payload_dir.is_some() && !specs.iter().any(|s| s.name == "payload_log") {
+            specs.push(self.payload_log_spec());
+        }
         Ok(specs)
     }
 
@@ -511,6 +565,18 @@ impl Config {
             params["fields"] = serde_json::json!(self.request_log_fields);
         }
         PluginSpec::new("request_log", params)
+    }
+
+    /// The `payload_log` plugin spec synthesized from the
+    /// `REQUEST_PAYLOAD_DIR` setting (used by [`Config::plugin_specs`]
+    /// when `REQUEST_PAYLOAD_DIR` is set and `PLUGINS` has no
+    /// `payload_log` spec).
+    fn payload_log_spec(&self) -> lpcache_plugins::PluginSpec {
+        use lpcache_plugins::PluginSpec;
+        PluginSpec::new(
+            "payload_log",
+            serde_json::json!({ "dir": self.request_payload_dir.as_ref().expect("set").to_string_lossy() }),
+        )
     }
 
     /// `--slot-save-path` directories known to the proxy, used to remove
@@ -585,6 +651,11 @@ impl Config {
             words_per_block: env_int(vars, "WORDS_PER_BLOCK", DEFAULT_WORDS_PER_BLOCK),
             big_threshold_words: env_int(vars, "BIG_THRESHOLD_WORDS", DEFAULT_BIG_THRESHOLD_WORDS),
             lcp_th: env_float(vars, "LCP_TH", DEFAULT_LCP_TH),
+            skip_save_on_self_restore: env_bool(
+                vars,
+                "SKIP_SAVE_ON_SELF_RESTORE",
+                DEFAULT_SKIP_SAVE_ON_SELF_RESTORE,
+            ),
             meta_dir,
             meta_max: env_int(vars, "META_MAX", DEFAULT_META_MAX),
             slot_save_path,
@@ -660,6 +731,11 @@ impl Config {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
+            request_payload_dir: vars
+                .get("REQUEST_PAYLOAD_DIR")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
         }
     }
 
@@ -818,6 +894,7 @@ impl Cli {
                 "--words-per-block" => cli.words_per_block = Some(value),
                 "--big-threshold-words" => cli.big_threshold_words = Some(value),
                 "--lcp-th" => cli.lcp_th = Some(value),
+                "--skip-save-on-self-restore" => cli.skip_save_on_self_restore = Some(value),
                 "--meta-dir" => cli.meta_dir = Some(value),
                 "--meta-max" => cli.meta_max = Some(value),
                 "--slot-save-path" => cli.slot_save_path = Some(value),
@@ -841,6 +918,7 @@ impl Cli {
                 "--request-log-max-bytes" => cli.request_log_max_bytes = Some(value),
                 "--request-log-keep" => cli.request_log_keep = Some(value),
                 "--request-log-fields" => cli.request_log_fields = Some(value),
+                "--request-payload-dir" => cli.request_payload_dir = Some(value),
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -862,6 +940,7 @@ Options:
   --words-per-block <N>         WORDS_PER_BLOCK      words per hash block (default 100)
   --big-threshold-words <N>     BIG_THRESHOLD_WORDS  word count making a request "big" (default 500)
   --lcp-th <F>                  LCP_TH               min. shared-block ratio 0..1 to restore a cache (default 0.1)
+  --skip-save-on-self-restore <BOOL>  SKIP_SAVE_ON_SELF_RESTORE  skip the post-request KV save when the request successfully restored its own key (the file already holds that state; ratio-1.0 prefix matches still save) (default true)
   --meta-dir <PATH>             META_DIR             meta file dir (default ./kv_meta, relative to CWD)
   --meta-max <N>                META_MAX             max meta files kept; oldest pruned (default 10, 0 = unlimited)
   --slot-save-path <PATH>       SLOT_SAVE_PATH       backend --slot-save-path dir (single-backend fallback)
@@ -885,6 +964,7 @@ Options:
   --request-log-max-bytes <N>   REQUEST_LOG_MAX_BYTES rotation threshold in bytes; the file is rotated when exceeded (default 10 MiB, 0 = no rotation)
   --request-log-keep <N>        REQUEST_LOG_KEEP     rotated generations retained (default 5, 0 = keep all)
   --request-log-fields <LIST>   REQUEST_LOG_FIELDS   comma-separated ordered subset of XLF field names (default: all fields)
+  --request-payload-dir <PATH>  REQUEST_PAYLOAD_DIR  write each chat request's raw payload to a unique file in this directory as it arrives (relative paths resolve against the CWD, created at startup; default: disabled)
   -V, --version                 show version and exit
   -h, --help                    show this help and exit
 
@@ -919,6 +999,14 @@ Notes:
     retained); REQUEST_LOG_FIELDS selects an ordered subset of fields
     (defaults to all W3C + lpcache-* pipeline fields); a request_log spec
     in PLUGINS takes precedence over the REQUEST_LOG_* settings
+  * REQUEST_PAYLOAD_DIR enables the built-in payload_log plugin: each chat
+    request's raw payload is written to
+    {dir}/{seq:06}-{timestamp}-{key16}.json as it arrives (non-UTF-8
+    payloads use .bin, key16 = first 16 hex chars of the KV cache key or
+    "nokey") — before parsing, prefiltering or backend dispatch, so
+    malformed and rejected requests are captured too; relative paths
+    resolve against the CWD and the directory is created at startup; a
+    payload_log spec in PLUGINS takes precedence
   * the backend should be started with matching llama-server flags:
     -np/--parallel (N_SLOTS), --api-key (LLAMA_API_KEY) and a
     --slot-save-path directory (SLOT_SAVE_PATH)
@@ -938,6 +1026,7 @@ Notes:
             ("WORDS_PER_BLOCK", &self.words_per_block),
             ("BIG_THRESHOLD_WORDS", &self.big_threshold_words),
             ("LCP_TH", &self.lcp_th),
+            ("SKIP_SAVE_ON_SELF_RESTORE", &self.skip_save_on_self_restore),
             ("META_DIR", &self.meta_dir),
             ("META_MAX", &self.meta_max),
             ("SLOT_SAVE_PATH", &self.slot_save_path),
@@ -970,6 +1059,7 @@ Notes:
             ("REQUEST_LOG_MAX_BYTES", &self.request_log_max_bytes),
             ("REQUEST_LOG_KEEP", &self.request_log_keep),
             ("REQUEST_LOG_FIELDS", &self.request_log_fields),
+            ("REQUEST_PAYLOAD_DIR", &self.request_payload_dir),
         ];
         for (env_name, value) in opts {
             if let Some(v) = value {
@@ -1014,6 +1104,7 @@ mod tests {
         assert_eq!(c.words_per_block, 100);
         assert_eq!(c.big_threshold_words, 500);
         assert!((c.lcp_th - 0.1).abs() < f64::EPSILON);
+        assert!(c.skip_save_on_self_restore);
         assert_eq!(
             c.meta_dir.file_name().and_then(|f| f.to_str()),
             Some("kv_meta")
@@ -1032,6 +1123,7 @@ mod tests {
         assert_eq!(c.request_log_max_bytes, DEFAULT_REQUEST_LOG_MAX_BYTES);
         assert_eq!(c.request_log_keep, DEFAULT_REQUEST_LOG_KEEP);
         assert!(c.request_log_fields.is_empty());
+        assert!(c.request_payload_dir.is_none());
     }
 
     #[test]
@@ -1272,6 +1364,7 @@ mod tests {
             "--words-per-block",
             "--big-threshold-words",
             "--lcp-th",
+            "--skip-save-on-self-restore",
             "--meta-dir",
             "--meta-max",
             "--slot-save-path",
@@ -1302,6 +1395,7 @@ mod tests {
             "WORDS_PER_BLOCK",
             "BIG_THRESHOLD_WORDS",
             "LCP_TH",
+            "SKIP_SAVE_ON_SELF_RESTORE",
             "META_DIR",
             "META_MAX",
             "SLOT_SAVE_PATH",
@@ -1339,6 +1433,34 @@ mod tests {
         let cli = Cli::parse(vec!["--coalesce-requests".to_string(), "false".to_string()]).unwrap();
         let merged = cli.merged_env(&vars(&[("COALESCE_REQUESTS", "1")]));
         assert!(!Config::from_env_map(&merged).coalesce_requests);
+    }
+
+    #[test]
+    fn skip_save_on_self_restore_flag() {
+        // default on
+        assert!(Config::from_env_map(&HashMap::new()).skip_save_on_self_restore);
+        // env on / off
+        assert!(
+            Config::from_env_map(&vars(&[("SKIP_SAVE_ON_SELF_RESTORE", "true")]))
+                .skip_save_on_self_restore
+        );
+        assert!(
+            !Config::from_env_map(&vars(&[("SKIP_SAVE_ON_SELF_RESTORE", "0")]))
+                .skip_save_on_self_restore
+        );
+        // invalid -> default
+        assert!(
+            Config::from_env_map(&vars(&[("SKIP_SAVE_ON_SELF_RESTORE", "oops")]))
+                .skip_save_on_self_restore
+        );
+        // CLI wins over env
+        let cli = Cli::parse(vec![
+            "--skip-save-on-self-restore".to_string(),
+            "false".to_string(),
+        ])
+        .unwrap();
+        let merged = cli.merged_env(&vars(&[("SKIP_SAVE_ON_SELF_RESTORE", "1")]));
+        assert!(!Config::from_env_map(&merged).skip_save_on_self_restore);
     }
 
     #[test]
@@ -1498,6 +1620,91 @@ mod tests {
         assert_eq!(specs[1].name, "result_cache");
         assert_eq!(specs[1].params["dir"], "/var/rc");
         assert_eq!(specs[1].params["ttl_secs"], 60.0);
+    }
+
+    #[test]
+    fn request_payload_dir_env_and_spec() {
+        // default: disabled
+        assert!(
+            Config::from_env_map(&HashMap::new())
+                .request_payload_dir
+                .is_none()
+        );
+        // env value (surrounding whitespace trimmed)
+        let c = Config::from_env_map(&vars(&[("REQUEST_PAYLOAD_DIR", "/var/payloads  ")]));
+        assert_eq!(
+            c.request_payload_dir
+                .as_deref()
+                .map(|p| p.to_str().unwrap()),
+            Some("/var/payloads")
+        );
+        // blank = disabled
+        assert!(
+            Config::from_env_map(&vars(&[("REQUEST_PAYLOAD_DIR", "   ")]))
+                .request_payload_dir
+                .is_none()
+        );
+        // synthesized spec, appended after the request_log spec when both
+        // are enabled
+        let c = Config::from_env_map(&vars(&[
+            ("REQUEST_LOG", "true"),
+            ("REQUEST_PAYLOAD_DIR", "/var/payloads"),
+        ]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "request_log");
+        assert_eq!(specs[1].name, "payload_log");
+        assert_eq!(specs[1].params["dir"], "/var/payloads");
+        // an explicit PLUGINS entry wins for prefilter selection; the
+        // payload_log spec is still appended (as with request_log)
+        let c = Config::from_env_map(&vars(&[
+            (
+                "PLUGINS",
+                r#"[{"name":"keyword","params":{"keywords":["a"]}}]"#,
+            ),
+            ("REQUEST_PAYLOAD_DIR", "/var/payloads"),
+        ]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "keyword");
+        assert_eq!(specs[1].name, "payload_log");
+        assert_eq!(specs[1].params["dir"], "/var/payloads");
+        // a PLUGINS payload_log spec is kept as-is (its params win)
+        let c = Config::from_env_map(&vars(&[
+            (
+                "PLUGINS",
+                r#"[{"name":"payload_log","params":{"dir":"/other"}}]"#,
+            ),
+            ("REQUEST_PAYLOAD_DIR", "/var/payloads"),
+        ]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].params["dir"], "/other");
+    }
+
+    #[test]
+    fn request_payload_dir_cli() {
+        let cli = Cli::parse(vec![
+            "--request-payload-dir".to_string(),
+            "/var/payloads".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.merged_env(&HashMap::new())
+                .get("REQUEST_PAYLOAD_DIR")
+                .map(|s| s.as_str()),
+            Some("/var/payloads")
+        );
+        // `--flag=value` form
+        let cli = Cli::parse(vec!["--request-payload-dir=/var/payloads".to_string()]).unwrap();
+        assert_eq!(
+            cli.merged_env(&HashMap::new())
+                .get("REQUEST_PAYLOAD_DIR")
+                .map(|s| s.as_str()),
+            Some("/var/payloads")
+        );
+        // missing value is an error
+        assert!(Cli::parse(vec!["--request-payload-dir".to_string()]).is_err());
     }
 
     #[test]

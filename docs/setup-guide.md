@@ -170,6 +170,7 @@ listening on 0.0.0.0:8081
 | `WORDS_PER_BLOCK`     | `100`                      | words per hash block (must be stable — it is part of the restore filter) |
 | `BIG_THRESHOLD_WORDS` | `500`                      | requests above this word count are "big" (saved)    |
 | `LCP_TH`              | `0.1`                      | min. shared-block ratio (0..1) to restore a cache   |
+| `SKIP_SAVE_ON_SELF_RESTORE` | `true`             | skip the post-request KV save when the request successfully restored its own key (a cold restore's 200 proved the KV file's presence; a warm "already running" no-op restore skips while the key's meta file is still on disk, and re-saves to heal it when the meta is gone); a ratio-1.0 *prefix* match (multi-turn extension) is not a self-restore and still saves |
 | `META_DIR`            | `./kv_meta` (relative to CWD) | where `<key>.meta.json` files live — use an absolute path |
 | `META_MAX`            | `10`                        | max meta files kept; oldest are pruned (with their KV files) after each save — 0 disables pruning |
 | `SLOT_SAVE_PATH`      | —                            | the backend's `--slot-save-path` dir (single-backend fallback); where pruned KV files are removed from |
@@ -206,6 +207,7 @@ built-in defaults. `--help` prints the full list with defaults:
 | `--words-per-block <N>`       | `WORDS_PER_BLOCK`   |
 | `--big-threshold-words <N>`   | `BIG_THRESHOLD_WORDS` |
 | `--lcp-th <F>`                | `LCP_TH`            |
+| `--skip-save-on-self-restore <BOOL>` | `SKIP_SAVE_ON_SELF_RESTORE` |
 | `--meta-dir <PATH>`           | `META_DIR`          |
 | `--meta-max <N>`              | `META_MAX`          |
 | `--slot-save-path <PATH>`     | `SLOT_SAVE_PATH`    |
@@ -399,13 +401,18 @@ every `refresh_ms`
   the additive resource charts (CPU ms, disk read, disk write) also draw
   the window total next to the max in the top-left corner.
 - **Tables** (in the **Backends**, **Slots**, **Recent requests** and **KV Cache** tabs): per-backend status (URL, slots, busy slots, circuit
-  breaker state), per-slot occupancy grid, a per-key restore-count table
-  (each distinct restored key, sorted by the highest count — lifetime, so
-  not scoped by the filter), and the recent-requests ring
+  breaker state), per-slot occupancy grid, a per-key KV table
+  (each distinct restored or saved key with its restore count and the
+  cumulative duration in ms of the restore and save API calls made for
+  that key, sorted by the highest restore count — lifetime, so not scoped
+  by the filter), and the
+  recent-requests ring
   (`max_recent` per backend scope, default 100: status, backend / slot,
   model,
   stream, tokens, timing, per-request CPU, disk I/O and RAM, pipeline
-  outcome), filtered to the selected time range and backend scope.
+  outcome, plus the duration in ms of the request's KV-restore and
+  KV-save API calls when one was made), filtered to the selected time
+  range and backend scope.
 
 Every finished request (success, error, rejection, disconnect — the same
 records the request log gets) feeds the aggregates; the live

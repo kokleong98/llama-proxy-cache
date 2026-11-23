@@ -537,6 +537,8 @@ mod tests {
             slot: Some(3),
             restored: Some(true),
             restore_call: Some("ok"),
+            restore_ms: Some(123.4),
+            save_ms: Some(45.6),
             restore_candidate: Some("abcdef0123456789".to_string()),
             lcp_ratio: Some(1.0),
             cache_hit: Some(false),

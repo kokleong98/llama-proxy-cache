@@ -214,6 +214,20 @@ pub fn touch_meta(meta_dir: &Path, key: &str) {
     }
 }
 
+/// Whether `key`'s meta file currently exists on disk.
+///
+/// The file-health probe behind `SKIP_SAVE_ON_SELF_RESTORE`'s warm-restore
+/// rule: a no-op "already running" restore makes no backend call, so the KV
+/// file's presence is only trusted while the meta file still exists — a
+/// missing meta file makes the post-request save re-write the pair (heal).
+/// The KV file itself is not checked: it lives in the backend's
+/// `slot_save_path` dir, which the proxy may not even see, and a missing KV
+/// file self-heals one round later via the rejected-restore path
+/// (`remove_stale_meta` + re-save).
+pub fn meta_exists(meta_dir: &Path, key: &str) -> bool {
+    meta_dir.join(format!("{key}.meta.json")).is_file()
+}
+
 /// Bounded LRU pruning (deviation from Python, which never prunes).
 ///
 /// Removes the oldest `.meta.json` files until `META_DIR` holds at most
@@ -512,6 +526,19 @@ mod tests {
         // missing file -> warning only, no file created
         touch_meta(td.path(), "nope");
         assert!(!td.path().join("nope.meta.json").exists());
+    }
+
+    #[test]
+    fn meta_exists_reports_file_presence() {
+        let td = tempfile::tempdir().unwrap();
+        assert!(!meta_exists(td.path(), "k"), "nothing written yet");
+        write_meta(td.path(), "k", "p", &["b".into()], 100, "m").unwrap();
+        assert!(meta_exists(td.path(), "k"));
+        std::fs::remove_file(td.path().join("k.meta.json")).unwrap();
+        assert!(!meta_exists(td.path(), "k"), "file removed");
+        // a directory named like a meta file is not a meta file
+        std::fs::create_dir(td.path().join("d.meta.json")).unwrap();
+        assert!(!meta_exists(td.path(), "d"));
     }
 
     fn set_meta_ts(dir: &Path, key: &str, ts: f64) {

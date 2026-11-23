@@ -71,9 +71,27 @@ pub struct SlotGuard {
     /// attempted" (`restored == None`) and "skipped because the slot was
     /// already running the requested KV" (`restored == Some(Restored)`).
     pub restore_call: bool,
+    /// The total duration in ms of the backend's `action=restore` API
+    /// call — `Some` only when that call was actually made (`false` for
+    /// "no restore attempted" and for the skip where the slot was already
+    /// running the requested KV; those make no API call).
+    pub restore_ms: Option<f64>,
     /// Holds the slot lock until the guard is dropped / released.
     #[allow(dead_code)]
     permit: OwnedSemaphorePermit,
+}
+
+/// The outcome of [`SlotManager::save_after`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SaveOutcome {
+    /// `true` when the backend accepted the KV cache save (`false` when the
+    /// backend answered 500 — the call was made, the save just did not
+    /// land).
+    pub ok: bool,
+    /// The total duration in ms of the backend's `action=save` API calls —
+    /// the initial attempt plus any retries (the waits between attempts are
+    /// not included).
+    pub call_ms: f64,
 }
 
 impl SlotGuard {
@@ -565,6 +583,7 @@ impl SlotManager {
             slot: g,
             restored: None,
             restore_call: false,
+            restore_ms: None,
             permit,
         };
         if let Some(key) = restore_key {
@@ -580,11 +599,14 @@ impl SlotManager {
                 guard.restored = Some(RestoreOutcome::Restored);
             } else {
                 guard.restore_call = true;
+                let t0 = std::time::Instant::now();
                 let outcome = self.clients[g.be].restore_slot(g.slot, key).await;
+                guard.restore_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
                 tracing::info!(
-                    "restore_before_chat g={g} key={} ok={}",
+                    "restore_before_chat g={g} key={} ok={} restore_ms={}",
                     short(key),
-                    matches!(outcome, RestoreOutcome::Restored)
+                    matches!(outcome, RestoreOutcome::Restored),
+                    guard.restore_ms.unwrap_or(0.0)
                 );
                 match outcome {
                     RestoreOutcome::Restored => self.set_slot_kv_key(g, Some(key)),
@@ -604,17 +626,23 @@ impl SlotManager {
     /// Auto-retry (deviation from the Python original): a failed save —
     /// backend 500 (`Ok(false)`) or any other error (`Err`) — is retried up
     /// to `save_retries` times, waiting `save_retry_delay` between attempts.
-    /// The final outcome is returned unchanged: `Ok(false)` on a 500 after
-    /// all attempts, `Err` when every attempt errored (the caller maps that
-    /// to a 500, as in the Python app). The slot is marked used on any
-    /// `Ok` outcome (including `Ok(false)`), as before.
+    /// The final outcome is returned: `Ok(SaveOutcome)` on a 500 after all
+    /// attempts (`ok: false`), `Err` when every attempt errored (the caller
+    /// maps that to a 500, as in the Python app). The slot is marked used on
+    /// any `Ok` outcome (including `ok: false`), as before.
+    ///
+    /// `SaveOutcome::call_ms` is the total duration of the `action=save` API
+    /// calls (initial attempt + retries; the retry waits are excluded), so
+    /// the caller can report it in the request log.
     ///
     /// On a successful save the slot's KV cache is exactly `key`, so the
     /// per-slot tracking is updated to it (a later restore of the same key
     /// into this slot is then skipped); a failed save leaves the tracking
     /// untouched (the slot's KV is unchanged by a save attempt).
-    pub async fn save_after(&self, g: GSlot, key: &str) -> Result<bool, BackendError> {
+    pub async fn save_after(&self, g: GSlot, key: &str) -> Result<SaveOutcome, BackendError> {
+        let t0 = std::time::Instant::now();
         let mut last = self.clients[g.be].save_slot(g.slot, key).await;
+        let mut call_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let mut attempt = 0;
         while !matches!(&last, Ok(true)) && attempt < self.save_retries {
             attempt += 1;
@@ -630,21 +658,24 @@ impl SlotManager {
                 self.save_retry_delay.as_millis()
             );
             tokio::time::sleep(self.save_retry_delay).await;
+            let t0 = std::time::Instant::now();
             last = self.clients[g.be].save_slot(g.slot, key).await;
+            call_ms += t0.elapsed().as_secs_f64() * 1000.0;
         }
-        match &last {
+        match last {
             Ok(true) => {
                 self.last_used[self.idx(g)].store(now_nanos(), Ordering::SeqCst);
                 self.set_slot_kv_key(g, Some(key));
+                Ok(SaveOutcome { ok: true, call_ms })
             }
             Ok(false) => {
                 // backend 500: the slot is marked used as before, but the KV
                 // save did not land — the tracking stays as it was
                 self.last_used[self.idx(g)].store(now_nanos(), Ordering::SeqCst);
+                Ok(SaveOutcome { ok: false, call_ms })
             }
-            Err(_) => {}
+            Err(e) => Err(e),
         }
-        last
     }
 
     /// Release a held slot (port of `release`).
@@ -940,10 +971,13 @@ mod tests {
         let g = sm.acquire(Some("key-abcdef0123456789")).await.unwrap();
         assert_eq!(g.restored, Some(RestoreOutcome::Restored));
         assert!(g.restore_call, "the restore API call was made");
+        // the call's duration is timed and reported (a non-negative number)
+        assert!(g.restore_ms.is_some() && g.restore_ms.unwrap() >= 0.0);
         sm.release(g);
         let g = sm.acquire(None).await.unwrap();
         assert_eq!(g.restored, None);
         assert!(!g.restore_call, "no restore attempted, no call");
+        assert!(g.restore_ms.is_none(), "no call -> no duration");
         sm.release(g);
 
         let c = &raw[0];
@@ -959,6 +993,10 @@ mod tests {
         let g = sm.acquire(Some("k2")).await.unwrap();
         assert_eq!(g.restored, Some(RestoreOutcome::Failed));
         assert!(g.restore_call, "the failing call was made");
+        assert!(
+            g.restore_ms.is_some(),
+            "the failing call's duration is timed"
+        );
         sm.release(g);
     }
 
@@ -970,6 +1008,10 @@ mod tests {
         assert_eq!(g.slot, GSlot { be: 0, slot: 0 });
         assert_eq!(g.restored, Some(RestoreOutcome::Restored));
         assert!(g.restore_call, "first time: the API call was made");
+        assert!(
+            g.restore_ms.is_some(),
+            "first time: the call's duration is timed"
+        );
         sm.release(g);
         // second acquire, same key: the slot is already running k1 (the
         // successful restore recorded it) -> no second backend call, but the
@@ -978,6 +1020,10 @@ mod tests {
         assert_eq!(g.slot, GSlot { be: 0, slot: 0 });
         assert_eq!(g.restored, Some(RestoreOutcome::Restored));
         assert!(!g.restore_call, "already running: no second API call");
+        assert!(
+            g.restore_ms.is_none(),
+            "already running: no call -> no duration"
+        );
         sm.release(g);
         assert_eq!(
             *raw[0].restores.lock().await,
@@ -987,6 +1033,10 @@ mod tests {
         let g = sm.acquire(Some("k2")).await.unwrap();
         assert_eq!(g.restored, Some(RestoreOutcome::Restored));
         assert!(g.restore_call, "a different key still calls the backend");
+        assert!(
+            g.restore_ms.is_some(),
+            "a different key: the call's duration is timed"
+        );
         sm.release(g);
         assert_eq!(
             *raw[0].restores.lock().await,
@@ -998,7 +1048,9 @@ mod tests {
     async fn save_updates_last_kv_tracking() {
         let (sm, raw) = make(1, 1);
         // a successful save leaves the slot running exactly `key`
-        assert!(sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap());
+        let out = sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap();
+        assert!(out.ok);
+        assert!(out.call_ms >= 0.0);
         assert_eq!(
             sm.last_kv_for_test(GSlot { be: 0, slot: 0 }),
             Some("k1".to_string())
@@ -1105,7 +1157,10 @@ mod tests {
     #[tokio::test]
     async fn save_after_saves_and_marks_used() {
         let (sm, raw) = make(1, 2);
-        assert!(sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap());
+        let out = sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap();
+        assert!(out.ok);
+        // the save API call duration is reported (a single attempt here)
+        assert!(out.call_ms >= 0.0);
         let saves = raw[0].saves.lock().await.clone();
         assert_eq!(saves, vec![(0usize, "k1".to_string())]);
         // slot 0 now used -> next free pick is slot 1
@@ -1120,7 +1175,12 @@ mod tests {
         raw[0]
             .save_mode
             .store(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(!sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap());
+        assert!(
+            !sm.save_after(GSlot { be: 0, slot: 0 }, "k1")
+                .await
+                .unwrap()
+                .ok
+        );
         let g = sm.acquire(None).await.unwrap();
         assert_eq!(g.slot, GSlot { be: 0, slot: 1 });
         sm.release(g);
@@ -1146,7 +1206,11 @@ mod tests {
         raw[0]
             .save_fail_first_n
             .store(2, std::sync::atomic::Ordering::SeqCst);
-        assert!(sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap());
+        // 2 failed attempts + 1 successful attempt: the reported duration
+        // covers all three API calls
+        let out = sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap();
+        assert!(out.ok);
+        assert!(out.call_ms >= 0.0);
         // 2 failed attempts + 1 successful attempt
         let saves = raw[0].saves.lock().await.clone();
         assert_eq!(
@@ -1184,7 +1248,11 @@ mod tests {
         raw[0]
             .save_mode
             .store(1, std::sync::atomic::Ordering::SeqCst); // always Ok(false)
-        assert!(!sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap());
+        // all attempts (initial + retries) 500'd: the duration is the sum
+        // over every API call that was made
+        let out = sm.save_after(GSlot { be: 0, slot: 0 }, "k1").await.unwrap();
+        assert!(!out.ok);
+        assert!(out.call_ms >= 0.0);
         assert_eq!(raw[0].saves.lock().await.len(), 1 + DEFAULT_SAVE_RETRIES);
         // a failed (500) save still marks the slot used
         let g = sm.acquire(None).await.unwrap();

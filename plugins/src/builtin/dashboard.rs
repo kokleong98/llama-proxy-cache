@@ -58,7 +58,9 @@
 //! - **recent requests** — a ring buffer of the last `max_recent`
 //!   finished requests (status, backend index, duration, key, the LCP
 //!   ratio of the best restore candidate — with the candidate key when it
-//!   differs from the request's own key — flags, tokens, timings); each
+//!   differs from the request's own key — the total duration of the
+//!   request's KV-cache restore API call when one was made, flags,
+//!   tokens, timings); each
 //!   backend scope (all backends, each backend
 //!   index, the `cached` scope, the `coalesced` scope and the
 //!   `coalesced_groups` scope) keeps its own ring, so selecting a
@@ -75,9 +77,13 @@
 //! window total next to the max); the remaining tabs hold the backend table, the
 //! per-backend slot occupancy grid (each backend's slots grouped under
 //! its label), the recent-requests table (with the backend index and slot
-//! of each request) and the KV-cache table (each distinct restored request
-//! key with its lifetime restore count, its created time, the last-restore
-//! time, and the backend/slot that served it, sorted by the highest count). A
+//! of each request and the duration of its KV-cache restore API call when
+//! one was made) and the KV-cache table (each distinct restored request
+//! key with its lifetime restore count — and how many of those restores
+//! were warm, i.e. the picked slot already ran the KV, so the restore API
+//! call was skipped — the total duration of the restore API calls for the
+//! key, its created time, the last-restore time, and the backend/slot that
+//! served it, sorted by the highest count). A
 //! time-filter dropdown, grouped into presets (30 seconds, 1 minute, 5
 //! minutes, 15 minutes) and other (custom time, or all time), and a
 //! backend-filter dropdown (default: all backends — no filtering; an
@@ -133,28 +139,49 @@ pub const MAX_BUCKETS: usize = 50_000;
 /// longer ranges are coarsened (merged into a multiple of `bucket_secs`)
 /// down to this many points, keeping the payload small.
 pub const MAX_SERIES_POINTS: usize = 360;
-/// Hard cap on the distinct restored keys retained in the per-key KV
-/// restore tally (the "KV Cache" tab): on overflow the lowest-count key
-/// is dropped, so the most-restored keys are always shown.
+/// Hard cap on the distinct keys retained in the per-key KV tally (the
+/// "KV Cache" tab): on overflow the lowest-count key is dropped, so the
+/// most-restored keys are always shown (never-restored, save-only keys go
+/// first).
 pub const MAX_KV_KEYS: usize = 512;
 
 /// Per-key state for the "KV Cache" tab: how many times the key was served
-/// via a successful KV restore (lifetime), the backend/slot that served the
-/// most recent restore, and when the key first appeared in the tally (its
-/// first successful restore — the "created" time) and was most recently
-/// restored (unix seconds).
+/// via a successful KV restore (lifetime), how many of those were warm
+/// (the picked slot already ran the KV, so the backend's `action=restore`
+/// call was skipped), the total duration of the
+/// backend's `action=restore` API calls for the key (lifetime — the
+/// requests that skipped the call, because the slot was already running
+/// the KV, contribute nothing), the total duration of the backend's
+/// `action=save` API calls for the key (lifetime), the backend/slot that
+/// served the most recent restore or save, and when the key first appeared
+/// in the tally (its first restore or save — the "created" time) and was
+/// most recently restored or saved (unix seconds). A key enters the tally
+/// on its first successful restore *or* its first completed KV save (a
+/// save-only key has a restore count of 0).
 #[derive(Debug, Clone, Copy)]
 pub struct KvEntry {
     /// Lifetime count of successful KV restores for this key.
     pub count: u64,
+    /// Lifetime count of this key's successful restores that skipped the
+    /// backend's `action=restore` call because the picked slot was already
+    /// running the KV (the "warm" restores; `count` minus this is the cold
+    /// count).
+    pub warm: u64,
+    /// Lifetime total duration in ms of the backend's `action=restore`
+    /// API calls for this key (skipped restores — no API call — add 0).
+    pub restore_ms_total: f64,
+    /// Lifetime total duration in ms of the backend's `action=save` API
+    /// calls for this key (0 when the key was never saved, or every save
+    /// attempt errored).
+    pub save_ms_total: f64,
     /// Unix seconds when this key first appeared in the tally (its first
-    /// successful restore) — the "created" time shown on the KV Cache tab.
+    /// restore or save) — the "created" time shown on the KV Cache tab.
     pub created_ts: u64,
-    /// Unix seconds of the most recent successful restore of this key.
+    /// Unix seconds of the most recent restore or save of this key.
     pub last_ts: u64,
-    /// The backend index that served the most recent restore.
+    /// The backend index that served the most recent restore or save.
     pub backend: Option<usize>,
-    /// The slot that served the most recent restore.
+    /// The slot that served the most recent restore or save.
     pub slot: Option<usize>,
 }
 
@@ -620,6 +647,19 @@ pub struct RecentRow {
     /// `restore_candidate` is).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lcp_ratio: Option<f64>,
+    /// `lpcache-restore-ms` for this request: the total duration in ms of
+    /// the backend's `action=restore` API call (present only when that
+    /// call was actually made — absent for `skipped` restores and when no
+    /// restore was attempted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_ms: Option<f64>,
+    /// `lpcache-save-ms` for this request: the total duration in ms of the
+    /// backend's `action=save` API calls (present when a KV cache save
+    /// completed — a big request on a `kv_cache`-enabled backend — even
+    /// if the backend rejected the save with a 500; absent when no save
+    /// was attempted or every save attempt errored).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_ms: Option<f64>,
     /// The prefilter served the request from its result cache.
     pub cache_hit: bool,
     /// The request joined a coalesced group as a follower.
@@ -1066,9 +1106,11 @@ pub struct Inner {
     /// evicted by traffic on other backends.
     pub recent_by_be: Vec<Vec<RecentRow>>,
     /// Lifetime per-key KV restore tally: each distinct restored request
-    /// key → how many times it was served via a successful KV restore, when
-    /// it was first seen (created), the backend/slot that served the most
-    /// recent restore, and its time.
+    /// key → how many times it was served via a successful KV restore
+    /// (and how many of those were warm — the picked slot already ran the
+    /// KV, so the restore API call was skipped), the total duration of
+    /// the restore API calls for the key, when it was first seen (created),
+    /// the backend/slot that served the most recent restore, and its time.
     /// Backs the "KV Cache" tab (sorted by the highest restored count).
     /// Bounded to [`MAX_KV_KEYS`] distinct keys — on overflow the
     /// lowest-count key is dropped, so the top-restored keys survive. Not
@@ -1090,13 +1132,27 @@ impl Inner {
         max_recent: usize,
     ) {
         self.counters.add(record);
-        // The per-key KV restore tally (the "KV Cache" tab): count a
-        // restored request under its own KV cache key.
-        if record.restored == Some(true)
-            && let Some(key) = record.key.as_deref()
-            && !key.is_empty()
+        // The per-key KV tally (the "KV Cache" tab): a restored request
+        // bumps its key's restore count (a successful skipped call — the
+        // slot already ran the KV — also bumps the key's warm count, and
+        // the request's restore API call duration is added to the key's
+        // total); a request that completed a KV cache save adds its save
+        // API call duration to the key's save total. Both can happen on
+        // the same request, and a key enters the tally on its first
+        // restore or save.
+        if (record.restored == Some(true) || record.save_ms.is_some())
+            && let Some(key) = record.key.as_deref().filter(|k| !k.is_empty())
         {
-            self.touch_restore_count(key.to_string(), now, record.backend, record.slot);
+            self.touch_kv(
+                key.to_string(),
+                now,
+                record.backend,
+                record.slot,
+                record.restored == Some(true),
+                record.restore_call,
+                record.restore_ms,
+                record.save_ms,
+            );
         }
         if let Some(be) = record.backend {
             if be >= self.by_be.len() {
@@ -1142,6 +1198,8 @@ impl Inner {
                 restore_call: record.restore_call.map(|s| s.to_string()),
                 restore_candidate: record.restore_candidate.clone(),
                 lcp_ratio: record.lcp_ratio,
+                restore_ms: record.restore_ms,
+                save_ms: record.save_ms,
                 cache_hit: record.cache_hit == Some(true),
                 coalesced: record.coalesced == Some("follower"),
                 reason: record.reason.clone(),
@@ -1178,26 +1236,45 @@ impl Inner {
         }
     }
 
-    /// Record one successful restore of `key` at `now` (unix seconds),
-    /// served by `backend`/`slot`, keeping the map bounded to
-    /// [`MAX_KV_KEYS`] distinct keys: an existing key's count is bumped and
-    /// its last-restore fields updated (its first-seen "created" time is
-    /// kept); a new key records `now` as its creation time and, when the cap
-    /// is reached, first evicts the lowest-count key (so the most-restored
-    /// keys survive).
-    fn touch_restore_count(
+    /// Record one KV cache activity event for `key` at `now` (unix
+    /// seconds), served by `backend`/`slot`, keeping the map bounded to
+    /// [`MAX_KV_KEYS`] distinct keys: a restored request (`restored`)
+    /// bumps the key's restore count, the key's restore-API-call duration
+    /// total grows by `restore_ms` (0 when no call was made) and its
+    /// save-API-call duration total grows by `save_ms` (0 when no save
+    /// completed); its last-activity fields are updated (its first-seen
+    /// "created" time is kept); a new key records `now` as its creation
+    /// time (a save-only key starts with a restore count of 0) and, when
+    /// the cap is reached, first evicts the lowest-count key (so the
+    /// most-restored keys survive).
+    #[allow(clippy::too_many_arguments)]
+    fn touch_kv(
         &mut self,
         key: String,
         now: u64,
         backend: Option<usize>,
         slot: Option<usize>,
+        restored: bool,
+        restore_call: Option<&'static str>,
+        restore_ms: Option<f64>,
+        save_ms: Option<f64>,
     ) {
+        let restore_ms = restore_ms.unwrap_or(0.0);
+        let save_ms = save_ms.unwrap_or(0.0);
+        // A successful restore that skipped the backend call (the slot was
+        // already running the KV) is a "warm" restore.
+        let warm = (restored && restore_call == Some("skipped")) as u64;
         match self.restore_counts.get_mut(&key) {
             Some(e) => {
-                e.count += 1;
+                if restored {
+                    e.count += 1;
+                }
+                e.warm += warm;
                 e.last_ts = now;
                 e.backend = backend;
                 e.slot = slot;
+                e.restore_ms_total += restore_ms;
+                e.save_ms_total += save_ms;
             }
             None => {
                 if self.restore_counts.len() >= MAX_KV_KEYS
@@ -1212,7 +1289,10 @@ impl Inner {
                 self.restore_counts.insert(
                     key,
                     KvEntry {
-                        count: 1,
+                        count: restored as u64,
+                        warm,
+                        restore_ms_total: restore_ms,
+                        save_ms_total: save_ms,
                         created_ts: now,
                         last_ts: now,
                         backend,
@@ -1503,8 +1583,11 @@ impl DashboardPlugin {
             BackendScope::All => &inner.recent,
         };
         payload["recent"] = serde_json::to_value(recent).unwrap_or(Value::Null);
-        // The per-key KV restore tally (the "KV Cache" tab): each distinct
-        // restored request key with how often it was restored, sorted by
+        // The per-key KV tally (the "KV Cache" tab): each distinct key
+        // with a successful restore or a completed KV save, with how often
+        // it was restored (and how many of those restores were warm — the
+        // slot already ran the KV, so the restore API call was skipped)
+        // and the totals of its restore/save API call durations, sorted by
         // the highest restored count (ties broken by key for a stable
         // order). Lifetime — not scoped by `since`/`scope`, since the KV
         // cache is a live state like the meta files.
@@ -1516,6 +1599,9 @@ impl DashboardPlugin {
                 json!({
                     "key": k,
                     "count": e.count,
+                    "warm": e.warm,
+                    "restore_ms": e.restore_ms_total,
+                    "save_ms": e.save_ms_total,
                     "created_ts": e.created_ts,
                     "last_ts": e.last_ts,
                     "backend": e.backend,
@@ -2301,7 +2387,7 @@ function render(d){
   if(ranged) rows = rows.filter(r=>r.ts >= (d.range.since==null ? 0 : d.range.since));
   if(!rows.length){ $("recent").innerHTML = '<div class="empty">no finished requests yet</div>'; }
   else {
-    let rt = "<table><tr><th>time</th><th>status</th><th>backend / slot</th><th>duration</th><th>model</th><th>key</th><th>restore</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w (MB)</th><th>ram (MB)</th><th>note</th></tr>";
+    let rt = "<table><tr><th>time</th><th>status</th><th>backend / slot</th><th>duration</th><th>model</th><th>key</th><th>restore</th><th>restore ms</th><th>save ms</th><th>flags</th><th>tokens (prompt/compl/cached)</th><th>ttft</th><th>gen tps</th><th>cpu</th><th>disk r/w (MB)</th><th>ram (MB)</th><th>note</th></tr>";
     rows.forEach(r=>{
       const flags = [];
       if(r.cache_hit) flags.push('<span class="badge b-acc">cache</span>');
@@ -2320,15 +2406,21 @@ function render(d){
       // the candidate key when it differs from the request key (a
       // closest-prefix match; an exact-key repeat shows the ratio only).
       const rst = r.lcp_ratio!=null ? r.lcp_ratio.toFixed(3)+((r.restore_candidate && r.restore_candidate!==r.key)?" \u2192 "+esc(r.restore_candidate):"") : "\u2013";
-      rt += "<tr><td>"+when+"</td><td>"+statusBadge(r.status)+"</td><td>"+(r.backend==null&&r.slot==null?"\u2013":(r.backend==null?"\u2013":r.backend)+" / "+(r.slot==null?"\u2013":r.slot))+"</td><td>"+fmtDur(r.duration_secs)+"</td><td>"+esc(r.model)+"</td><td>"+(r.key?esc(r.key):"\u2013")+"</td><td>"+rst+"</td><td>"+flags.join(" ")+"</td><td>"+toks+"</td><td>"+(r.ttft_ms!=null?Math.round(r.ttft_ms)+" ms":"\u2013")+"</td><td>"+(r.gen_tps!=null?r.gen_tps.toFixed(1):"\u2013")+"</td><td>"+cpu+"</td><td>"+diow+"</td><td>"+ram+"</td><td>"+(r.reason?esc(r.reason):"")+"</td></tr>";
+      // restore API call duration (ms) — \u2013 when no backend
+      // action=restore call was made (skipped / no restore).
+      const rsm = fmtMs(r.restore_ms);
+      // KV cache save API call duration (ms) — \u2013 when no save
+      // was attempted (small request / kv_cache disabled / no save).
+      const svms = fmtMs(r.save_ms);
+      rt += "<tr><td>"+when+"</td><td>"+statusBadge(r.status)+"</td><td>"+(r.backend==null&&r.slot==null?"\u2013":(r.backend==null?"\u2013":r.backend)+" / "+(r.slot==null?"\u2013":r.slot))+"</td><td>"+fmtDur(r.duration_secs)+"</td><td>"+esc(r.model)+"</td><td>"+(r.key?esc(r.key):"\u2013")+"</td><td>"+rst+"</td><td>"+rsm+"</td><td>"+svms+"</td><td>"+flags.join(" ")+"</td><td>"+toks+"</td><td>"+(r.ttft_ms!=null?Math.round(r.ttft_ms)+" ms":"\u2013")+"</td><td>"+(r.gen_tps!=null?r.gen_tps.toFixed(1):"\u2013")+"</td><td>"+cpu+"</td><td>"+diow+"</td><td>"+ram+"</td><td>"+(r.reason?esc(r.reason):"")+"</td></tr>";
     });
     rt += "</table>";
     $("recent").innerHTML = rt;
   }
-  // KV Cache tab: the per-key restore tally, sorted by the highest
+  // KV Cache tab: the per-key KV tally, sorted by the highest
   // restored count (the server sends it pre-sorted; re-assert the order
-  // defensively). Lifetime — every distinct key restored since proxy
-  // start (bounded server-side to the top N by count).
+  // defensively). Lifetime — every distinct key restored or saved since
+  // proxy start (bounded server-side to the top N by count).
   {
     const kv = (d.kv_cache||[]).slice().sort((a,b)=> (b.count-a.count) || (a.key<b.key?-1:(a.key>b.key?1:0)));
     const ksum = $("kv-cache");
@@ -2336,14 +2428,17 @@ function render(d){
       ksum.innerHTML = '<div class="empty">no KV restores yet</div>';
     } else {
       const totalRestores = kv.reduce((s,r)=> s + r.count, 0);
-      let kt = "<table><tr><th>#</th><th>key</th><th>restored</th><th>created</th><th>last restored</th><th>backend</th><th>slot</th></tr>";
+      const totalWarm = kv.reduce((s,r)=> s + (r.warm||0), 0);
+      const totalRestoreMs = kv.reduce((s,r)=> s + (r.restore_ms||0), 0);
+      const totalSaveMs = kv.reduce((s,r)=> s + (r.save_ms||0), 0);
+      let kt = "<table><tr><th>#</th><th>key</th><th>restored</th><th>warm</th><th>restore total (ms)</th><th>save total (ms)</th><th>created</th><th>last active</th><th>backend</th><th>slot</th></tr>";
       kv.forEach((r,i)=>{
         const created = r.created_ts!=null ? new Date(r.created_ts*1000).toLocaleString() : "\u2013";
         const last = r.last_ts!=null ? new Date(r.last_ts*1000).toLocaleString() : "\u2013";
-        kt += "<tr><td class=\"num\">"+(i+1)+"</td><td class=\"key\">"+esc(r.key)+"</td><td class=\"num\">"+fmtN(r.count)+"</td><td>"+created+"</td><td>"+last+"</td><td class=\"num\">"+(r.backend==null?"\u2013":r.backend)+"</td><td class=\"num\">"+(r.slot==null?"\u2013":r.slot)+"</td></tr>";
+        kt += "<tr><td class=\"num\">"+(i+1)+"</td><td class=\"key\">"+esc(r.key)+"</td><td class=\"num\">"+fmtN(r.count)+"</td><td class=\"num\">"+fmtN(r.warm||0)+"</td><td class=\"num\">"+fmtMs(r.restore_ms)+"</td><td class=\"num\">"+fmtMs(r.save_ms)+"</td><td>"+created+"</td><td>"+last+"</td><td class=\"num\">"+(r.backend==null?"\u2013":r.backend)+"</td><td class=\"num\">"+(r.slot==null?"\u2013":r.slot)+"</td></tr>";
       });
       kt += "</table>";
-      ksum.innerHTML = "<div class=\"kvsum\">"+kv.length+" distinct key(s)\u00b7 restored "+fmtN(totalRestores)+" \u2192 all time</div>"+kt;
+      ksum.innerHTML = "<div class=\"kvsum\">"+kv.length+" distinct key(s)\u00b7 restored "+fmtN(totalRestores)+" (warm "+fmtN(totalWarm)+")\u00b7 restore API total "+fmtMs(totalRestoreMs)+"\u00b7 save API total "+fmtMs(totalSaveMs)+" \u2192 all time</div>"+kt;
     }
   }
   $("foot").textContent = "filter "+rangeLabel()+(BE==null?"":(BE=="cached"?" \u00b7 cached results":(BE=="coalesced"?" \u00b7 coalesced followers":(BE=="coalesced_groups"?" \u00b7 coalesced groups":" \u00b7 backend "+BE))))+" \u00b7 buckets "+s.bucket_secs+" s \u00b7 poll "+d.refresh_ms+" ms";
@@ -3045,6 +3140,11 @@ mod tests {
         r2.backend = Some(0);
         r2.slot = Some(1);
         r2.restore_call = Some("ok");
+        // the restore decision made the backend's action=restore call
+        r2.restore_ms = Some(123.4);
+        // r2 also completed a KV cache save (its action=save call took
+        // 45.6 ms)
+        r2.save_ms = Some(45.6);
         // r2's restore candidate differs from its own key (a
         // closest-prefix match covering 85.7% of the prompt)
         r2.restore_candidate = Some("cd34ef56ab78ab12".to_string());
@@ -3070,6 +3170,11 @@ mod tests {
         assert_eq!(kv0.len(), 1);
         assert_eq!(kv0[0]["key"], "ab12cd34ef56ab78");
         assert_eq!(kv0[0]["count"], 3);
+        // the key's restore API call total sums the calls that were
+        // actually made (only r2's — r1/r3 attempted no restore)
+        assert_eq!(kv0[0]["restore_ms"], 123.4);
+        // the key's save API call total (only r2 completed a save)
+        assert_eq!(kv0[0]["save_ms"], 45.6);
         assert_eq!(kv0[0]["created_ts"], 100);
         assert_eq!(kv0[0]["last_ts"], 125);
         assert!(kv0[0]["backend"].is_null());
@@ -3118,6 +3223,14 @@ mod tests {
         // API call succeeded; r3 never attempted a restore)
         assert_eq!(v["recent"][0]["restore_call"], "ok");
         assert!(v["recent"][1]["restore_call"].is_null());
+        // the recent ring carries the restore API call duration (r2's call
+        // took 123.4 ms; r3's row has no field — no call was made)
+        assert_eq!(v["recent"][0]["restore_ms"], 123.4);
+        assert!(v["recent"][1].get("restore_ms").is_none());
+        // the recent ring carries the save API call duration (r2's save
+        // took 45.6 ms; r3's row has no field — no save completed)
+        assert_eq!(v["recent"][0]["save_ms"], 45.6);
+        assert!(v["recent"][1].get("save_ms").is_none());
         // the recent ring carries the restore candidate + LCP ratio (r2
         // restored a closest prefix under another key; r3 had none)
         assert_eq!(v["recent"][0]["restore_candidate"], "cd34ef56ab78ab12");
@@ -3145,11 +3258,14 @@ mod tests {
     #[test]
     fn kv_cache_tab_tracks_per_key_restore_counts_sorted_and_bounded() {
         let d = DashboardPlugin::new(params(json!({ "max_recent": 0 }))).unwrap();
-        // kA restored 3 times, kB once, kC twice.
-        for (key, n) in [("kA", 3), ("kB", 1), ("kC", 2)] {
-            for _ in 0..n {
+        // kA restored 3 times (2 warm — the slot already ran the KV, so the
+        // restore API call was skipped), kB once, kC twice (all cold — each
+        // made the API call).
+        for (key, n, n_warm) in [("kA", 3, 2), ("kB", 1, 0), ("kC", 2, 0)] {
+            for i in 0..n {
                 let mut r = record(200);
                 r.key = Some(key.to_string());
+                r.restore_call = Some(if i < n_warm { "skipped" } else { "ok" });
                 d.record_now(&r).unwrap();
             }
         }
@@ -3158,6 +3274,13 @@ mod tests {
         r.key = Some("kD".into());
         r.restored = Some(false);
         d.record_now(&r).unwrap();
+        // A request that saved but did not restore enters the tally with
+        // a restore count of 0 and its save total.
+        let mut r = record(200);
+        r.key = Some("kE".into());
+        r.restored = Some(false);
+        r.save_ms = Some(7.5);
+        d.record_now(&r).unwrap();
         // An empty key must not enter the tally.
         let mut r = record(200);
         r.key = Some(String::new());
@@ -3165,47 +3288,130 @@ mod tests {
         d.record_now(&r).unwrap();
         let v = d.stats(&proxy(), Some(0), BackendScope::All);
         let kv = v["kv_cache"].as_array().unwrap().to_vec();
-        // Sorted by the highest restored count: kA (3), kC (2), kB (1);
-        // kD (not restored) and the empty key are excluded.
-        assert_eq!(kv.len(), 3);
+        // Sorted by the highest restored count: kA (3), kC (2), kB (1),
+        // kE (0 — save only); kD (no restore, no save) and the empty key
+        // are excluded.
+        assert_eq!(kv.len(), 4);
         assert_eq!(kv[0]["key"], "kA");
         assert_eq!(kv[0]["count"], 3);
         assert_eq!(kv[1]["key"], "kC");
         assert_eq!(kv[1]["count"], 2);
         assert_eq!(kv[2]["key"], "kB");
         assert_eq!(kv[2]["count"], 1);
+        assert_eq!(kv[3]["key"], "kE");
+        assert_eq!(kv[3]["count"], 0);
+        // the per-key warm restore count (kA: 2 warm of its 3 restores; the
+        // others were all cold or never restored)
+        assert_eq!(kv[0]["warm"], 2);
+        assert_eq!(kv[1]["warm"], 0);
+        assert_eq!(kv[2]["warm"], 0);
+        assert_eq!(kv[3]["warm"], 0);
+        // the per-key save API call total (kE saved once; the others
+        // never completed a save)
+        assert_eq!(kv[3]["save_ms"], 7.5);
+        assert_eq!(kv[0]["save_ms"], 0.0);
         // The tally is lifetime (present regardless of `since`).
         assert_eq!(
             d.stats(&proxy(), None, BackendScope::All)["kv_cache"]
                 .as_array()
                 .unwrap()
                 .len(),
-            3
+            4
         );
 
         // Bounded: bumping an existing key never evicts; a new key at the
         // cap evicts a lowest-count key, and a higher-count key survives.
         let mut e = Inner::default();
         for i in 0..MAX_KV_KEYS {
-            e.touch_restore_count(format!("key-{i}"), 0, None, None); // each count 1
+            e.touch_kv(
+                format!("key-{i}"),
+                0,
+                None,
+                None,
+                true,
+                Some("ok"),
+                None,
+                None,
+            ); // each count 1, cold
         }
         assert_eq!(e.restore_counts.len(), MAX_KV_KEYS);
-        e.touch_restore_count("key-0".to_string(), 5, Some(1), Some(2)); // existing -> bump to 2
+        e.touch_kv(
+            "key-0".to_string(),
+            5,
+            Some(1),
+            Some(2),
+            true,
+            Some("skipped"), // warm: the slot already ran the KV
+            Some(12.5),
+            Some(7.5),
+        ); // existing -> bump to 2
         assert_eq!(e.restore_counts.len(), MAX_KV_KEYS);
-        // an existing key's count bumps AND its last-restore fields update
+        // an existing key's count bumps AND its last-activity fields update
         assert_eq!(e.restore_counts.get("key-0").unwrap().count, 2);
+        // the warm bump is added to the first-seen (cold) count
+        assert_eq!(e.restore_counts.get("key-0").unwrap().warm, 1);
         assert_eq!(e.restore_counts.get("key-0").unwrap().last_ts, 5);
         assert_eq!(e.restore_counts.get("key-0").unwrap().backend, Some(1));
         assert_eq!(e.restore_counts.get("key-0").unwrap().slot, Some(2));
-        // a key's "created" time is its first-seen (first-restore) time and is
-        // NOT updated by later restores
+        // the restore and save API call durations sum per key (no-call
+        // events — `None` — add nothing)
+        assert_eq!(
+            e.restore_counts.get("key-0").unwrap().restore_ms_total,
+            12.5
+        );
+        assert_eq!(e.restore_counts.get("key-0").unwrap().save_ms_total, 7.5);
+        // a key's "created" time is its first-seen time and is NOT
+        // updated by later activity
         assert_eq!(e.restore_counts.get("key-0").unwrap().created_ts, 0);
-        e.touch_restore_count("key-new".to_string(), 9, Some(0), Some(4)); // new -> evicts a count-1 key
+        e.touch_kv(
+            "key-new".to_string(),
+            9,
+            Some(0),
+            Some(4),
+            true,
+            Some("ok"),
+            Some(7.5),
+            None,
+        ); // new -> evicts a count-1 key
         assert_eq!(e.restore_counts.len(), MAX_KV_KEYS);
         assert_eq!(e.restore_counts.get("key-new").unwrap().count, 1);
+        assert_eq!(e.restore_counts.get("key-new").unwrap().warm, 0);
         assert_eq!(e.restore_counts.get("key-0").unwrap().count, 2);
         // a brand-new key records its creation time as the current `now`
         assert_eq!(e.restore_counts.get("key-new").unwrap().created_ts, 9);
+        // a key that only saved (never restored) enters the tally with a
+        // restore count of 0 and its save total — and, at the cap, is
+        // evicted first (the lowest count)
+        e.touch_kv(
+            "key-save-only".to_string(),
+            11,
+            Some(2),
+            Some(0),
+            false,
+            None,
+            None,
+            Some(30.0),
+        );
+        let so = e.restore_counts.get("key-save-only").unwrap();
+        assert_eq!(so.count, 0);
+        assert_eq!(so.warm, 0);
+        assert_eq!(so.save_ms_total, 30.0);
+        assert_eq!(so.restore_ms_total, 0.0);
+        assert_eq!(so.created_ts, 11);
+        assert_eq!(e.restore_counts.len(), MAX_KV_KEYS);
+        e.touch_kv(
+            "key-new2".to_string(),
+            12,
+            None,
+            None,
+            true,
+            Some("ok"),
+            None,
+            None,
+        );
+        assert!(e.restore_counts.get("key-save-only").is_none());
+        assert_eq!(e.restore_counts.get("key-new2").unwrap().count, 1);
+        assert_eq!(e.restore_counts.len(), MAX_KV_KEYS);
     }
 
     #[test]
@@ -3745,10 +3951,16 @@ mod tests {
         let page = d.html();
         // the switch in the filter bar (bars selected by default)
         assert!(page.contains("id=\"chartmode\""), "switch element");
-        assert!(page.contains("data-mode=\"bar\" class=\"on\""), "bars is the default");
+        assert!(
+            page.contains("data-mode=\"bar\" class=\"on\""),
+            "bars is the default"
+        );
         assert!(page.contains("data-mode=\"line\""), "line option");
         // the style state, defaulting to bars
-        assert!(page.contains("let CHART_MODE = \"bar\";"), "chart-style state");
+        assert!(
+            page.contains("let CHART_MODE = \"bar\";"),
+            "chart-style state"
+        );
         // line-mode rendering in the shared chart renderer
         assert!(
             page.contains("const lineMode = CHART_MODE === \"line\";"),
@@ -3768,7 +3980,10 @@ mod tests {
             "toggle handler wired"
         );
         // the switch styling
-        assert!(page.contains(".seg { display:inline-flex"), "switch styling");
+        assert!(
+            page.contains(".seg { display:inline-flex"),
+            "switch styling"
+        );
         assert!(page.contains(".seg button.on"), "active switch styling");
     }
 }

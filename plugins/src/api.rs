@@ -1,6 +1,6 @@
 //! Adapter API: the traits every lpcache plugin implements.
 //!
-//! Six adapter kinds exist:
+//! Seven adapter kinds exist:
 //!
 //! - [`Prefilter`] — request prefilter, consulted **before** any slot
 //!   acquisition, KV-cache restore/save, or backend dispatch. Built-ins:
@@ -17,6 +17,10 @@
 //! - [`RequestLogger`] — one W3C Extended Log Format (XLF) record per
 //!   finished request; the built-in `request_log` plugin writes the
 //!   records to a (size-rotated) log file.
+//! - [`PayloadLogger`] — dumps each chat request's raw payload and its
+//!   request headers to a backing store; the built-in `payload_log`
+//!   plugin writes one payload file plus a paired headers file per
+//!   request to its configured directory.
 //! - [`Dashboard`] — the real-time statistics web dashboard; the proxy
 //!   feeds it one [`RequestLogRecord`] per finished request and hands it
 //!   a live [`ProxyStatus`] snapshot on every stats poll, and serves its
@@ -354,6 +358,21 @@ pub struct RequestLogRecord {
     /// requested KV), `rejected` (the backend refused the call),
     /// `failed` (transient backend error). Missing = not attempted.
     pub restore_call: Option<&'static str>,
+    /// `lpcache-restore-ms`: the total duration in ms of the backend's
+    /// `action=restore` API call — present only when that call was
+    /// actually made (missing when no restore was attempted and when the
+    /// slot was already running the requested KV, the `skipped` case).
+    pub restore_ms: Option<f64>,
+    /// `lpcache-save-ms`: the total duration in ms of the backend's
+    /// `action=save` API calls for this request (initial attempt +
+    /// retries) — present when a KV cache save completed (a big request
+    /// on a `kv_cache`-enabled backend; timed even when the backend
+    /// rejected the save with a 500), missing when no save was attempted
+    /// (small request, `kv_cache` disabled, prefilter hit, coalesced
+    /// follower), when the save was skipped after a successful
+    /// self-restore (`SKIP_SAVE_ON_SELF_RESTORE`), or when every save
+    /// attempt errored.
+    pub save_ms: Option<f64>,
     /// `lpcache-restore-candidate`: the first 16 hex chars of the key the
     /// LCP scan picked as the best restore candidate. Equals `lpcache-key`
     /// when the request repeats a previously cached prefix exactly;
@@ -459,6 +478,44 @@ pub trait RequestLogger: Send + Sync {
 
     /// Record one finished request.
     fn log(&self, record: &RequestLogRecord) -> Result<(), String>;
+}
+
+/// A request-payload-logging adapter: receives one raw request payload and
+/// the request's HTTP headers per chat request and persists them (the
+/// built-in `payload_log` plugin writes each payload to a unique file in
+/// its configured directory, paired with a `.headers` file holding the
+/// request's HTTP headers).
+///
+/// Unlike [`RequestLogger`] (which records one summary record per
+/// *finished* request), a payload logger sees the payload as it arrives —
+/// before parsing, prefiltering, or any slot/backend work — so rejected
+/// and malformed requests are captured as well.
+///
+/// Implementations must be `Send + Sync` — they are shared across all
+/// requests behind an `Arc` (see `AppState::payload_log` in the `lpcache`
+/// crate). Failures are logged by the proxy and swallowed: payload logging
+/// never breaks request serving.
+pub trait PayloadLogger: Send + Sync {
+    /// The plugin name (for diagnostics).
+    fn name(&self) -> &str;
+
+    /// Prepare the backing store (create the directory). Called once at
+    /// startup so a bad path fails there instead of on the first request.
+    fn prepare(&self) -> Result<(), String>;
+
+    /// Persist one request payload and its HTTP headers. `key` is the
+    /// request's KV cache key (or its first 16 hex chars) when the payload
+    /// could be parsed into a chat request, `None` otherwise;
+    /// implementations may use it for file naming. `headers` are the
+    /// request's HTTP headers as received — names lowercased, values
+    /// restricted to valid UTF-8 strings, in wire order (duplicates kept);
+    /// implementations may persist them alongside the payload.
+    fn log_payload(
+        &self,
+        key: Option<&str>,
+        payload: &[u8],
+        headers: &[(String, String)],
+    ) -> Result<(), String>;
 }
 
 // ---------------------------------------------------------------------------

@@ -150,6 +150,7 @@ async fn make_state_inner(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td)
@@ -686,6 +687,7 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -709,9 +711,12 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
     //        slot is already running the key from req1's save)
     // req3/4 -> be1 in cooldown -> (0,0) -> restore skipped (already running)
     assert_eq!(statuses, vec![200, 200, 200, 200]);
-    // all chats (including the retry) landed on the live backend
+    // all chats (including the retry) landed on the live backend. Only req1
+    // saved: req2's retry and req3/4 are warm self-restores (the slot was
+    // already running the key, no backend call) and their meta file is still
+    // on disk, so SKIP_SAVE_ON_SELF_RESTORE skips their redundant saves.
     let saves = mock.state.saves().await;
-    assert_eq!(saves.len(), 4);
+    assert_eq!(saves.len(), 1);
     // the only restore attempt was req2's doomed one on the dead backend
     // (unrecorded); the live backend's slot was already running the key, so
     // every restore targeting it was skipped
@@ -769,6 +774,7 @@ async fn connection_failure_retries_on_other_backend() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -844,6 +850,7 @@ async fn probe_recovers_cooled_down_backend() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -860,8 +867,10 @@ async fn probe_recovers_cooled_down_backend() {
         assert_eq!(resp.status(), 200, "request {i}");
         let _ = to_bytes(resp.into_body(), usize::MAX).await;
     }
-    // all saves landed on the live backend while be0 cooled down
-    assert_eq!(live.state.saves().await.len(), 3);
+    // only req1 saved on the live backend: req2/3 are warm self-restores
+    // (slot (1,0) already running the key, no backend call) and their meta
+    // file is still on disk, so SKIP_SAVE_ON_SELF_RESTORE skips their saves.
+    assert_eq!(live.state.saves().await.len(), 1);
 
     // probe round 1: backend 0 is still down
     assert_eq!(sm.probe_down_backends().await, 0);
@@ -932,6 +941,7 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -947,13 +957,18 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         statuses.push(resp.status().as_u16());
         let _ = to_bytes(resp.into_body(), usize::MAX).await;
     }
-    // req1 -> (0,0) 200 (save stamps it); req2 -> (0,1) 200 (save stamps it)
+    // req1 -> (0,0) 200 (the save stamps it)
+    // req2 -> (0,1) 200 (a successful self-restore stamps (0,1) running the
+    //        key; its save is skipped by the default SKIP_SAVE_ON_SELF_RESTORE)
     // req3 -> (1,0) free -> provider 500 -> slot marked used
     // req4 -> (1,1) free -> provider 500 -> slot marked used
     // req5 -> no free slots -> LRU -> (0,0) -> 200
     // (without mark_used, req5 would have re-picked the still-"free" (1,0))
     assert_eq!(statuses, vec![200, 200, 500, 500, 200]);
-    assert_eq!(mock0.state.saves().await.len(), 3);
+    // req2's save was skipped (a cold self-restore whose 200 verified the
+    // file) and req5's warm self-restore (the slot already running the key,
+    // meta still on disk) skips too — mock0 saved for req1 only.
+    assert_eq!(mock0.state.saves().await.len(), 1);
     assert_eq!(mock1.state.saves().await.len(), 0);
 }
 
@@ -993,6 +1008,7 @@ async fn prune_removes_oldest_meta_and_kv_files() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1067,6 +1083,7 @@ async fn kv_cache_disabled_backend_never_saves_or_restores() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1142,6 +1159,7 @@ async fn kv_cache_disabled_backend_skips_stream_save() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1251,6 +1269,7 @@ async fn kv_restore_prefers_kv_enabled_backend() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1330,6 +1349,7 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1478,6 +1498,7 @@ async fn key_affinity_avoids_redundant_restore() {
             prefilter,
             result_store,
             request_log: None,
+            payload_log: None,
             dashboard: None,
         };
         (state, mock, kv, td)
@@ -1571,6 +1592,7 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -2178,6 +2200,7 @@ async fn make_state_result_cache(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td, td_rc)
@@ -2340,6 +2363,7 @@ async fn make_state_result_cache_streaming(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td, td_rc)
@@ -2467,6 +2491,7 @@ async fn make_state_result_cache_cache_control(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td, td_rc)
@@ -2613,6 +2638,7 @@ async fn keyword_blocklist_rejects_before_result_cache_serves() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     // Pre-populate the cache for the blocked prompt's key (a blocked
@@ -2680,6 +2706,7 @@ async fn make_state_with_save_dir(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td)
@@ -2812,6 +2839,7 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -2896,6 +2924,7 @@ async fn make_state_request_log(
         prefilter,
         result_store,
         request_log: Some(request_log),
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td, log_path)
@@ -3013,7 +3042,10 @@ async fn request_log_writes_xlf_record() {
         rec["lpcache-restore-candidate"], "-",
         "no restore attempt on small requests"
     );
-    assert_eq!(rec["lpcache-lcp-ratio"], "-", "no restore attempt on small requests");
+    assert_eq!(
+        rec["lpcache-lcp-ratio"], "-",
+        "no restore attempt on small requests"
+    );
     assert_eq!(rec["lpcache-cache-hit"], "-", "no prefilter enabled");
     assert_eq!(rec["lpcache-coalesced"], "-");
     assert_eq!(rec["lpcache-reason"], "-", "the request completed normally");
@@ -3268,7 +3300,10 @@ async fn request_log_rotates_and_bounds_keep() {
 /// A state with the built-in `dashboard` plugin loaded from a `dashboard`
 /// plugin spec with `params` — the same dynamic loading path the `lpcache`
 /// binary uses (`load_dashboard`).
-async fn make_state_dashboard(params: Value) -> (AppState, MockLlama, tempfile::TempDir) {
+async fn make_state_dashboard(
+    params: Value,
+    skip_save_on_self_restore: bool,
+) -> (AppState, MockLlama, tempfile::TempDir) {
     let mock = MockLlama::start(BACKEND_MODEL).await;
     let td = tempfile::tempdir().expect("tempdir");
     let cfg = Config::new(
@@ -3285,7 +3320,8 @@ async fn make_state_dashboard(params: Value) -> (AppState, MockLlama, tempfile::
         Duration::from_secs(30),
         "llama.cpp".to_string(),
         0,
-    );
+    )
+    .with_skip_save_on_self_restore(skip_save_on_self_restore);
     let client = Arc::new(
         LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
     );
@@ -3306,6 +3342,7 @@ async fn make_state_dashboard(params: Value) -> (AppState, MockLlama, tempfile::
         prefilter: None,
         result_store: None,
         request_log: None,
+        payload_log: None,
         dashboard: Some(dashboard),
     };
     (state, mock, td)
@@ -3318,7 +3355,7 @@ async fn drain(resp: axum::http::Response<Body>) {
 
 #[tokio::test]
 async fn dashboard_page_and_stats_reachable() {
-    let (state, mock, _td) = make_state_dashboard(json!({})).await;
+    let (state, mock, _td) = make_state_dashboard(json!({}), true).await;
     let app = router(state);
 
     // The stats API first (its polling never inflates the aggregates —
@@ -3405,7 +3442,7 @@ async fn dashboard_page_and_stats_reachable() {
 /// renders the canvas, so this guards the embedded script.
 #[tokio::test]
 async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
-    let (state, _mock, _td) = make_state_dashboard(json!({})).await;
+    let (state, _mock, _td) = make_state_dashboard(json!({}), true).await;
     let app = router(state);
 
     let resp = app.oneshot(get_req("/dashboard")).await.expect("resp");
@@ -3577,7 +3614,7 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
 
 #[tokio::test]
 async fn dashboard_counters_update_after_requests() {
-    let (state, _mock, _td) = make_state_dashboard(json!({ "refresh_ms": 750 })).await;
+    let (state, _mock, _td) = make_state_dashboard(json!({ "refresh_ms": 750 }), true).await;
     let app = router(state);
 
     // A successful chat request.
@@ -3747,7 +3784,7 @@ async fn dashboard_counters_update_after_requests() {
 
 #[tokio::test]
 async fn dashboard_stats_since_scopes_the_range() {
-    let (state, _mock, _td) = make_state_dashboard(json!({})).await;
+    let (state, _mock, _td) = make_state_dashboard(json!({}), true).await;
     let app = router(state);
 
     // Two finished requests (a successful chat + a 404).
@@ -3944,6 +3981,7 @@ async fn dashboard_coalesced_scopes_track_group_records() {
         prefilter: None,
         result_store: None,
         request_log: None,
+        payload_log: None,
         dashboard: Some(dashboard),
     };
     let app = router(state);
@@ -4073,6 +4111,7 @@ async fn dashboard_routes_excluded_from_request_log_and_aggregates() {
         prefilter: None,
         result_store: None,
         request_log: Some(request_log),
+        payload_log: None,
         dashboard: Some(dashboard),
     };
     let app = router(state);
@@ -4129,7 +4168,7 @@ async fn dashboard_routes_excluded_from_request_log_and_aggregates() {
 
 #[tokio::test]
 async fn dashboard_custom_path() {
-    let (state, _mock, _td) = make_state_dashboard(json!({ "path": "/stats" })).await;
+    let (state, _mock, _td) = make_state_dashboard(json!({ "path": "/stats" }), true).await;
     let app = router(state);
 
     let resp = app.clone().oneshot(get_req("/stats")).await.expect("resp");
@@ -4153,4 +4192,390 @@ async fn dashboard_custom_path() {
     let resp = app.oneshot(get_req("/dashboard")).await.expect("resp");
     assert_eq!(resp.status(), 404);
     drain(resp).await;
+}
+
+#[tokio::test]
+async fn dashboard_restores_report_the_api_call_duration() {
+    // Self-restore save-skip is pinned OFF: this test exercises the save
+    // timing of *both* requests (the second is a self-restore, which the
+    // default configuration would skip saving).
+    let (state, mock, _td) = make_state_dashboard(json!({}), false).await;
+    let app = router(state);
+
+    // The same big request (600 words > the 500-word threshold) twice: the
+    // first finds no saved KV cache to restore (no candidate), runs a full
+    // prefill, and saves the KV cache to its slot on completion; the second
+    // finds the saved cache as a restore candidate, lands on the other
+    // (never used) slot, and issues the restore API call to load it there.
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": words(600) }]
+    });
+    for _ in 0..2 {
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        read_body(resp).await; // dropping the body records the request
+    }
+    let restores = mock.state.restores().await;
+    assert_eq!(restores.len(), 1, "only the second request restored");
+
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    let recent = v["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    // req1 (the older row): no restore candidate existed, so no restore
+    // call was made and the duration field is absent from the JSON.
+    assert_eq!(recent[0]["restored"], false);
+    assert!(recent[0].get("restore_ms").is_none());
+    // req2 (the newer row): the restore API call was made and its duration
+    // is reported as a non-negative number.
+    assert_eq!(recent[1]["restored"], true);
+    assert_eq!(recent[1]["restore_call"], "ok");
+    assert!(
+        recent[1]["restore_ms"].as_f64().is_some_and(|ms| ms >= 0.0),
+        "restore_ms missing on row {:?}",
+        recent[1]
+    );
+    // Both requests are big, so both completed a KV cache save — each row
+    // reports the total duration of its action=save API call.
+    let s1 = recent[0]
+        .get("save_ms")
+        .and_then(Value::as_f64)
+        .expect("save_ms on req1");
+    let s2 = recent[1]
+        .get("save_ms")
+        .and_then(Value::as_f64)
+        .expect("save_ms on req2");
+    assert!(s1 >= 0.0 && s2 >= 0.0);
+    // The KV Cache tab's per-key entry tallies the restored requests and
+    // sums their restore API call durations; its save total is the sum of
+    // both requests' save durations.
+    let kv = v["kv_cache"].as_array().unwrap();
+    assert_eq!(kv.len(), 1);
+    assert_eq!(kv[0]["count"], 1);
+    assert!(
+        kv[0]["restore_ms"].as_f64().is_some_and(|ms| ms >= 0.0),
+        "kv restore total: {:?}",
+        kv[0]
+    );
+    assert_eq!(kv[0]["save_ms"].as_f64(), Some(s1 + s2));
+}
+
+#[tokio::test]
+async fn self_restore_skips_the_kv_save_by_default() {
+    // Default (`SKIP_SAVE_ON_SELF_RESTORE=true`): a big request that
+    // successfully restores its own key does not re-save the KV cache —
+    // the file already holds that key's state — so `action=save` happens
+    // once for two identical requests, and the skipped row reports no
+    // save duration.
+    let (state, mock, _td) = make_state_dashboard(json!({}), true).await;
+    let app = router(state);
+
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": words(600) }]
+    });
+    // req1: no saved cache exists yet -> full prefill -> KV save.
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await; // dropping the body records the request
+    assert_eq!(mock.state.saves().await.len(), 1);
+    // req2 (same key): the LCP scan finds its own saved cache and the
+    // restore loads it successfully -> the redundant save is skipped.
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await;
+    assert_eq!(mock.state.saves().await.len(), 1, "self-restore re-saved");
+    assert_eq!(mock.state.restores().await.len(), 1);
+
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    let recent = v["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    // req1 (the older row): no restore, one save.
+    let s1 = recent[0]
+        .get("save_ms")
+        .and_then(Value::as_f64)
+        .expect("save_ms on req1");
+    assert!(recent[0].get("restore_ms").is_none());
+    // req2 (the newer row): restored, but the save was skipped, so the row
+    // reports the restore duration and no save duration.
+    assert_eq!(recent[1]["restored"], true);
+    assert!(
+        recent[1]["restore_ms"].as_f64().is_some_and(|ms| ms >= 0.0),
+        "restore_ms missing on row {:?}",
+        recent[1]
+    );
+    assert!(
+        recent[1].get("save_ms").is_none(),
+        "skipped save must not report a duration: {:?}",
+        recent[1]
+    );
+    // The KV Cache tab: one restored request; the save total is req1's
+    // save only (the skipped save contributes nothing).
+    let kv = v["kv_cache"].as_array().unwrap();
+    assert_eq!(kv.len(), 1);
+    assert_eq!(kv[0]["count"], 1);
+    assert_eq!(kv[0]["save_ms"].as_f64(), Some(s1));
+}
+
+#[tokio::test]
+async fn warm_self_restore_skips_save_when_meta_exists() {
+    // Single slot: every repeat of the same big request finds its own key
+    // already running in the only slot — a warm ("already running") no-op
+    // restore with no backend call. With `SKIP_SAVE_ON_SELF_RESTORE` (the
+    // default) and the meta file still on disk, the redundant save is
+    // skipped: the meta's presence is the file-health probe that stands in
+    // for the missing restore call.
+    let (state, mock, _td) = make_state(1, None).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": words(600) }]
+    });
+    // req1: no saved cache exists yet -> full prefill -> one KV save.
+    // req2/req3: warm self-restores -> saves skipped.
+    for i in 0..3 {
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200, "request {i}");
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    }
+    assert_eq!(
+        mock.state.saves().await.len(),
+        1,
+        "warm self-restore re-saved"
+    );
+    // req2/req3 made no backend `action=restore` call (the slot was already
+    // running the key), yet all three chats ran.
+    assert!(
+        mock.state.restores().await.is_empty(),
+        "warm restore made an API call: {:?}",
+        mock.state.restores().await
+    );
+    assert_eq!(mock.state.chat_bodies().await.len(), 3);
+}
+
+#[tokio::test]
+async fn warm_self_restore_heals_missing_meta() {
+    // The warm self-restore skip trusts the KV file only while the meta
+    // file is still on disk: remove the meta between repeats (a prune or
+    // manual cleanup) and the next request's post-request save re-writes the
+    // pair (heal) — save call + meta file reappear.
+    let (state, mock, td) = make_state(1, None).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": words(600) }]
+    });
+    // req1 saves (and writes the meta); req2 is a warm self-restore with the
+    // meta present -> skip.
+    for i in 0..2 {
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200, "request {i}");
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    }
+    assert_eq!(mock.state.saves().await.len(), 1);
+    // simulate a prune / cleanup removing the meta file
+    let metas: Vec<_> = std::fs::read_dir(td.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".meta.json"))
+        })
+        .collect();
+    assert_eq!(metas.len(), 1);
+    std::fs::remove_file(&metas[0]).unwrap();
+    // req3: warm self-restore again, but the meta is gone -> the save heals
+    // the pair (KV file + meta file reappear).
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert_eq!(mock.state.saves().await.len(), 2, "missing meta not healed");
+    let metas: Vec<_> = std::fs::read_dir(td.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".meta.json"))
+        })
+        .collect();
+    assert_eq!(metas.len(), 1, "meta file not re-written by the heal save");
+}
+
+/// An `AppState` with the built-in payload log enabled (loaded through
+/// the same plugin-spec path the `lpcache` binary uses, via
+/// `REQUEST_PAYLOAD_DIR`).
+async fn make_state_payload_log() -> (AppState, MockLlama, tempfile::TempDir, std::path::PathBuf) {
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("tempdir");
+    let dir = td.path().join("payloads");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+            kv_cache: true,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_request_payload_dir(Some(dir.clone()));
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let specs = cfg.plugin_specs().expect("plugin specs");
+    let payload_log = lpcache::plugins::load_payload_loggers(
+        &lpcache::plugins::Registry::with_builtins(),
+        &specs,
+    )
+    .expect("load payload log")
+    .expect("payload log spec present");
+    payload_log.prepare().expect("prepare payload log");
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        payload_log: Some(payload_log),
+        dashboard: None,
+    };
+    (state, mock, td, dir)
+}
+
+/// Wait up to ~5 s for at least `n` files to appear in `dir` (payload
+/// writes run on the blocking pool, so they may lag the response).
+async fn wait_for_files(dir: &std::path::Path, n: usize) -> Vec<std::path::PathBuf> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let files = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.path())
+            .collect::<Vec<_>>();
+        if files.len() >= n || tokio::time::Instant::now() >= deadline {
+            return files;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn payload_log_writes_one_file_per_request() {
+    let (state, _mock, _td, dir) = make_state_payload_log().await;
+    let app = router(state);
+    // A valid request: a payload file with the exact body bytes plus a
+    // paired headers file, both named with the request's KV cache key.
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    let raw = body.to_string();
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await;
+    let files = wait_for_files(&dir, 2).await;
+    assert_eq!(files.len(), 2, "payload + headers file: {files:?}");
+    let payload = files
+        .iter()
+        .find(|f| f.extension().is_some_and(|e| e == "json"))
+        .expect("payload file");
+    let headers = files
+        .iter()
+        .find(|f| f.extension().is_some_and(|e| e == "headers"))
+        .expect("headers file");
+    let name = payload.file_name().unwrap().to_string_lossy().to_string();
+    assert!(name.starts_with("000001-"), "{name}");
+    assert!(
+        name.contains(&expected_key("hello world")[..16]),
+        "key16 in {name}"
+    );
+    // Same base name (the headers file is the payload name with the
+    // extension swapped).
+    let headers_name = headers.file_name().unwrap().to_string_lossy().to_string();
+    assert!(
+        headers_name.starts_with(&name[..name.len() - ".json".len()]),
+        "paired base names: {name} / {headers_name}"
+    );
+    assert_eq!(
+        std::fs::read(payload).expect("payload file"),
+        raw.as_bytes()
+    );
+    // The headers file holds the request's headers, one `name: value`
+    // line each, names lowercased (post_json sends content-type).
+    let headers_text = std::fs::read_to_string(headers).expect("headers file");
+    assert!(
+        headers_text.lines().all(|l| l.contains(':')),
+        "name: value lines: {headers_text:?}"
+    );
+    assert!(
+        headers_text.contains("content-type: application/json"),
+        "content-type in {headers_text:?}"
+    );
+
+    // A malformed body is captured too (with `nokey`: the payload failed
+    // to parse, so the key was never computed) — payload and headers
+    // file.
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from("not json"))
+        .expect("request");
+    let resp = app.clone().oneshot(req).await.expect("resp");
+    assert_eq!(resp.status(), 422);
+    read_body(resp).await;
+    let files = wait_for_files(&dir, 4).await;
+    assert_eq!(files.len(), 4, "both requests captured: {files:?}");
+    let bad = files
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-nokey.json")
+        })
+        .expect("nokey payload file");
+    assert_eq!(std::fs::read(bad).expect("payload file"), b"not json");
+    let bad_headers = files
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-nokey.headers")
+        })
+        .expect("nokey headers file");
+    assert!(
+        std::fs::read_to_string(bad_headers)
+            .expect("read")
+            .contains("content-type: application/json"),
+        "headers captured for the malformed request too"
+    );
 }

@@ -63,7 +63,7 @@ use crate::coalesce::{Flight, SharedOutcome, SingleFlight};
 use crate::config::Config;
 use crate::hashing;
 use crate::procsample::ProcSample;
-use crate::slot_manager::{AcquireTimeout, GSlot, SlotGuard, SlotManager};
+use crate::slot_manager::{AcquireTimeout, GSlot, SaveOutcome, SlotGuard, SlotManager};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Query, State};
@@ -74,11 +74,12 @@ use axum::routing::{get, post};
 use bytes::Bytes;
 use futures::StreamExt;
 use lpcache_plugins::{
-    BackendError, BackendScope, BackendStatus, Dashboard, JsonChat, LlamaBackend, Prefilter,
-    PrefilterDecision, PrefilterRequest, ProxyStatus, RequestLogRecord, RequestLogger,
+    BackendError, BackendScope, BackendStatus, Dashboard, JsonChat, LlamaBackend, PayloadLogger,
+    Prefilter, PrefilterDecision, PrefilterRequest, ProxyStatus, RequestLogRecord, RequestLogger,
     RestoreOutcome, ResultStore, format_utc,
 };
 use serde_json::{Value, json};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -106,6 +107,14 @@ pub struct AppState {
     /// from `REQUEST_LOG` / the `PLUGINS` settings): one W3C-XLF record is
     /// appended per finished request (`None` = disabled — the default).
     pub request_log: Option<Arc<dyn RequestLogger>>,
+    /// Optional request-payload logger (the built-in `payload_log` plugin,
+    /// loaded from `REQUEST_PAYLOAD_DIR` / the `PLUGINS` settings): each
+    /// chat request's raw payload (plus its HTTP headers in a paired
+    /// `.headers` file) is written to a unique file in its configured
+    /// directory as it arrives — before parsing, prefiltering or backend
+    /// dispatch, so malformed and rejected requests are captured too
+    /// (`None` = disabled — the default).
+    pub payload_log: Option<Arc<dyn PayloadLogger>>,
     /// Optional dashboard plugin (the built-in `dashboard` plugin, loaded
     /// from the `PLUGINS` settings): serves the real-time statistics web
     /// page at its configured path and receives one
@@ -113,6 +122,27 @@ pub struct AppState {
     /// its own page/stats routes are excluded (`None` = disabled — the
     /// default).
     pub dashboard: Option<Arc<dyn Dashboard>>,
+}
+
+impl AppState {
+    /// Persist this request's raw payload and HTTP headers to the payload
+    /// logger (when loaded): the write runs on the blocking pool so the
+    /// async hot path never blocks on disk; a failure is logged and
+    /// swallowed — payload logging never breaks request serving.
+    fn log_payload(&self, key: Option<&str>, raw: &[u8], headers: &[(String, String)]) {
+        let Some(logger) = self.payload_log.as_ref() else {
+            return;
+        };
+        let logger = Arc::clone(logger);
+        let key = key.map(str::to_string);
+        let payload = raw.to_vec();
+        let headers = headers.to_vec();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = logger.log_payload(key.as_deref(), &payload, &headers) {
+                tracing::error!("payload_log_write_fail logger={}: {e}", logger.name());
+            }
+        });
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -304,6 +334,24 @@ pub(crate) struct PipelineLog {
     /// requested KV), `rejected` (the backend refused the call), `failed`
     /// (transient backend error). Missing = not attempted.
     pub restore_call: Option<&'static str>,
+    /// `lpcache-restore-ms`: the total duration in ms of the backend's
+    /// `action=restore` API call — present only when that call was
+    /// actually made (missing for `skipped` restores and when no restore
+    /// was attempted).
+    pub restore_ms: Option<f64>,
+    /// `lpcache-save-ms`: the total duration in ms of the backend's
+    /// `action=save` API calls for this request — present when a KV cache
+    /// save completed (a big request on a `kv_cache`-enabled backend; the
+    /// call is timed even when the backend rejected it with a 500),
+    /// missing when no save was attempted (small request, `kv_cache`
+    /// disabled, prefilter/follower), when the save was skipped after a
+    /// successful self-restore (`SKIP_SAVE_ON_SELF_RESTORE`), or when every
+    /// save attempt errored.
+    /// Shared state like [`PerfInner`] — for streaming requests the save
+    /// runs in the reader task (after the response has started), so the
+    /// request log reads the cell when the body completes (a client
+    /// disconnect racing the save leaves it missing, like `perf`).
+    pub save_ms: Arc<Mutex<Option<f64>>>,
     /// `lpcache-restore-candidate`: the first 16 hex chars of the key the
     /// LCP scan picked as the best restore candidate. Equals `key` when
     /// the request repeats a previously cached prefix exactly; differs
@@ -340,17 +388,20 @@ fn with_pipeline_log(mut resp: Response, pl: PipelineLog) -> Response {
 
 /// Fill in the slot-related fields for a request that ran on slot `g`
 /// (`restored`/`restore_call` are present when a KV cache restore was
-/// attempted).
+/// attempted; `restore_ms` when the restore decision actually made the
+/// backend's `action=restore` API call).
 fn with_slot(
     mut pl: PipelineLog,
     g: GSlot,
     restored: Option<bool>,
     restore_call: Option<&'static str>,
+    restore_ms: Option<f64>,
 ) -> PipelineLog {
     pl.backend = Some(g.be);
     pl.slot = Some(g.slot);
     pl.restored = restored;
     pl.restore_call = restore_call;
+    pl.restore_ms = restore_ms;
     pl
 }
 
@@ -512,6 +563,10 @@ impl Drop for PendingRequestLog {
             .perf
             .as_ref()
             .and_then(|p| p.lock().ok().map(|g| g.clone()));
+        // The streaming reader's save (which runs after the response
+        // started) has finished by now too — same caveat for a client
+        // disconnect.
+        let save_ms = self.pl.save_ms.lock().ok().and_then(|g| *g);
         // The request's proxy-side resource usage: process counters
         // sampled now minus the sample taken when the request started
         // (see the `procsample` module for the concurrency caveat).
@@ -535,6 +590,8 @@ impl Drop for PendingRequestLog {
             slot: self.pl.slot,
             restored: self.pl.restored,
             restore_call: self.pl.restore_call,
+            restore_ms: self.pl.restore_ms,
+            save_ms,
             restore_candidate: self.pl.restore_candidate.clone(),
             lcp_ratio: self.pl.lcp_ratio,
             cache_hit: self.pl.cache_hit,
@@ -695,11 +752,19 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
         Ok(b) => b,
         Err(e) => return json_error(400, format!("reading body failed: {e}")),
     };
+    // Payload log (when enabled): capture the raw payload and headers as
+    // they arrive — before JSON validation, so malformed bodies are
+    // logged too (without a key, since the key is only known for parsed
+    // requests).
     let body: Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
-        Err(e) => return json_error(422, format!("invalid json body: {e}")),
+        Err(e) => {
+            state.log_payload(None, &raw, &headers);
+            return json_error(422, format!("invalid json body: {e}"));
+        }
     };
     if !body.is_object() {
+        state.log_payload(None, &raw, &headers);
         return json_error(422, "request body must be a JSON object");
     }
 
@@ -728,6 +793,11 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
     let blocks = hashing::block_hashes_from_text(&prefix, state.config.words_per_block);
     let n_words = hashing::words_from_text(&prefix).len();
     let is_big = n_words > state.config.big_threshold_words;
+
+    // Payload log (when enabled): one file with this request's raw
+    // payload (plus a paired `.headers` file), named with the request's
+    // KV cache key.
+    state.log_payload(Some(&key), &raw, &headers);
 
     // Request log: the pipeline view of this request (carried in the
     // response's extensions to the request-log middleware); filled in as
@@ -1002,6 +1072,7 @@ async fn run_pipeline(
         .as_ref()
         .map(|o| matches!(o, RestoreOutcome::Restored));
     let mut restore_call = restore_call_label(guard.restored, guard.restore_call);
+    let mut restore_ms = guard.restore_ms;
     // LRU bookkeeping: a successful restore counts as a "use" of the
     // cached entry — bump its meta timestamp so the post-save prune of
     // this very request cannot evict a cache that was just used
@@ -1047,13 +1118,14 @@ async fn run_pipeline(
                                 .as_ref()
                                 .map(|o| matches!(o, RestoreOutcome::Restored));
                             restore_call = restore_call_label(g2.restored, g2.restore_call);
+                            restore_ms = g2.restore_ms;
                             touch_restored_meta(state, &g2, &restore_key);
                             remove_stale_meta(state, &g2, &restore_key);
                             guard = g2;
                             continue;
                         }
                         None => {
-                            pl = with_slot(pl, g, restored, restore_call);
+                            pl = with_slot(pl, g, restored, restore_call, restore_ms);
                             pl.reason = Some("backend_unreachable".into());
                             let (resp, o) = err_outcome(500, format!("backend unreachable: {e}"));
                             return (with_pipeline_log(resp, pl), Some(o));
@@ -1063,7 +1135,7 @@ async fn run_pipeline(
                 Err(e) => {
                     state.sm.mark_used(g);
                     state.sm.release(guard);
-                    pl = with_slot(pl, g, restored, restore_call);
+                    pl = with_slot(pl, g, restored, restore_call, restore_ms);
                     pl.reason = Some("backend_error".into());
                     let (resp, o) = err_outcome(500, e.to_string());
                     return (with_pipeline_log(resp, pl), Some(o));
@@ -1089,7 +1161,7 @@ async fn run_pipeline(
                 let status =
                     StatusCode::from_u16(sc.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let val = json!({ "error": err_txt });
-                pl = with_slot(pl, g, restored, restore_call);
+                pl = with_slot(pl, g, restored, restore_call, restore_ms);
                 pl.reason = Some(format!("provider_http_{}", sc.status));
                 return (
                     with_pipeline_log((status, axum::Json(val.clone())).into_response(), pl),
@@ -1138,6 +1210,21 @@ async fn run_pipeline(
             // Request log: shared performance state (the reader fills in
             // ttft + the backend `usage`/`timings` as the chunks arrive).
             let perf = pl.perf.clone();
+            // Request log: shared save-duration cell — the reader's "finally"
+            // save runs after this response has started, so the request log
+            // reads the cell when the body completes.
+            let save_ms_cell = Arc::clone(&pl.save_ms);
+            // `SKIP_SAVE_ON_SELF_RESTORE`: evaluated here, before `guard` is
+            // moved into the reader — when this request successfully restored
+            // its own key, the reader's "finally" save + meta write are
+            // skipped (the file already holds this key's state).
+            let skip_save = skip_save_for_self_restore(
+                cfg.skip_save_on_self_restore,
+                &guard,
+                &restore_key,
+                key,
+                &cfg.meta_dir,
+            );
             tokio::spawn(async move {
                 let mut s = sc.stream;
                 let mut client_gone = false;
@@ -1212,11 +1299,30 @@ async fn run_pipeline(
                 // support must never be asked to save, and no meta file is
                 // written (it could not be loaded back by this backend
                 // anyway) — the same gating as the non-streaming save sites.
-                let ok = if cfg.backends[g.be].kv_cache {
+                let ok = if cfg.backends[g.be].kv_cache && skip_save {
+                    // `SKIP_SAVE_ON_SELF_RESTORE`: the request just restored
+                    // its own key — the KV file already holds this key's
+                    // state and the restore touched the meta, so no save +
+                    // meta write; the slot bookkeeping still runs.
+                    sm.report_success(g);
+                    sm.mark_used(g);
+                    tracing::info!(
+                        "kv_save_skipped g={g} key={} reason=self_restore",
+                        short16(&key2)
+                    );
+                    prune_cache(&cfg);
+                    false
+                } else if cfg.backends[g.be].kv_cache {
                     match sm.save_after(g, &key2).await {
-                        Ok(ok) => {
+                        Ok(out) => {
                             sm.report_success(g);
-                            ok
+                            // Request log: the total duration of the
+                            // action=save API calls (the backend may still
+                            // have rejected the save with a 500).
+                            if let Ok(mut s) = save_ms_cell.lock() {
+                                *s = Some(out.call_ms);
+                            }
+                            out.ok
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1242,7 +1348,7 @@ async fn run_pipeline(
                     );
                     false
                 };
-                if cfg.backends[g.be].kv_cache {
+                if cfg.backends[g.be].kv_cache && !skip_save {
                     if let Err(e) = hashing::write_meta(
                         &cfg.meta_dir,
                         &key2,
@@ -1295,7 +1401,7 @@ async fn run_pipeline(
                 futures::stream::unfold((rx, client_gone_tx), |(mut rx, gone_tx)| async move {
                     rx.recv().await.map(|item| (item, (rx, gone_tx)))
                 });
-            pl = with_slot(pl, g, restored, restore_call);
+            pl = with_slot(pl, g, restored, restore_call, restore_ms);
             return (
                 with_pipeline_log((headers, Body::from_stream(stream)).into_response(), pl),
                 None,
@@ -1309,7 +1415,7 @@ async fn run_pipeline(
                     state.sm.mark_used(g);
                     state.sm.release(guard);
                     let body: String = body.chars().take(512).collect();
-                    pl = with_slot(pl, g, restored, restore_call);
+                    pl = with_slot(pl, g, restored, restore_call, restore_ms);
                     pl.reason = Some(format!("provider_http_{status}"));
                     let (resp, o) =
                         err_outcome(500, format!("provider returned HTTP {status}: {body}"));
@@ -1334,13 +1440,14 @@ async fn run_pipeline(
                                 .as_ref()
                                 .map(|o| matches!(o, RestoreOutcome::Restored));
                             restore_call = restore_call_label(g2.restored, g2.restore_call);
+                            restore_ms = g2.restore_ms;
                             touch_restored_meta(state, &g2, &restore_key);
                             remove_stale_meta(state, &g2, &restore_key);
                             guard = g2;
                             continue;
                         }
                         None => {
-                            pl = with_slot(pl, g, restored, restore_call);
+                            pl = with_slot(pl, g, restored, restore_call, restore_ms);
                             pl.reason = Some("backend_unreachable".into());
                             let (resp, o) = err_outcome(500, format!("backend unreachable: {e}"));
                             return (with_pipeline_log(resp, pl), Some(o));
@@ -1350,7 +1457,7 @@ async fn run_pipeline(
                 Err(e) => {
                     state.sm.mark_used(g);
                     state.sm.release(guard);
-                    pl = with_slot(pl, g, restored, restore_call);
+                    pl = with_slot(pl, g, restored, restore_call, restore_ms);
                     pl.reason = Some("backend_error".into());
                     let (resp, o) = err_outcome(500, e.to_string());
                     return (with_pipeline_log(resp, pl), Some(o));
@@ -1359,7 +1466,7 @@ async fn run_pipeline(
                     state.sm.report_success(g);
                     state.sm.mark_used(g);
                     state.sm.release(guard);
-                    pl = with_slot(pl, g, restored, restore_call);
+                    pl = with_slot(pl, g, restored, restore_call, restore_ms);
                     pl.reason = Some("provider_non_object".into());
                     let (resp, o) = err_outcome(502, "provider non-JSON body");
                     return (with_pipeline_log(resp, pl), Some(o));
@@ -1374,14 +1481,41 @@ async fn run_pipeline(
                     // without this it would stay "never used" and the free-tier
                     // pick would pin all traffic to the first slot forever).
                     state.sm.mark_used(g);
+                    let skip_save = skip_save_for_self_restore(
+                        state.config.skip_save_on_self_restore,
+                        &guard,
+                        &restore_key,
+                        key,
+                        &state.config.meta_dir,
+                    );
                     let save_ok = if is_big {
-                        if state.config.backends[g.be].kv_cache {
+                        if state.config.backends[g.be].kv_cache && skip_save {
+                            // `SKIP_SAVE_ON_SELF_RESTORE`: the request just
+                            // restored its own key, so the KV file already
+                            // holds this key's state (and the restore touched
+                            // the meta) — skip the redundant save + meta
+                            // write. report_success/mark_used ran above.
+                            tracing::info!(
+                                "kv_save_skipped g={g} key={} reason=self_restore",
+                                short16(key)
+                            );
+                            prune_cache(&state.config);
+                            false
+                        } else if state.config.backends[g.be].kv_cache {
                             match save_big(state, g, key, prefix, blocks, backend_model_id).await {
-                                Ok(ok) => ok,
+                                Ok(out) => {
+                                    // Request log: the total duration of the
+                                    // action=save API calls (the backend may
+                                    // still have rejected the save with a 500).
+                                    if let Ok(mut s) = pl.save_ms.lock() {
+                                        *s = Some(out.call_ms);
+                                    }
+                                    out.ok
+                                }
                                 Err(b) => {
                                     let (resp, o) = *b;
                                     state.sm.release(guard);
-                                    pl = with_slot(pl, g, restored, restore_call);
+                                    pl = with_slot(pl, g, restored, restore_call, restore_ms);
                                     pl.reason = Some("save_failed".into());
                                     return (with_pipeline_log(resp, pl), Some(o));
                                 }
@@ -1406,7 +1540,7 @@ async fn run_pipeline(
                         t0.elapsed().as_millis()
                     );
                     let val = json!({ "object": "error", "message": message, "raw": raw });
-                    pl = with_slot(pl, g, restored, restore_call);
+                    pl = with_slot(pl, g, restored, restore_call, restore_ms);
                     return (
                         with_pipeline_log(
                             (StatusCode::OK, axum::Json(val.clone())).into_response(),
@@ -1423,14 +1557,41 @@ async fn run_pipeline(
                     // would keep the first slot in the "never used" free tier
                     // and pin all traffic to it.
                     state.sm.mark_used(g);
+                    let skip_save = skip_save_for_self_restore(
+                        state.config.skip_save_on_self_restore,
+                        &guard,
+                        &restore_key,
+                        key,
+                        &state.config.meta_dir,
+                    );
                     let save_ok = if is_big {
-                        if state.config.backends[g.be].kv_cache {
+                        if state.config.backends[g.be].kv_cache && skip_save {
+                            // `SKIP_SAVE_ON_SELF_RESTORE`: the request just
+                            // restored its own key, so the KV file already
+                            // holds this key's state (and the restore touched
+                            // the meta) — skip the redundant save + meta
+                            // write. report_success/mark_used ran above.
+                            tracing::info!(
+                                "kv_save_skipped g={g} key={} reason=self_restore",
+                                short16(key)
+                            );
+                            prune_cache(&state.config);
+                            false
+                        } else if state.config.backends[g.be].kv_cache {
                             match save_big(state, g, key, prefix, blocks, backend_model_id).await {
-                                Ok(ok) => ok,
+                                Ok(out) => {
+                                    // Request log: the total duration of the
+                                    // action=save API calls (the backend may
+                                    // still have rejected the save with a 500).
+                                    if let Ok(mut s) = pl.save_ms.lock() {
+                                        *s = Some(out.call_ms);
+                                    }
+                                    out.ok
+                                }
                                 Err(b) => {
                                     let (resp, o) = *b;
                                     state.sm.release(guard);
-                                    pl = with_slot(pl, g, restored, restore_call);
+                                    pl = with_slot(pl, g, restored, restore_call, restore_ms);
                                     pl.reason = Some("save_failed".into());
                                     return (with_pipeline_log(resp, pl), Some(o));
                                 }
@@ -1464,7 +1625,7 @@ async fn run_pipeline(
                     {
                         tracing::warn!("result_cache_store_fail key={}: {e}", short16(key));
                     }
-                    pl = with_slot(pl, g, restored, restore_call);
+                    pl = with_slot(pl, g, restored, restore_call, restore_ms);
                     // Request log: the backend's `usage`/`timings` from the
                     // completion (llama.cpp includes them in the response).
                     if let Some(perf) = &pl.perf {
@@ -1597,6 +1758,37 @@ fn build_out_body(body: &Value, client_model: &str, is_big: bool, g: GSlot) -> V
     out_body
 }
 
+/// `SKIP_SAVE_ON_SELF_RESTORE`: whether this request's post-request KV save
+/// can be skipped — true only when the request *successfully restored its
+/// own key*: the LCP candidate equals the request key, the outcome is
+/// `Restored`, and either the `action=restore` API call actually ran and
+/// loaded the file (cold — the 200 response proves the KV file's presence
+/// and contents) or the acquire was the no-op "already running" warm
+/// variant and the key's meta file is still on disk (a pruned or deleted
+/// meta file makes the save re-write the pair — heal). The KV file then
+/// already holds this key's state and `touch_restored_meta` refreshed its
+/// mtime, so re-saving would only rewrite the same key with this request's
+/// fresh completion (growing the file every round). This is key *equality*,
+/// not `lcp_ratio == 1.0`: a ratio-1.0 *prefix* match (a multi-turn
+/// extension) is not a self-restore and must save — that save is what
+/// extends the cache chain. `Rejected`/`Failed` restores always save (the
+/// save heals a missing/corrupt file).
+fn skip_save_for_self_restore(
+    enabled: bool,
+    guard: &SlotGuard,
+    restore_key: &Option<String>,
+    key: &str,
+    meta_dir: &Path,
+) -> bool {
+    enabled
+        && guard.restored == Some(RestoreOutcome::Restored)
+        && restore_key.as_deref() == Some(key)
+        // A cold restore call re-verified the file (its 200 loaded it); a
+        // warm no-op did not, so trust the file only while the meta is
+        // still on disk (the stat runs only for warm self-restores).
+        && (guard.restore_call || hashing::meta_exists(meta_dir, key))
+}
+
 /// LRU bookkeeping: a successful restore counts as a "use" of the cached
 /// entry — bump its meta-file timestamp (see [`hashing::touch_meta`]).
 /// Without this, a just-restored entry could be evicted by this very
@@ -1689,10 +1881,11 @@ async fn retry_after_failure(
 
 /// Runs the big-request `save_after` + `write_meta` sequence.
 ///
-/// Returns the save status on success, or a 500 response (plus its shared
-/// coalescing outcome) when either step fails (mirrors the Python
-/// `try / except` around `sm.save_after` + `hs.write_meta`, which bubbles
-/// up to the outer 500 handler).
+/// Returns the save outcome on success (whether the backend accepted the
+/// save, plus the total duration of the `action=save` API calls), or a 500
+/// response (plus its shared coalescing outcome) when either step fails
+/// (mirrors the Python `try / except` around `sm.save_after` +
+/// `hs.write_meta`, which bubbles up to the outer 500 handler).
 async fn save_big(
     state: &AppState,
     g: GSlot,
@@ -1700,8 +1893,8 @@ async fn save_big(
     prefix: &str,
     blocks: &[String],
     backend_model_id: &str,
-) -> Result<bool, Box<(Response, SharedOutcome)>> {
-    let ok = state.sm.save_after(g, key).await.map_err(|e| {
+) -> Result<SaveOutcome, Box<(Response, SharedOutcome)>> {
+    let out = state.sm.save_after(g, key).await.map_err(|e| {
         if matches!(e, BackendError::Other(_)) {
             tracing::warn!("save_error g={g} key={}: {e}", short16(key));
             state.sm.report_failure(g);
@@ -1729,7 +1922,13 @@ async fn save_big(
         ))
     })?;
     prune_cache(&state.config);
-    Ok(ok)
+    tracing::info!(
+        "kv_saved g={g} key={} ok={} save_ms={:.1}",
+        short16(key),
+        out.ok,
+        out.call_ms
+    );
+    Ok(out)
 }
 
 /// Bounded LRU cache pruning (deviation from Python, which never prunes).

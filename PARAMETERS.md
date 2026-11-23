@@ -37,12 +37,13 @@ precedence over the built-in defaults. `-h` / `--help` prints the built-in help.
 | `STREAM_QUEUE_SIZE` | `--stream-queue-size <N>` | `16` | Capacity of the per-request bounded channel that buffers streamed SSE bytes between the background reader and the HTTP response. Must be `>= 1` (`0`/invalid fall back to the default with a warning). Smaller values backpressure a slow client faster; the default is 16 |
 | `COALESCE_REQUESTS` | `--coalesce-requests <BOOL>` | `false` | Group concurrent requests with the same KV cache key into one backend call (followers receive the leader's result, regardless of generation parameters) |
 | `SLOT_ROUTING_POLICY` | `--slot-routing-policy <POL>` | `lru` | Slot pick policy. `lru` (default): free (never-used) slots first in insertion order, then the least recently used slot — a slot becomes "used" when any request completes on it (success or failure; small requests never save, so the completion itself stamps it), which is what moves traffic on to the next free slot — the restore key never influences the pick (a picked slot already running the key is detected after the pick and the restore is skipped). `key_affinity`: for a request that carries a KV restore key, an **idle** slot already running that key is preferred before the free/LRU tiers, so the restore becomes a zero-wire-call skip instead of a redundant backend call. Case-insensitive (`key-affinity` accepted as an alias); unknown values log a warning and fall back to `lru` |
-| `PLUGINS` | `--plugins <JSON>` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` loaded from the `lpcache-plugins` registry at runtime — built-ins: `keyword`, `qwen_guard`, `result_cache`, `chain`, `llama`, `request_log`, `dashboard`. Full per-plugin parameter reference: see the **Plugins** subsection below. |
+| `PLUGINS` | `--plugins <JSON>` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` loaded from the `lpcache-plugins` registry at runtime — built-ins: `keyword`, `qwen_guard`, `result_cache`, `chain`, `llama`, `request_log`, `payload_log`, `dashboard`. Full per-plugin parameter reference: see the **Plugins** subsection below. |
 | `REQUEST_LOG` | `--request-log <BOOL>` | `false` | When true, one [W3C-XLF](https://www.w3.org/TR/xlf-10/) record per **finished** request (successes, errors and client disconnects — the record is written when the response body completes or is dropped) is appended to `REQUEST_LOG_PATH` — the built-in `request_log` plugin |
 | `REQUEST_LOG_PATH` | `--request-log-path <PATH>` | `lpcache-request.log` | Request-log file location; relative paths resolve against the **current working directory**; the parent dir is created at startup |
 | `REQUEST_LOG_MAX_BYTES` | `--request-log-max-bytes <N>` | `10485760` (10 MiB) | Rotation threshold in bytes: the current file is renamed to `<path>.1` and older generations shift upward (`<path>.2`, …); the fresh current file starts with a new XLF header. `0` = no rotation |
 | `REQUEST_LOG_KEEP` | `--request-log-keep <N>` | `5` | Rotated generations retained (the oldest is dropped); `0` = keep them all |
 | `REQUEST_LOG_FIELDS` | `--request-log-fields <LIST>` | all 36 fields | Comma-separated **ordered** subset of the known XLF field names — W3C fields `datetime`, `cs-method`, `cs-uri`, `c-ip`, `cs(User-Agent)`, `cs-bytes`, `cs-time`, `sc-status`, `sc-bytes` plus the lpcache pipeline fields `lpcache-model`, `lpcache-stream`, `lpcache-key`, `lpcache-n-words`, `lpcache-is-big`, `lpcache-backend`, `lpcache-slot`, `lpcache-restored`, `lpcache-restore-call`, `lpcache-restore-candidate` (the key the LCP scan picked as the best restore candidate — equals `lpcache-key` on an exact-key repeat, differs on a closest-prefix match), `lpcache-lcp-ratio` (that candidate's LCP ratio, 0..=1, 3 decimals), `lpcache-cache-hit`, `lpcache-coalesced`, `lpcache-reason` and the lpcache performance fields `lpcache-prompt-tokens`, `lpcache-completion-tokens`, `lpcache-cached-tokens` (backend `usage` — the last one is the prompt tokens served from the backend's KV cache), `lpcache-prefill-ms`, `lpcache-gen-ms`, `lpcache-prefill-tps`, `lpcache-gen-tps` (backend `timings`) and `lpcache-ttft-ms` (proxy-side time to first token, streaming only), and the lpcache resource fields `lpcache-cpu-ms`, `lpcache-disk-read-bytes`, `lpcache-disk-write-bytes`, `lpcache-ram-bytes`, `lpcache-peak-ram-bytes` (the proxy process's own CPU time and disk I/O during the request, plus its resident memory — `VmRSS`/working set — and peak resident memory — `VmHWM`/peak working set, high-water mark since process start — when the request completed; the CPU/disk values are process-wide counter deltas, so approximate under concurrency, while the memory values are point-in-time gauges; `-` where the platform cannot sample them). Missing values render as `-`; values containing whitespace/quotes are quoted+escaped per XLF. `lpcache-reason` is `-` on success, otherwise the pipeline outcome (`prefilter_reject`, `slot_timeout`, `backend_unreachable`, `backend_error`, `provider_http_<status>`, `provider_non_object`, `coalesce_leader_failed`, `save_failed`). Log I/O failures are swallowed — logging never breaks serving. Caveats: `c-ip` needs a real socket connection (Axum `ConnectInfo`); `cs-bytes` is taken from `Content-Length` (chunked requests without one log `-`) |
+| `REQUEST_PAYLOAD_DIR` | `--request-payload-dir <PATH>` | — | When set, each chat request's **raw payload** (plus its HTTP headers in a paired `.headers` file) is written to unique files in this directory as it arrives — before JSON parsing, prefiltering or backend dispatch, so malformed and rejected requests are captured too: `{dir}/{seq:06}-{timestamp}-{key16}.json` (non-UTF-8 payloads use `.bin`) and `{same base name}.headers` (one `name: value` line per request header, names lowercased, in wire order), where `seq` is a per-process counter, `timestamp` the UTC receive time and `key16` the first 16 hex chars of the request's KV cache key (`nokey` when the payload could not be parsed). Relative paths resolve against the **current working directory**; the directory is created at startup; files are never rotated or deleted by the proxy (payloads and headers may contain sensitive data — prune the directory yourself). A `payload_log` spec in `PLUGINS` takes precedence — the built-in `payload_log` plugin |
 | `PREFILTER_BLOCKLIST` | `--prefilter-blocklist <LIST>` | — | **Legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset). Comma-separated keywords (surrounding whitespace ignored, empty entries dropped). When set, requests whose message contents (string content or text content parts) contain any keyword are **rejected with `400` before any slot/backend work** — no slot is acquired, no KV cache is restored/saved, no meta file is written, and the request never joins a coalescing group. Unset/blank = no prefilter |
 | `PREFILTER_CASE_INSENSITIVE` | `--prefilter-case-insensitive <BOOL>` | `true` | **Legacy**: prefilter keyword matching is case-insensitive |
 | `PREFILTER_RESULT_CACHE_DIR` | `--prefilter-result-cache-dir <PATH>` | — | **Legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset). The **cache-result path** (dir holding one `{key}.json` per request KV cache key). When set, the result-cache prefilter answers fresh (non-expired) same-key requests with a previously cached backend result **before any slot/backend work** — no slot, no restore/save, no meta file, no coalescing group; fresh non-streaming 200 JSON results are stored under the key after the backend call; streaming requests are never served from the cache. Unset/blank = disabled |
@@ -98,11 +99,16 @@ Rules:
   `request_log` spec — whether set or unset — `REQUEST_LOG=true` still
   synthesizes a `request_log` spec from the `REQUEST_LOG_*` values and appends
   it.
+- **Payload logging:** a `payload_log` **spec** in `PLUGINS` takes precedence
+  over `REQUEST_PAYLOAD_DIR` the same way; when `PLUGINS` has **no**
+  `payload_log` spec and `REQUEST_PAYLOAD_DIR` is set, a `payload_log` spec is
+  synthesized from it and appended.
 - The **`llama` backend client is not selected here**: one built-in `llama`
   plugin client is created per backend from `BACKENDS` / `LLAMA_URL`,
   `LLAMA_API_KEY` and `REQUEST_TIMEOUT`. It is listed below for reference and
   for embedded use, where a `llama` spec can be loaded explicitly.
-- At most **one** `request_log` and one `dashboard` plugin may be configured.
+- At most **one** `request_log`, one `payload_log` and one `dashboard`
+  plugin may be configured.
 - Invalid specs are **startup errors** — the proxy prints the offending entry
   and exits with code 2 before binding its port; per-plugin validation rules
   and the exact error-message formats are documented in
@@ -213,6 +219,26 @@ ignored. See the `REQUEST_LOG*` rows above for the full field list.
 | `keep` | `5` | Rotated generations retained (the oldest is dropped); `0` = keep them all |
 | `fields` | all 36 fields | Ordered list of field names to emit — any subset of the known XLF fields (see `REQUEST_LOG_FIELDS`); omitted = all 36. An empty list, an unknown name, or a duplicate is a startup error |
 
+#### `payload_log` — raw request-payload logger
+
+One **payload file plus a paired headers file per chat-request payload**,
+written as the payload arrives — before JSON parsing, prefiltering or backend
+dispatch, so malformed and rejected requests are captured too. File names:
+`{dir}/{seq:06}-{timestamp}-{key16}.json` (`.bin` for non-UTF-8 payloads) and
+`{same base name}.headers` (one `name: value` line per request header, names
+lowercased, in wire order), where `seq` is a per-process 1-based counter,
+`timestamp` the UTC receive time (`%Y-%m-%dT%H-%M-%S.%fZ`, colons replaced by
+dashes) and `key16` the first 16 hex chars of the request's KV cache key
+(`nokey` when the payload could not be parsed into a chat request). A
+`payload_log` spec in `PLUGINS` takes precedence over `REQUEST_PAYLOAD_DIR`.
+Payloads and headers may contain sensitive data (`Authorization` values
+included) — treat the directory like a log file and prune it; the proxy never
+rotates or deletes the files. At most one `payload_log` plugin.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `dir` (required) | — | The directory the payload files are written to; relative paths resolve against the **current working directory**; the directory is created at startup. Missing or blank = startup error |
+
 #### `dashboard` — real-time statistics web dashboard
 
 Serves a self-contained HTML page (inline CSS + JS, no external assets) plus a
@@ -262,6 +288,7 @@ lpcache --plugins '[
   {"name": "keyword",      "params": {"keywords": ["forbidden"]}},
   {"name": "result_cache", "params": {"dir": "./result_cache", "ttl_secs": 600}},
   {"name": "request_log",  "params": {"path": "./lpcache.log", "max_bytes": 5242880}},
+  {"name": "payload_log",  "params": {"dir": "./payloads"}},
   {"name": "dashboard",    "params": {"path": "/dashboard"}}
 ]'
 ```
@@ -305,6 +332,10 @@ llama-server -m ./model.gguf -np 4 --api-key 777 \
   variables — with `PLUGINS` set, the spec synthesized from the `REQUEST_LOG*` settings is
   not appended. After a rotation the current file is missing until the next record is
   written (the rotated file holds the records up to the rotation).
+- Payload log: a `payload_log` spec in `PLUGINS` takes precedence over
+  `REQUEST_PAYLOAD_DIR` the same way. Payload files are never rotated or
+  deleted by the proxy — prune the directory manually; payloads may contain
+  sensitive data.
 - Slot acquire timeout (300 s) and circuit-breaker cooldowns (5 s → 60 s,
   probe recovery) are built-in behaviour, not configurable.
 

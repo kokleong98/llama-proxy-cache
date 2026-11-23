@@ -144,8 +144,15 @@ footer{padding:10px 20px;color:var(--dim);font-size:12px;border-top:1px solid va
       </div>
     </details>
     <details open>
+      <summary>Payload log</summary>
+      <div class="grid">
+        <label>Request payload dir (REQUEST_PAYLOAD_DIR)<input id="f_plog_dir" placeholder="(disabled)"></label>
+      </div>
+      <div class="note">One file per chat-request payload, written as it arrives (before prefilter / cache / backend), named <code>{seq}-{timestamp}-{key16}.json</code> (<code>.bin</code> for non-UTF-8 bodies, <code>nokey</code> when the payload is unparseable). Empty = disabled; the proxy never rotates or deletes the dir — prune it yourself.</div>
+    </details>
+    <details open>
       <summary>Plugins (PLUGINS)</summary>
-      <div class="note">The ordered plugin chain, as JSON plugin specs <code>[{"name": "…", "params": {…}}]</code>. Pick a built-in, fill in its params (the hints show each param's default and allowed values). When non-empty this <b>takes precedence</b> over the Prefilter section above (the proxy then ignores the legacy settings) and <code>request_log</code> here wins over the Request log toggle.</div>
+      <div class="note">The ordered plugin chain, as JSON plugin specs <code>[{"name": "…", "params": {…}}]</code>. Pick a built-in, fill in its params (the hints show each param's default and allowed values). When non-empty this <b>takes precedence</b> over the Prefilter section above (the proxy then ignores the legacy settings) and <code>request_log</code> / <code>payload_log</code> here win over the Request log / Payload log toggles.</div>
       <div id="plugin-list" class="plist"></div>
       <div class="plugin-add">
         <button id="btn-plugins-raw" class="small" title="Edit the raw JSON list">Raw JSON</button>
@@ -229,6 +236,9 @@ function collect() {
       keep: int($('f_rlog_keep').value),
       fields: lines($('f_rlog_fields'))
     },
+    payload_log: {
+      dir: $('f_plog_dir').value.trim()
+    },
     plugins: { json: rawVisible() ? $('f_plugins').value.trim() : pluginText() }
   };
 }
@@ -260,6 +270,7 @@ function apply(c) {
   $('f_rlog_max').value = c.request_log.max_bytes;
   $('f_rlog_keep').value = c.request_log.keep;
   $('f_rlog_fields').value = (c.request_log.fields || []).join('\n');
+  $('f_plog_dir').value = (c.payload_log && c.payload_log.dir) || '';
   applyPlugins(c.plugins.json);
 }
 

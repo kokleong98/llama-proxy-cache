@@ -18,9 +18,9 @@ pub const FORMATS: &[&str] = &["env", "cli", "systemd", "docker", "llama-server"
 /// single-quoted otherwise (`'` escaped as `'\''`).
 pub fn shquote(s: &str) -> String {
     if !s.is_empty()
-        && s
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | ':' | '@' | '-' | '_' | ',' | '+'))
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | ':' | '@' | '-' | '_' | ',' | '+')
+        })
     {
         s.to_string()
     } else {
@@ -98,7 +98,10 @@ pub fn to_systemd(cfg: &LpcacheConfig) -> String {
 /// Reduce a path to a safe volume name (slashes → `_`, leading dot/dash
 /// dropped, empty → `data`).
 fn volume_name(p: &str) -> String {
-    let flat: String = p.trim().chars().map(|c| (c == '/' || c == '.').then(|| '_').unwrap_or(c))
+    let flat: String = p
+        .trim()
+        .chars()
+        .map(|c| (c == '/' || c == '.').then(|| '_').unwrap_or(c))
         .collect();
     let flat = flat.trim_matches('_').to_string();
     if flat.is_empty() {
@@ -125,12 +128,13 @@ pub fn to_docker(cfg: &LpcacheConfig) -> String {
     // KV/meta state persists
     let mut volumes: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let add_vol = |volumes: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, p: &str| {
-        let name = volume_name(p);
-        if seen.insert(name.clone()) {
-            volumes.push(format!("-v \"$PWD/{name}:/data/{name}\""));
-        }
-    };
+    let add_vol =
+        |volumes: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, p: &str| {
+            let name = volume_name(p);
+            if seen.insert(name.clone()) {
+                volumes.push(format!("-v \"$PWD/{name}:/data/{name}\""));
+            }
+        };
     add_vol(&mut volumes, &mut seen, &cfg.kv_cache.meta_dir);
     for be in &cfg.backends {
         if !be.slot_save_path.trim().is_empty() {
@@ -138,7 +142,11 @@ pub fn to_docker(cfg: &LpcacheConfig) -> String {
         }
     }
     if !cfg.prefilter.result_cache_dir.trim().is_empty() {
-        add_vol(&mut volumes, &mut seen, cfg.prefilter.result_cache_dir.trim());
+        add_vol(
+            &mut volumes,
+            &mut seen,
+            cfg.prefilter.result_cache_dir.trim(),
+        );
     }
     for v in &volumes {
         lines.push(format!("  {v} \\"));
@@ -148,12 +156,14 @@ pub fn to_docker(cfg: &LpcacheConfig) -> String {
     }
     // the last -e line must not end with a continuation backslash
     let last = lines.last_mut().expect("at least one -e line");
-    *last = last.trim_end_matches(' ').trim_end_matches('\\').to_string();
+    *last = last
+        .trim_end_matches(' ')
+        .trim_end_matches('\\')
+        .to_string();
     lines.push("  lpcache:latest".into());
     let _ = writeln!(s, "{}", lines.join("\n"));
     s
 }
-
 
 /// The matching `llama-server` command(s) — one per configured backend,
 /// with the flags the proxy depends on (`-np`, `--api-key`,
@@ -235,7 +245,10 @@ fn host_port_from_url(url: &str) -> (String, u16) {
     };
     let hostpart = rest.split('/').next().unwrap_or(rest);
     match hostpart.rsplit_once(':') {
-        Some((host, port)) => (host.to_string(), port.parse::<u16>().unwrap_or(default_port)),
+        Some((host, port)) => (
+            host.to_string(),
+            port.parse::<u16>().unwrap_or(default_port),
+        ),
         None => (hostpart.to_string(), default_port),
     }
 }
@@ -309,8 +322,14 @@ mod tests {
 
     #[test]
     fn host_port_parsing() {
-        assert_eq!(host_port_from_url("http://127.0.0.1:8000"), ("127.0.0.1".into(), 8000));
-        assert_eq!(host_port_from_url("https://example.com/x"), ("example.com".into(), 443));
+        assert_eq!(
+            host_port_from_url("http://127.0.0.1:8000"),
+            ("127.0.0.1".into(), 8000)
+        );
+        assert_eq!(
+            host_port_from_url("https://example.com/x"),
+            ("example.com".into(), 443)
+        );
         assert_eq!(host_port_from_url("http://h"), ("h".into(), 80));
     }
 
@@ -321,4 +340,3 @@ mod tests {
         assert!(export(&cfg, "json").unwrap().contains("\"proxy\""));
     }
 }
-

@@ -20,6 +20,7 @@
 //!                PREFILTER_RESULT_CACHE_DIR / PREFILTER_RESULT_CACHE_TTL
 //! [request_log]  REQUEST_LOG / REQUEST_LOG_PATH / REQUEST_LOG_MAX_BYTES /
 //!                REQUEST_LOG_KEEP / REQUEST_LOG_FIELDS
+//! [payload_log]  REQUEST_PAYLOAD_DIR
 //! [plugins]      PLUGINS (raw JSON array of plugin specs)
 //! ```
 
@@ -41,6 +42,7 @@ pub struct LpcacheConfig {
     pub kv_cache: KvCacheConfig,
     pub prefilter: PrefilterConfig,
     pub request_log: RequestLogConfig,
+    pub payload_log: PayloadLogConfig,
     pub plugins: PluginsConfig,
 }
 
@@ -138,6 +140,14 @@ pub struct RequestLogConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct PayloadLogConfig {
+    /// `REQUEST_PAYLOAD_DIR`: dir for one file per chat-request payload
+    /// (`""` = disabled).
+    pub dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PluginsConfig {
     /// `PLUGINS`: raw JSON array of plugin specs
     /// (`[{"name": "...", "params": {...}}]`). When non-empty, the
@@ -165,7 +175,9 @@ impl Default for ProxyConfig {
             request_timeout_secs: lpcache::config::DEFAULT_REQUEST_TIMEOUT_SECS,
             stream_queue_size: lpcache::config::DEFAULT_STREAM_QUEUE_SIZE,
             coalesce_requests: false,
-            slot_routing_policy: lpcache::config::RoutingPolicy::default().as_str().to_string(),
+            slot_routing_policy: lpcache::config::RoutingPolicy::default()
+                .as_str()
+                .to_string(),
             api_key: String::new(),
         }
     }
@@ -209,9 +221,17 @@ impl Default for RequestLogConfig {
     }
 }
 
+impl Default for PayloadLogConfig {
+    fn default() -> Self {
+        Self { dir: String::new() }
+    }
+}
+
 impl Default for PluginsConfig {
     fn default() -> Self {
-        Self { json: String::new() }
+        Self {
+            json: String::new(),
+        }
     }
 }
 
@@ -223,13 +243,13 @@ impl Default for LpcacheConfig {
             kv_cache: KvCacheConfig::default(),
             prefilter: PrefilterConfig::default(),
             request_log: RequestLogConfig::default(),
+            payload_log: PayloadLogConfig::default(),
             plugins: PluginsConfig::default(),
         }
     }
 }
 
 impl LpcacheConfig {
-
     /// `(errors, warnings)` for the current configuration. Errors mean the
     /// proxy would misbehave or refuse to start; warnings usually indicate
     /// a mismatch with the backend's flags.
@@ -278,9 +298,7 @@ impl LpcacheConfig {
             errors.push("proxy.request_timeout_secs must be > 0".into());
         }
         if self.proxy.stream_queue_size == 0 {
-            errors.push(
-                "proxy.stream_queue_size must be >= 1 (0 is not representable)".into(),
-            );
+            errors.push("proxy.stream_queue_size must be >= 1 (0 is not representable)".into());
         }
         if !matches!(
             self.proxy.slot_routing_policy.to_ascii_lowercase().as_str(),
@@ -297,12 +315,14 @@ impl LpcacheConfig {
             errors.push("kv_cache.words_per_block must be >= 1".into());
         }
         if !(0.0..=1.0).contains(&self.kv_cache.lcp_th) {
-            errors.push(format!("kv_cache.lcp_th {} must be in 0..=1", self.kv_cache.lcp_th));
+            errors.push(format!(
+                "kv_cache.lcp_th {} must be in 0..=1",
+                self.kv_cache.lcp_th
+            ));
         }
         if self.kv_cache.meta_dir.trim().is_empty() {
-            warnings.push(
-                "kv_cache.meta_dir is empty — the proxy would not store meta files".into(),
-            );
+            warnings
+                .push("kv_cache.meta_dir is empty — the proxy would not store meta files".into());
         }
         if self.backends.len() > 1 && !self.kv_cache.slot_save_path.trim().is_empty() {
             warnings.push(
@@ -490,6 +510,15 @@ impl LpcacheConfig {
             }
         }
 
+        let pl = &self.payload_log;
+        if !pl.dir.trim().is_empty() {
+            v.push((
+                "payload log",
+                "REQUEST_PAYLOAD_DIR".into(),
+                pl.dir.trim().to_string(),
+            ));
+        }
+
         if !self.plugins.json.trim().is_empty() {
             v.push((
                 "plugins",
@@ -550,7 +579,10 @@ impl LpcacheConfig {
                 ));
             }
             if !f.result_cache_dir.trim().is_empty() {
-                a.push(format!("--prefilter-result-cache-dir {}", f.result_cache_dir));
+                a.push(format!(
+                    "--prefilter-result-cache-dir {}",
+                    f.result_cache_dir
+                ));
                 a.push(format!(
                     "--prefilter-result-cache-ttl {}",
                     fmt_num(f.result_cache_ttl_secs)
@@ -566,6 +598,10 @@ impl LpcacheConfig {
             if !r.fields.is_empty() {
                 a.push(format!("--request-log-fields {}", r.fields.join(",")));
             }
+        }
+        let pl = &self.payload_log;
+        if !pl.dir.trim().is_empty() {
+            a.push(format!("--request-payload-dir {}", pl.dir.trim()));
         }
         if !self.plugins.json.trim().is_empty() {
             a.push(format!("--plugins {}", self.plugins.json.trim()));
@@ -679,6 +715,13 @@ impl LpcacheConfig {
         } else {
             let _ = writeln!(s, "  enabled                false");
         }
+        let pl = &self.payload_log;
+        let _ = writeln!(s, "\n  [payload_log]");
+        if pl.dir.trim().is_empty() {
+            let _ = writeln!(s, "  dir                    (disabled)");
+        } else {
+            let _ = writeln!(s, "  dir                    {}", pl.dir);
+        }
         let _ = writeln!(s, "\n  [plugins]");
         let _ = writeln!(
             s,
@@ -721,9 +764,7 @@ impl LpcacheConfig {
             "kv_cache.meta_max" => Some(self.kv_cache.meta_max.to_string()),
             "kv_cache.slot_save_path" => Some(self.kv_cache.slot_save_path.clone()),
             "kv_cache.save_retries" => Some(self.kv_cache.save_retries.to_string()),
-            "kv_cache.save_retry_delay_ms" => {
-                Some(self.kv_cache.save_retry_delay_ms.to_string())
-            }
+            "kv_cache.save_retry_delay_ms" => Some(self.kv_cache.save_retry_delay_ms.to_string()),
             "prefilter.blocklist" => Some(self.prefilter.blocklist.join(",")),
             "prefilter.case_insensitive" => Some(self.prefilter.case_insensitive.to_string()),
             "prefilter.result_cache_dir" => Some(self.prefilter.result_cache_dir.clone()),
@@ -735,6 +776,7 @@ impl LpcacheConfig {
             "request_log.max_bytes" => Some(self.request_log.max_bytes.to_string()),
             "request_log.keep" => Some(self.request_log.keep.to_string()),
             "request_log.fields" => Some(self.request_log.fields.join(",")),
+            "payload_log.dir" => Some(self.payload_log.dir.clone()),
             "plugins.json" => Some(self.plugins.json.clone()),
             _ => None,
         }
@@ -768,6 +810,7 @@ impl LpcacheConfig {
             "request_log.max_bytes",
             "request_log.keep",
             "request_log.fields",
+            "payload_log.dir",
             "plugins.json",
         ]
     }
@@ -804,17 +847,13 @@ impl LpcacheConfig {
             "proxy.request_timeout_secs" => {
                 self.proxy.request_timeout_secs = parse_f64(value, key)?
             }
-            "proxy.stream_queue_size" => {
-                self.proxy.stream_queue_size = parse_usize(value, key)?
-            }
+            "proxy.stream_queue_size" => self.proxy.stream_queue_size = parse_usize(value, key)?,
             "proxy.coalesce_requests" => set_bool(&mut self.proxy.coalesce_requests, value, key)?,
             "proxy.slot_routing_policy" => {
                 self.proxy.slot_routing_policy = value.trim().to_string()
             }
             "proxy.api_key" => self.proxy.api_key = value.to_string(),
-            "kv_cache.words_per_block" => {
-                self.kv_cache.words_per_block = parse_usize(value, key)?
-            }
+            "kv_cache.words_per_block" => self.kv_cache.words_per_block = parse_usize(value, key)?,
             "kv_cache.big_threshold_words" => {
                 self.kv_cache.big_threshold_words = parse_usize(value, key)?
             }
@@ -839,12 +878,13 @@ impl LpcacheConfig {
             "request_log.max_bytes" => self.request_log.max_bytes = parse_u64(value, key)?,
             "request_log.keep" => self.request_log.keep = parse_usize(value, key)?,
             "request_log.fields" => set_list(&mut self.request_log.fields, value)?,
+            "payload_log.dir" => self.payload_log.dir = value.to_string(),
             "plugins.json" => self.plugins.json = value.to_string(),
             _ => {
                 return Err(format!(
                     "unknown key {key:?} (valid keys: {})",
                     Self::keys().join(", ")
-                ))
+                ));
             }
         }
         Ok(())
@@ -888,8 +928,7 @@ pub fn save(path: &Path, cfg: &LpcacheConfig) -> Result<(), String> {
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
     }
-    let raw = toml::to_string_pretty(cfg)
-        .map_err(|e| format!("cannot serialize config: {e}"))?;
+    let raw = toml::to_string_pretty(cfg).map_err(|e| format!("cannot serialize config: {e}"))?;
     std::fs::write(path, raw).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
@@ -902,7 +941,6 @@ pub fn fmt_num(n: f64) -> String {
         format!("{n}")
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -930,7 +968,8 @@ mod tests {
         assert_eq!(cfg.get_key("prefilter.blocklist").unwrap(), "foo,bar");
         cfg.set_key("proxy.coalesce_requests", "yes").unwrap();
         assert_eq!(cfg.get_key("proxy.coalesce_requests").unwrap(), "true");
-        cfg.set_key("proxy.slot_routing_policy", "key_affinity").unwrap();
+        cfg.set_key("proxy.slot_routing_policy", "key_affinity")
+            .unwrap();
         assert_eq!(
             cfg.get_key("proxy.slot_routing_policy").unwrap(),
             "key_affinity"
@@ -946,7 +985,12 @@ mod tests {
         cfg.kv_cache.slot_save_path = "kvcache".into();
         cfg.prefilter.blocklist = vec!["bad".into()];
         let pairs = cfg.env_pairs();
-        let get = |k: &str| pairs.iter().find(|(_, key, _)| key == k).map(|(_, _, v)| v.clone());
+        let get = |k: &str| {
+            pairs
+                .iter()
+                .find(|(_, key, _)| key == k)
+                .map(|(_, _, v)| v.clone())
+        };
         assert_eq!(get("LLAMA_URL").as_deref(), Some("http://127.0.0.1:8000"));
         assert_eq!(get("N_SLOTS").as_deref(), Some("1"));
         assert_eq!(get("SLOT_SAVE_PATH").as_deref(), Some("kvcache"));
@@ -955,6 +999,16 @@ mod tests {
         assert_eq!(get("PREFILTER_BLOCKLIST").as_deref(), Some("bad"));
         assert!(get("BACKENDS").is_none());
         assert!(get("REQUEST_LOG").is_none());
+        // payload logging off by default
+        assert!(get("REQUEST_PAYLOAD_DIR").is_none());
+        cfg.payload_log.dir = "/var/payloads".into();
+        let get = |k: &str| {
+            cfg.env_pairs()
+                .iter()
+                .find(|(_, key, _)| key == k)
+                .map(|(_, _, v)| v.clone())
+        };
+        assert_eq!(get("REQUEST_PAYLOAD_DIR").as_deref(), Some("/var/payloads"));
     }
 
     #[test]
@@ -967,7 +1021,12 @@ mod tests {
             kv_cache: false,
         });
         let pairs = cfg.env_pairs();
-        let get = |k: &str| pairs.iter().find(|(_, key, _)| key == k).map(|(_, _, v)| v.clone());
+        let get = |k: &str| {
+            pairs
+                .iter()
+                .find(|(_, key, _)| key == k)
+                .map(|(_, _, v)| v.clone())
+        };
         assert!(get("LLAMA_URL").is_none());
         let backends = get("BACKENDS").unwrap();
         let v: serde_json::Value = serde_json::from_str(&backends).unwrap();
@@ -1011,4 +1070,3 @@ mod tests {
         assert!(!args.iter().any(|a| a.starts_with("--request-log ")));
     }
 }
-

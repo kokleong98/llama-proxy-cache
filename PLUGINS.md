@@ -8,7 +8,7 @@ Comprehensive guide to the `lpcache` **adapter-plugin system** — what each bui
 
 1. [What a plugin is](#1-what-a-plugin-is)
 2. [Loading plugins](#2-loading-plugins)
-3. [Built-in plugins](#3-built-in-plugins) — `keyword`, `result_cache`, `qwen_guard`, `chain`, `llama`, `request_log`, `dashboard`
+3. [Built-in plugins](#3-built-in-plugins) — `keyword`, `result_cache`, `qwen_guard`, `chain`, `llama`, `request_log`, `payload_log`, `dashboard`
 4. [Writing a custom plugin](#4-writing-a-custom-plugin)
 5. [Configuration recipes](#5-configuration-recipes)
 6. [Live validation (Llama-3.2-1B)](#6-live-validation-llama-32-1b)
@@ -17,9 +17,9 @@ Comprehensive guide to the `lpcache` **adapter-plugin system** — what each bui
 
 ## 1. What a plugin is
 
-The proxy core — KV-cache-aware routing, slot management, concurrent-request coalescing, and backend failover (the `lpcache` crate) — is **backend- and policy-agnostic**. All "adapter" behavior lives in a separate crate, **`lpcache-plugins`**, behind six small, object-safe traits. The `lpcache` binary hard-codes **none** of these adapters: it **instantiates them from JSON configuration at startup** through a name-based registry. Which plugins run is decided entirely by configuration, not by compile-time wiring — so a custom plugin crate can register a new name and become loadable from configuration like any built-in.
+The proxy core — KV-cache-aware routing, slot management, concurrent-request coalescing, and backend failover (the `lpcache` crate) — is **backend- and policy-agnostic**. All "adapter" behavior lives in a separate crate, **`lpcache-plugins`**, behind seven small, object-safe traits. The `lpcache` binary hard-codes **none** of these adapters: it **instantiates them from JSON configuration at startup** through a name-based registry. Which plugins run is decided entirely by configuration, not by compile-time wiring — so a custom plugin crate can register a new name and become loadable from configuration like any built-in.
 
-The six adapter kinds (all used behind `Arc<dyn …>` in the proxy's `AppState`):
+The seven adapter kinds (all used behind `Arc<dyn …>` in the proxy's `AppState`):
 
 | Adapter trait | Role | Consulted when | Built-in plugin(s) |
 |---|---|---|---|
@@ -28,6 +28,7 @@ The six adapter kinds (all used behind `Arc<dyn …>` in the proxy's `AppState`)
 | `PostCleanup` | Post-serve cleanup of a cache entry | After a cached result has been read | `result_cache` (`remove_after_serve`) |
 | `LlamaBackend` | One llama.cpp backend client (chat, slot save/restore, model id) | During slot acquisition and dispatch | `llama` (auto, one per backend) |
 | `RequestLogger` | One W3C-XLF record per finished request | When each response completes (success/error/reject/disconnect) | `request_log` |
+| `PayloadLogger` | One raw-payload file plus a paired `.headers` file per chat request | As each payload arrives — before parsing, prefiltering or backend dispatch | `payload_log` |
 | `Dashboard` | Real-time statistics web page + JSON stats | Page/stats route polls; one record fed per finished request | `dashboard` |
 
 ### The request pipeline (where plugins hook in)
@@ -36,6 +37,7 @@ A `POST /v1/chat/completions` flows like this; the numbered **hooks** are where 
 
 ```text
 client ─▶ (H) request-log + dashboard middleware            (record on completion)
+       ─▶ (P) PayloadLogger.log_payload(raw, headers) ← payload_log  (as the payload arrives)
        ─▶ parse body, compute KV cache key
        ─▶ (1) PREFILTER chain   ← keyword / qwen_guard / result_cache / chain
              Accept → continue
@@ -85,6 +87,7 @@ startup error.
   - **`PLUGINS` set** → the prefilter specs are used **as-is**; the legacy `PREFILTER_*` variables are **ignored**.
   - **`PLUGINS` unset** → prefilter specs are **synthesized** from the legacy settings: a non-empty `PREFILTER_BLOCKLIST` → a `keyword` spec (placed first, so a blocked request is rejected with `400` before a cache hit could serve it), and `PREFILTER_RESULT_CACHE_DIR` set → a `result_cache` spec.
 - **Request logging:** a `request_log` **spec in `PLUGINS` takes precedence** — its params are used as-is, the `REQUEST_LOG*` settings are ignored, and the spec enables logging on its own (even with `REQUEST_LOG` unset). When `PLUGINS` has **no** `request_log` spec (whether `PLUGINS` is set without one or unset at all) and `REQUEST_LOG=true`, a `request_log` spec is synthesized from the `REQUEST_LOG_*` values and appended to the list — so `REQUEST_LOG=true` keeps enabling logging alongside `PLUGINS` unless `PLUGINS` carries its own `request_log` spec.
+- **Payload logging:** a `payload_log` **spec in `PLUGINS` takes precedence** the same way — its params are used as-is and `REQUEST_PAYLOAD_DIR` is ignored. When `PLUGINS` has **no** `payload_log` spec and `REQUEST_PAYLOAD_DIR` is set, a `payload_log` spec is synthesized from it and appended to the list.
 
 An empty array `[]` is valid and disables the prefilter.
 
@@ -93,8 +96,8 @@ An empty array `[]` is valid and disables the prefilter.
 The `lpcache-plugins` crate provides:
 
 - **`Registry`** — a `name → PluginFactory` map. `Registry::with_builtins()` registers the built-ins; `global()` / `ensure_builtin()` register them into the process-wide registry the `lpcache` binary uses.
-- **`PluginFactory`** — a trait with one method per adapter kind (`create_prefilter`, `create_backend`, `create_request_logger`, `create_dashboard`); a factory implements only the kind(s) it provides and returns `Ok(None)` for the rest.
-- **Loaders:** `load_prefilters(registry, specs)`, `load_request_loggers(registry, specs)`, `load_dashboard(registry, specs)`.
+- **`PluginFactory`** — a trait with one method per adapter kind (`create_prefilter`, `create_backend`, `create_request_logger`, `create_payload_logger`, `create_dashboard`); a factory implements only the kind(s) it provides and returns `Ok(None)` for the rest.
+- **Loaders:** `load_prefilters(registry, specs)`, `load_request_loggers(registry, specs)`, `load_payload_loggers(registry, specs)`, `load_dashboard(registry, specs)`.
 
 Loading rules (a bad spec is a **startup error** that names the offending entry):
 
@@ -102,6 +105,7 @@ Loading rules (a bad spec is a **startup error** that names the offending entry)
 |---|---|---|
 | prefilter | 0..n | Chained **in list order**; the first non-`Accept` decision wins. Specs for other kinds are skipped; an unknown name is an error. |
 | request logger | 0..1 | First spec providing a logger; a second is an error. Other kinds skipped. |
+| payload logger | 0..1 | First spec providing a payload logger; a second is an error. Other kinds skipped. |
 | dashboard | 0..1 | At most one; a second is an error. Other kinds skipped. |
 | `llama` backend | 1 per backend | **Not selected via `PLUGINS`.** One is created per `BACKENDS`/`LLAMA_URL` entry from the backend URL + `LLAMA_API_KEY` + `REQUEST_TIMEOUT`; it exists in the registry for embedded use. |
 
@@ -143,7 +147,7 @@ offending plugin — and, for a nested `chain` filter, its index:
 | an entry is not a spec object (missing / non-string `name`) | `PLUGINS[i]: spec must be an object with a `name` string` |
 | name not registered | `no plugin registered under name "x"` |
 | missing / malformed / out-of-range params | `invalid params for plugin "x": <detail>` |
-| a second `request_log` / `dashboard` spec | `invalid params for plugin "x": only one request logger plugin is supported` / `…only one dashboard plugin is supported` |
+| a second `request_log` / `payload_log` / `dashboard` spec | `invalid params for plugin "x": only one request logger plugin is supported` / `…only one payload logger plugin is supported` / `…only one dashboard plugin is supported` |
 
 Per-plugin validation (what makes a spec invalid at startup):
 
@@ -155,6 +159,7 @@ Per-plugin validation (what makes a spec invalid at startup):
 | `chain` | `filters` is missing, not an array, or empty; any nested spec is invalid (reported as `filters[i]: …`, so a nested unknown name or bad params is pinpointed) |
 | `llama` | `url` is missing or empty |
 | `request_log` | `path` is empty; `fields` is an empty list, names an unknown field, or repeats a field (the error lists the known fields) |
+| `payload_log` | `dir` is missing or empty |
 | `dashboard` | `path` does not start with `/`; **any unknown param** (see below); a number outside its range (`refresh_ms` 100..=3600000, `window_secs` 10..=86400, `bucket_secs` 1..=3600, `max_recent` 0..=10000) |
 
 Two asymmetries worth knowing:
@@ -178,7 +183,7 @@ Two asymmetries worth knowing:
 
 ## 3. Built-in plugins
 
-Each of the seven built-ins is a module in `plugins/src/builtin/` implementing one or more adapter traits plus a `PluginFactory`. Summary first, then behavior + worked examples:
+Each of the eight built-ins is a module in `plugins/src/builtin/` implementing one or more adapter traits plus a `PluginFactory`. Summary first, then behavior + worked examples:
 
 | name | adapters | one-liner |
 |---|---|---|
@@ -188,6 +193,7 @@ Each of the seven built-ins is a module in `plugins/src/builtin/` implementing o
 | `chain` | prefilter | Run nested prefilter plugins in order |
 | `llama` | backend | The reqwest-based llama.cpp backend client (auto per backend) |
 | `request_log` | request logger | W3C-XLF request log to a size-rotated file |
+| `payload_log` | payload logger | One raw request-payload file plus a paired `.headers` file per chat request, written as they arrive |
 | `dashboard` | dashboard | Real-time statistics web page + JSON stats endpoint |
 
 ### 3.1 `keyword` — keyword blocklist prefilter
@@ -372,7 +378,34 @@ Live results ([§6.6](#66-qwen_guard-fail-open--fail-closed)): with the guard do
 
 Live result ([§6.5](#65-request_log-xlf-request-log)): every request — including the `400` rejections (`lpcache-reason=prefilter_reject`) and the cache hit (`lpcache-cache-hit=true`) — appends one XLF line with the full field set.
 
-### 3.7 `dashboard` — real-time statistics web dashboard
+### 3.7 `payload_log` — raw request-payload logger
+
+**What it does.** One **payload file plus a paired headers file per chat-request payload**, written as the payload arrives — before JSON parsing, prefiltering or backend dispatch, so malformed and rejected requests are captured too. Unlike `request_log` (one summary record per *finished* request), the payload logger sees the payload at the top of the pipeline.
+
+**Behavior.**
+- **File name:** `{dir}/{seq:06}-{timestamp}-{key16}.json` (`.bin` for non-UTF-8 payloads), where `seq` is a per-process 1-based counter, `timestamp` the UTC receive time (`%Y-%m-%dT%H-%M-%S.%fZ` with the colons replaced by dashes, so the name is portable to every filesystem) and `key16` the first 16 hex chars of the request's KV cache key — `nokey` when the payload could not be parsed into a chat request (invalid JSON / non-object body), so the key was never computed.
+- **Paired headers file:** each payload file has a companion `{same base name}.headers` holding the request's HTTP headers as received — one `name: value` line per header, names lowercased, in wire order (duplicate names kept as separate lines; non-UTF-8 header values are dropped, so the file is always valid UTF-8). The pair shares one `seq`, so it can never mix with another request.
+- **Captures everything:** the files are written for valid requests *and* for the `422` malformed bodies (the latter under `nokey`). A body that cannot even be read off the socket is not captured (there is no payload).
+- **Unique names:** the `seq` prefix is assigned under a mutex, so concurrent requests never overwrite each other; the timestamp adds human readability.
+- **No rotation, no deletion:** the proxy never prunes the directory — payloads and headers may contain sensitive data (messages, system prompts, credentials echoed in tool calls, `Authorization` values), so treat the directory like a log file and prune it yourself.
+- **Directory:** relative `dir` resolves against the proxy's cwd; the directory (nested included) is created at startup, so a bad path fails there instead of on the first request.
+- **Never breaks serving:** writes run on the blocking pool (the async hot path never blocks on disk); failures are logged (`payload_log_write_fail`) and swallowed.
+
+**Params.**
+
+| Param | Default | Meaning |
+|---|---|---|
+| `dir` (required) | — | The directory the payload files are written to (relative → cwd; created at startup). Missing or blank is a startup error |
+
+**Example.**
+
+```json
+{ "name": "payload_log", "params": { "dir": "./payloads" } }
+```
+
+or the legacy variable: `REQUEST_PAYLOAD_DIR=./payloads` (a `payload_log` spec in `PLUGINS` takes precedence).
+
+### 3.8 `dashboard` — real-time statistics web dashboard
 
 **What it does.** Serves a self-contained HTML page (inline CSS + JS, no external assets) plus a JSON stats endpoint, fed by one record per finished request (the same records the request logger receives).
 
@@ -446,7 +479,8 @@ impl PluginFactory for TooLongFactory {
             .unwrap_or(1000) as usize;
         Ok(Some(Arc::new(TooLongPrefilter { max_words })))
     }
-    // create_backend / create_request_logger / create_dashboard: keep the defaults (Ok(None))
+    // create_backend / create_request_logger / create_payload_logger /
+    // create_dashboard: keep the defaults (Ok(None))
 }
 
 fn main() {
@@ -494,6 +528,11 @@ Each of the following is a complete `PLUGINS` value (set it as `PLUGINS='…'` o
   ```json
   [ { "name": "qwen_guard", "params": { "url": "http://127.0.0.1:8010", "reject_levels": ["Unsafe"] } } ]
   ```
+- **Capture raw request payloads (debugging/replay):**
+  ```json
+  [ { "name": "payload_log", "params": { "dir": "./payloads" } } ]
+  ```
+  (or just set `REQUEST_PAYLOAD_DIR=./payloads` — one payload file plus a paired `.headers` file per chat request, written as they arrive; see [§3.7](#37-payload_log-raw-request-payload-logger))
 - **Order matters.** Because prefilters run in list order and the first non-`Accept` wins, put cheap deterministic checks (`keyword`) before expensive or fallible ones (`qwen_guard`, `result_cache`).
 
 ---
