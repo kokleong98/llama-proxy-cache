@@ -94,6 +94,16 @@ pub fn lcp_blocks(a: &[String], b: &[String]) -> usize {
 pub fn prefix_key_sha256(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
+
+/// The KV cache filename (the `filename` sent to llama-server's
+/// `action=save`/`action=restore` API): `{lowercase(model_id)}_{key}`.
+/// The model prefix keeps the caches of different models apart in the
+/// backend's `--slot-save-path` directory; the lowercasing matches the
+/// model id the proxy uses in the cache key hash, so a key is always
+/// addressed by the same filename it was saved under.
+pub fn kv_basename(model_id: &str, key: &str) -> String {
+    format!("{}_{key}", model_id.to_lowercase())
+}
 /// Scan META_DIR for `*.meta.json` files, most recently modified first
 /// (port of `scan_all_meta`). Corrupt files are skipped with a warning.
 pub fn scan_all_meta(meta_dir: &Path) -> Vec<Meta> {
@@ -214,6 +224,20 @@ pub fn touch_meta(meta_dir: &Path, key: &str) {
     }
 }
 
+/// Whether `key`'s meta file currently exists on disk.
+///
+/// The file-health probe behind `SKIP_SAVE_ON_SELF_RESTORE`'s warm-restore
+/// rule: a no-op "already running" restore makes no backend call, so the KV
+/// file's presence is only trusted while the meta file still exists — a
+/// missing meta file makes the post-request save re-write the pair (heal).
+/// The KV file itself is not checked: it lives in the backend's
+/// `slot_save_path` dir, which the proxy may not even see, and a missing KV
+/// file self-heals one round later via the rejected-restore path
+/// (`remove_stale_meta` + re-save).
+pub fn meta_exists(meta_dir: &Path, key: &str) -> bool {
+    meta_dir.join(format!("{key}.meta.json")).is_file()
+}
+
 /// Bounded LRU pruning (deviation from Python, which never prunes).
 ///
 /// Removes the oldest `.meta.json` files until `META_DIR` holds at most
@@ -222,12 +246,15 @@ pub fn touch_meta(meta_dir: &Path, key: &str) {
 /// Unreadable/unparseable files are treated as oldest — they are useless
 /// to candidate lookup anyway. `max == 0` disables pruning.
 ///
-/// Returns the keys of the removed meta files, oldest first.
-pub fn prune_meta(meta_dir: &Path, max: usize) -> Vec<String> {
+/// Returns `(key, model_id)` of the removed meta files, oldest first;
+/// `model_id` is the meta file's own `model_id` (empty string when the
+/// file was unparseable) — the caller uses it to address the pruned KV
+/// files (`{lowercase(model_id)}_{key}`) in the slot-save directories.
+pub fn prune_meta(meta_dir: &Path, max: usize) -> Vec<(String, String)> {
     if max == 0 {
         return Vec::new();
     }
-    let mut entries: Vec<(f64, std::time::SystemTime, String)> = Vec::new();
+    let mut entries: Vec<(f64, std::time::SystemTime, String, Option<String>)> = Vec::new();
     let rd = match std::fs::read_dir(meta_dir) {
         Ok(rd) => rd,
         Err(e) => {
@@ -248,16 +275,20 @@ pub fn prune_meta(meta_dir: &Path, max: usize) -> Vec<String> {
         let mtime = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let ts = match std::fs::read_to_string(&path) {
-            Ok(txt) => serde_json::from_str::<Meta>(&txt)
-                .map(|m| m.timestamp)
-                .unwrap_or(0.0),
+        let (ts, model_id) = match std::fs::read_to_string(&path) {
+            Ok(txt) => match serde_json::from_str::<Meta>(&txt) {
+                Ok(m) => (m.timestamp, Some(m.model_id)),
+                Err(e) => {
+                    tracing::debug!("prune_meta unreadable {}: {e}", path.display());
+                    (0.0, None)
+                }
+            },
             Err(e) => {
                 tracing::debug!("prune_meta unreadable {}: {e}", path.display());
-                0.0
+                (0.0, None)
             }
         };
-        entries.push((ts, mtime, name));
+        entries.push((ts, mtime, name, model_id));
     }
     let excess = entries.len().saturating_sub(max);
     if excess == 0 {
@@ -270,19 +301,71 @@ pub fn prune_meta(meta_dir: &Path, max: usize) -> Vec<String> {
             .then_with(|| a.1.cmp(&b.1))
             .then_with(|| a.2.cmp(&b.2))
     });
-    let mut removed = Vec::with_capacity(excess);
-    for (_, _, name) in entries.iter().take(excess) {
+    let mut removed: Vec<(String, String)> = Vec::with_capacity(excess);
+    for (_, _, name, model_id) in entries.iter().take(excess) {
         let key = name.trim_end_matches(".meta.json").to_string();
         let path = meta_dir.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 tracing::debug!("prune_meta_removed key={}", short(&key));
-                removed.push(key);
+                removed.push((key, model_id.clone().unwrap_or_default()));
             }
             Err(e) => tracing::warn!("prune_meta_remove_fail {}: {e}", path.display()),
         }
     }
     tracing::info!("prune_meta removed={} max={max}", removed.len());
+    removed
+}
+
+/// Startup scan of `META_DIR`: remove the corrupt `.meta.json` files
+/// (unreadable or failing the [`Meta`] schema) so a crash-corrupted cache
+/// dir self-heals before the first request (deviation from Python, where
+/// `scan_all_meta` merely skips them on every request).
+///
+/// Returns the keys of the removed meta files (the filename minus
+/// `.meta.json`), in directory order. A missing/unreadable dir returns an
+/// empty list; a removal failure is logged and the key is not counted.
+pub fn clean_corrupt_meta(meta_dir: &Path) -> Vec<String> {
+    let rd = match std::fs::read_dir(meta_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            tracing::debug!("clean_corrupt_meta read_dir failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut removed: Vec<String> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !name.ends_with(".meta.json") {
+            continue;
+        }
+        let ok = match std::fs::read_to_string(&path) {
+            Ok(txt) => serde_json::from_str::<Meta>(&txt).is_ok(),
+            Err(e) => {
+                tracing::debug!("clean_corrupt_meta unreadable {}: {e}", path.display());
+                false
+            }
+        };
+        if ok {
+            continue;
+        }
+        let key = name.trim_end_matches(".meta.json").to_string();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::warn!("clean_corrupt_meta removed key={}", short(&key));
+                removed.push(key);
+            }
+            Err(e) => tracing::warn!(
+                "clean_corrupt_meta remove_fail {}: {e}",
+                path.display()
+            ),
+        }
+    }
     removed
 }
 
@@ -514,6 +597,19 @@ mod tests {
         assert!(!td.path().join("nope.meta.json").exists());
     }
 
+    #[test]
+    fn meta_exists_reports_file_presence() {
+        let td = tempfile::tempdir().unwrap();
+        assert!(!meta_exists(td.path(), "k"), "nothing written yet");
+        write_meta(td.path(), "k", "p", &["b".into()], 100, "m").unwrap();
+        assert!(meta_exists(td.path(), "k"));
+        std::fs::remove_file(td.path().join("k.meta.json")).unwrap();
+        assert!(!meta_exists(td.path(), "k"), "file removed");
+        // a directory named like a meta file is not a meta file
+        std::fs::create_dir(td.path().join("d.meta.json")).unwrap();
+        assert!(!meta_exists(td.path(), "d"));
+    }
+
     fn set_meta_ts(dir: &Path, key: &str, ts: f64) {
         let path = dir.join(format!("{key}.meta.json"));
         let txt = std::fs::read_to_string(&path).unwrap();
@@ -535,8 +631,14 @@ mod tests {
         set_meta_ts(td.path(), "kd", 30.0);
         set_meta_ts(td.path(), "ke", 70.0);
         let pruned = prune_meta(td.path(), 3);
-        // two oldest removed, oldest first
-        assert_eq!(pruned, vec!["kb", "kd"]);
+        // two oldest removed, oldest first; each carries its meta's model id
+        assert_eq!(
+            pruned,
+            vec![
+                ("kb".to_string(), "m".to_string()),
+                ("kd".to_string(), "m".to_string())
+            ]
+        );
         let remaining: Vec<String> = scan_all_meta(td.path())
             .iter()
             .map(|m| m.key.clone())
@@ -567,8 +669,58 @@ mod tests {
         set_meta_ts(td.path(), "good", 100.0);
         std::fs::write(td.path().join("bad.meta.json"), "not json").unwrap();
         let pruned = prune_meta(td.path(), 1);
-        // unparseable file is treated as oldest
-        assert_eq!(pruned, vec!["bad"]);
+        // unparseable file is treated as oldest; its model id is unknown
+        // (empty) so the caller cannot address a prefixed KV file
+        assert_eq!(pruned, vec![("bad".to_string(), String::new())]);
         assert!(td.path().join("good.meta.json").exists());
+    }
+
+    #[test]
+    fn clean_corrupt_meta_removes_bad_keeps_good() {
+        let td = tempfile::tempdir().unwrap();
+        write_meta(td.path(), "good", "p", &["b".into()], 100, "m").unwrap();
+        std::fs::write(td.path().join("badjson.meta.json"), "not json").unwrap();
+        std::fs::write(td.path().join("badschema.meta.json"), r#"{"foo": 1}"#).unwrap();
+        // a non-meta file in the dir is never touched
+        std::fs::write(td.path().join("notes.txt"), "keep me").unwrap();
+        let mut removed = clean_corrupt_meta(td.path());
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec!["badjson".to_string(), "badschema".to_string()]
+        );
+        assert!(td.path().join("good.meta.json").exists());
+        assert!(td.path().join("notes.txt").exists());
+        // idempotent: nothing corrupt left behind
+        assert!(clean_corrupt_meta(td.path()).is_empty());
+    }
+
+    #[test]
+    fn clean_corrupt_meta_missing_and_empty_dir_noop() {
+        let td = tempfile::tempdir().unwrap();
+        // empty dir
+        assert!(clean_corrupt_meta(td.path()).is_empty());
+        // missing dir
+        assert!(clean_corrupt_meta(&td.path().join("nope")).is_empty());
+    }
+
+    #[test]
+    fn clean_corrupt_meta_directory_named_like_meta_is_left_alone() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir(td.path().join("d.meta.json")).unwrap();
+        // a directory is unreadable as a meta file and cannot be removed
+        // with remove_file: it is warned about, not counted
+        assert!(clean_corrupt_meta(td.path()).is_empty());
+        assert!(td.path().join("d.meta.json").is_dir());
+    }
+
+    #[test]
+    fn kv_basename_lowercases_model_and_keeps_key() {
+        assert_eq!(
+            kv_basename("Llama-3.2-1B-Instruct-Q4_K_M", "abc123"),
+            "llama-3.2-1b-instruct-q4_k_m_abc123"
+        );
+        assert_eq!(kv_basename("m1", "k"), "m1_k");
+        assert_eq!(kv_basename("M1", "k"), "m1_k");
     }
 }

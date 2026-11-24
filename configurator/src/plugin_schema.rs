@@ -69,7 +69,8 @@ pub struct Param {
 #[derive(Debug, Clone, Copy)]
 pub struct Plugin {
     pub name: &'static str,
-    /// `prefilter`, `prefilter+store`, `backend`, `logger`, `dashboard`.
+    /// `prefilter`, `prefilter+store`, `backend`, `logger`,
+    /// `payload_logger`, `dashboard`.
     pub kind: &'static str,
     pub summary: &'static str,
     /// Offered by the add-plugin picker (false for the auto `llama`).
@@ -173,16 +174,46 @@ fn p(key: &'static str, label: &'static str, kind: FieldKind) -> Param {
 }
 
 impl Param {
-    const fn req(mut self) -> Self { self.required = true; self }
-    const fn no_empty(mut self) -> Self { self.error_if_empty = true; self }
-    const fn no_dup(mut self) -> Self { self.no_duplicates = true; self }
-    const fn comma(mut self) -> Self { self.comma_ok = true; self }
-    const fn def(mut self, d: &'static str) -> Self { self.default = d; self }
-    const fn help(mut self, h: &'static str) -> Self { self.help = h; self }
-    const fn ch(mut self, c: &'static [&'static str]) -> Self { self.choices = c; self }
-    const fn ge(mut self, m: f64) -> Self { self.min = Some(m); self }
-    const fn le(mut self, m: f64) -> Self { self.max = Some(m); self }
-    const fn alias(mut self, f: fn(&str) -> bool) -> Self { self.extra_ok = Some(f); self }
+    const fn req(mut self) -> Self {
+        self.required = true;
+        self
+    }
+    const fn no_empty(mut self) -> Self {
+        self.error_if_empty = true;
+        self
+    }
+    const fn no_dup(mut self) -> Self {
+        self.no_duplicates = true;
+        self
+    }
+    const fn comma(mut self) -> Self {
+        self.comma_ok = true;
+        self
+    }
+    const fn def(mut self, d: &'static str) -> Self {
+        self.default = d;
+        self
+    }
+    const fn help(mut self, h: &'static str) -> Self {
+        self.help = h;
+        self
+    }
+    const fn ch(mut self, c: &'static [&'static str]) -> Self {
+        self.choices = c;
+        self
+    }
+    const fn ge(mut self, m: f64) -> Self {
+        self.min = Some(m);
+        self
+    }
+    const fn le(mut self, m: f64) -> Self {
+        self.max = Some(m);
+        self
+    }
+    const fn alias(mut self, f: fn(&str) -> bool) -> Self {
+        self.extra_ok = Some(f);
+        self
+    }
 }
 
 fn plugin(
@@ -348,6 +379,16 @@ fn build() -> Vec<Plugin> {
         .unique()
         .build(),
         plugin(
+            "payload_log",
+            "payload_logger",
+            "one file per chat-request payload, written as it arrives",
+            vec![p("dir", "dir", Text)
+                .req()
+                .help("dir for the payload files {seq:06}-{timestamp}-{key16}.json (relative paths resolve against the proxy's cwd; created at startup)")],
+        )
+        .unique()
+        .build(),
+        plugin(
             "dashboard",
             "dashboard",
             "real-time statistics web page + JSON stats endpoint",
@@ -418,7 +459,6 @@ pub fn prefilter_plugins() -> Vec<&'static Plugin> {
         .collect()
 }
 
-
 /// Case-insensitive Levenshtein distance (short strings only — names).
 fn distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.to_lowercase().chars().collect();
@@ -463,13 +503,17 @@ pub fn spec_summary(v: &Value) -> String {
     };
     let detail = match name {
         "keyword" => sig("keywords").unwrap_or_else(|| "no keywords".into()),
-        "chain" => match params.and_then(|m| m.get("filters")).and_then(Value::as_array) {
+        "chain" => match params
+            .and_then(|m| m.get("filters"))
+            .and_then(Value::as_array)
+        {
             Some(items) => format!("{} nested filter(s)", items.len()),
             None => "no filters".into(),
         },
         "qwen_guard" => sig("url").unwrap_or_else(|| "no url".into()),
         "result_cache" => sig("dir").unwrap_or_else(|| "no dir".into()),
         "request_log" => sig("path").unwrap_or_else(|| "default path".into()),
+        "payload_log" => sig("dir").unwrap_or_else(|| "no dir".into()),
         "dashboard" => sig("path").unwrap_or_else(|| "/dashboard".into()),
         "llama" => sig("url").unwrap_or_else(|| "auto per backend".into()),
         _ => plg.kind.to_string(),
@@ -498,7 +542,13 @@ pub fn validate_plugins(raw: &str) -> (Vec<String>, Vec<String>) {
         }
     };
     for (i, v) in arr.iter().enumerate() {
-        validate_spec(v, &format!("plugins.json[{i}]"), 0, &mut errors, &mut warnings);
+        validate_spec(
+            v,
+            &format!("plugins.json[{i}]"),
+            0,
+            &mut errors,
+            &mut warnings,
+        );
     }
     // Singleton plugins (marked `unique` in the schema) — a second spec is a
     // startup error ("only one … plugin is supported").
@@ -546,7 +596,10 @@ fn validate_spec(
         return;
     }
     let Some(plg) = find(name) else {
-        let mut msg = format!("{at}: unknown plugin {name:?} (built-ins: {})", names_joined());
+        let mut msg = format!(
+            "{at}: unknown plugin {name:?} (built-ins: {})",
+            names_joined()
+        );
         if let Some(sug) = did_you_mean(name) {
             msg += &format!(", did you mean {sug:?}?");
         }
@@ -586,7 +639,12 @@ fn validate_spec(
             .filter(|k| !plg.params.iter().any(|p| &p.key == k))
             .collect();
         if !unknown.is_empty() {
-            let known = plg.params.iter().map(|p| p.key).collect::<Vec<_>>().join(", ");
+            let known = plg
+                .params
+                .iter()
+                .map(|p| p.key)
+                .collect::<Vec<_>>()
+                .join(", ");
             let msg = format!(
                 "{at} ({name}): unknown param(s): {} — known: {known}",
                 unknown.join(", ")
@@ -602,12 +660,11 @@ fn validate_spec(
         && let Some(Value::String(path)) = params.and_then(|m| m.get("path"))
         && !path.starts_with('/')
     {
-        errors.push(format!(r#"{at} (dashboard): path {path:?} must start with "/""#));
+        errors.push(format!(
+            r#"{at} (dashboard): path {path:?} must start with "/""#
+        ));
     }
 }
-
-
-
 
 fn type_of(v: &Value) -> &'static str {
     match v {
@@ -644,16 +701,23 @@ fn check_param(
         },
         FieldKind::Int | FieldKind::Float => {
             let Some(f) = v.as_f64() else {
-                bad(format!("expected a number, got {} (numbers are not quoted)", type_of(v)));
+                bad(format!(
+                    "expected a number, got {} (numbers are not quoted)",
+                    type_of(v)
+                ));
                 return;
             };
             if par.kind == FieldKind::Int && f.fract() != 0.0 {
                 bad(format!("must be a whole number (got {f})"));
             }
-            if let Some(min) = par.min && f < min {
+            if let Some(min) = par.min
+                && f < min
+            {
                 bad(format!("must be >= {min} (got {f})"));
             }
-            if let Some(max) = par.max && f > max {
+            if let Some(max) = par.max
+                && f > max
+            {
                 bad(format!("must be <= {max} (got {f})"));
             }
         }
@@ -681,11 +745,17 @@ fn check_param(
                         bad("list items must be strings".into());
                         None
                     }),
-                Value::String(s) if par.comma_ok => {
-                    Some(s.split(',').map(str::trim).filter(|s| !s.is_empty()).collect())
-                }
+                Value::String(s) if par.comma_ok => Some(
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                ),
                 other => {
-                    bad(format!("expected an array of strings, got {}", type_of(other)));
+                    bad(format!(
+                        "expected an array of strings, got {}",
+                        type_of(other)
+                    ));
                     None
                 }
             };
@@ -711,14 +781,20 @@ fn check_param(
                         par.choices.contains(&item)
                     };
                     if !hit {
-                        bad(format!("unknown value {item:?}; known: {}", par.choices.join(", ")));
+                        bad(format!(
+                            "unknown value {item:?}; known: {}",
+                            par.choices.join(", ")
+                        ));
                     }
                 }
             }
         }
         FieldKind::Nested => {
             let Some(items) = v.as_array() else {
-                bad(format!("expected an array of plugin specs, got {}", type_of(v)));
+                bad(format!(
+                    "expected an array of plugin specs, got {}",
+                    type_of(v)
+                ));
                 return;
             };
             if items.is_empty() {
@@ -726,7 +802,13 @@ fn check_param(
                 return;
             }
             for (j, item) in items.iter().enumerate() {
-                validate_spec(item, &format!("{at}.{}[{j}]", par.key), depth + 1, errors, warnings);
+                validate_spec(
+                    item,
+                    &format!("{at}.{}[{j}]", par.key),
+                    depth + 1,
+                    errors,
+                    warnings,
+                );
             }
         }
     }
@@ -808,6 +890,7 @@ mod tests {
                 "result_cache",
                 "chain",
                 "request_log",
+                "payload_log",
                 "dashboard",
                 "llama"
             ]
@@ -826,6 +909,7 @@ mod tests {
              "on_error":"reject","on_unparseable":"accept","cache_max":256}},
           {"name":"dashboard","params":{"path":"/dash","refresh_ms":1000,"window_secs":600,
              "bucket_secs":10,"max_recent":50}},
+          {"name":"payload_log","params":{"dir":"/var/payloads"}},
           {"name":"chain","params":{"filters":[{"name":"keyword","params":{"keywords":"x, y"}}]}}
         ]"#;
         let (errors, warnings) = validate_plugins(ok);
@@ -847,25 +931,52 @@ mod tests {
     #[test]
     fn required_params_are_enforced() {
         let e = errs(r#"[{"name":"qwen_guard","params":{"timeout_secs":"thirty"}}]"#);
-        assert!(e.iter().any(|x| x.contains("missing required param \"url\"")), "{e:?}");
-        assert!(e.iter().any(|x| x.contains("timeout_secs") && x.contains("expected a number")), "{e:?}");
+        assert!(
+            e.iter()
+                .any(|x| x.contains("missing required param \"url\"")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|x| x.contains("timeout_secs") && x.contains("expected a number")),
+            "{e:?}"
+        );
         let e = errs(r#"[{"name":"result_cache"}]"#);
-        assert!(e.iter().any(|x| x.contains("missing required param \"dir\"")), "{e:?}");
+        assert!(
+            e.iter()
+                .any(|x| x.contains("missing required param \"dir\"")),
+            "{e:?}"
+        );
         let e = errs(r#"[{"name":"keyword","params":{"keywords":[]}}]"#);
         assert!(e.iter().any(|x| x.contains("non-empty list")), "{e:?}");
         let e = errs(r#"[{"name":"chain"}]"#);
-        assert!(e.iter().any(|x| x.contains("missing required param \"filters\"")), "{e:?}");
+        assert!(
+            e.iter()
+                .any(|x| x.contains("missing required param \"filters\"")),
+            "{e:?}"
+        );
     }
 
     #[test]
     fn chain_filters_validate_recursively() {
         let e = errs(r#"[{"name":"chain","params":{"filters":["not-a-spec",{}]}}]"#);
-        assert!(e.iter().any(|x| x.contains("filters[0]") && x.contains("must be an object")), "{e:?}");
-        assert!(e.iter().any(|x| x.contains("filters[1]") && x.contains("missing \"name\"")), "{e:?}");
-        let e = errs(r#"[{"name":"chain","params":{"filters":[{"name":"chain","params":{"filters":"nope"}}]}}]"#);
         assert!(
             e.iter()
-                .any(|x| x.contains("plugins.json[0].filters[0]") && x.contains("array of plugin specs")),
+                .any(|x| x.contains("filters[0]") && x.contains("must be an object")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|x| x.contains("filters[1]") && x.contains("missing \"name\"")),
+            "{e:?}"
+        );
+        let e = errs(
+            r#"[{"name":"chain","params":{"filters":[{"name":"chain","params":{"filters":"nope"}}]}}]"#,
+        );
+        assert!(
+            e.iter()
+                .any(|x| x.contains("plugins.json[0].filters[0]")
+                    && x.contains("array of plugin specs")),
             "{e:?}"
         );
         let e = errs(r#"[{"name":"chain","params":{"filters":[]}}]"#);
@@ -881,9 +992,24 @@ mod tests {
         assert!(e.is_empty(), "{e:?}");
         assert!(w.iter().any(|x| x.contains("no effect")), "{w:?}");
         let e = errs(r#"[{"name":"request_log"},{"name":"request_log"}]"#);
-        assert!(e.iter().any(|x| x.contains("only one request_log")), "{e:?}");
+        assert!(
+            e.iter().any(|x| x.contains("only one request_log")),
+            "{e:?}"
+        );
         let e = errs(r#"[{"name":"dashboard"},{"name":"dashboard"}]"#);
         assert!(e.iter().any(|x| x.contains("only one dashboard")), "{e:?}");
+        let e = errs(r#"[{"name":"payload_log"},{"name":"payload_log"}]"#);
+        assert!(
+            e.iter().any(|x| x.contains("only one payload_log")),
+            "{e:?}"
+        );
+        // payload_log requires dir
+        let e = errs(r#"[{"name":"payload_log"}]"#);
+        assert!(
+            e.iter()
+                .any(|x| x.contains("missing required param \"dir\"")),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -894,38 +1020,74 @@ mod tests {
                "reject_categories":["JAILBREAK","personally identifiable information"]}}]"#,
         );
         assert!(e.is_empty(), "{e:?}");
-        let e = errs(r#"[{"name":"qwen_guard","params":{"url":"http://g","reject_levels":["spicy"],"on_error":"shrug"}}]"#);
-        assert!(e.iter().any(|x| x.contains("unknown value \"spicy\"")), "{e:?}");
-        assert!(e.iter().any(|x| x.contains("on_error") && x.contains("must be one of")), "{e:?}");
+        let e = errs(
+            r#"[{"name":"qwen_guard","params":{"url":"http://g","reject_levels":["spicy"],"on_error":"shrug"}}]"#,
+        );
+        assert!(
+            e.iter().any(|x| x.contains("unknown value \"spicy\"")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|x| x.contains("on_error") && x.contains("must be one of")),
+            "{e:?}"
+        );
         // fields are exact and array-only (runtime errors on unknown)
         let e = errs(r#"[{"name":"request_log","params":{"fields":["datetime","nope"]}}]"#);
-        assert!(e.iter().any(|x| x.contains("unknown value \"nope\"")), "{e:?}");
+        assert!(
+            e.iter().any(|x| x.contains("unknown value \"nope\"")),
+            "{e:?}"
+        );
         let e = errs(r#"[{"name":"request_log","params":{"fields":"datetime"}}]"#);
         assert!(e.iter().any(|x| x.contains("array of strings")), "{e:?}");
         // explicit empty list and repeated fields are startup errors
         let e = errs(r#"[{"name":"request_log","params":{"fields":[]}}]"#);
         assert!(e.iter().any(|x| x.contains("must not be empty")), "{e:?}");
-        let e = errs(r#"[{"name":"request_log","params":{"fields":["datetime","lpcache-key","datetime"]}}]"#);
-        assert!(e.iter().any(|x| x.contains("duplicate value \"datetime\"")), "{e:?}");
+        let e = errs(
+            r#"[{"name":"request_log","params":{"fields":["datetime","lpcache-key","datetime"]}}]"#,
+        );
+        assert!(
+            e.iter().any(|x| x.contains("duplicate value \"datetime\"")),
+            "{e:?}"
+        );
         // dashboard denies unknown params; path needs a leading slash; ranges enforced
-        let e = errs(r#"[{"name":"dashboard","params":{"colour":"red","path":"dash","refresh_ms":5}}]"#);
-        assert!(e.iter().any(|x| x.contains("unknown param(s): colour")), "{e:?}");
-        assert!(e.iter().any(|x| x.contains("must start with \"/\"")), "{e:?}");
-        assert!(e.iter().any(|x| x.contains("refresh_ms") && x.contains("must be >= 100")), "{e:?}");
+        let e = errs(
+            r#"[{"name":"dashboard","params":{"colour":"red","path":"dash","refresh_ms":5}}]"#,
+        );
+        assert!(
+            e.iter().any(|x| x.contains("unknown param(s): colour")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter().any(|x| x.contains("must start with \"/\"")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|x| x.contains("refresh_ms") && x.contains("must be >= 100")),
+            "{e:?}"
+        );
         // other plugins only warn on unknown params
-        let (_, w) = validate_plugins(r#"[{"name":"keyword","params":{"keywords":["a"],"colour":"red"}}]"#);
-        assert!(w.iter().any(|x| x.contains("unknown param(s): colour")), "{w:?}");
+        let (_, w) =
+            validate_plugins(r#"[{"name":"keyword","params":{"keywords":["a"],"colour":"red"}}]"#);
+        assert!(
+            w.iter().any(|x| x.contains("unknown param(s): colour")),
+            "{w:?}"
+        );
         // params must be an object
         let e = errs(r#"[{"name":"keyword","params":"a,b"}]"#);
-        assert!(e.iter().any(|x| x.contains("\"params\" must be a JSON object")), "{e:?}");
+        assert!(
+            e.iter()
+                .any(|x| x.contains("\"params\" must be a JSON object")),
+            "{e:?}"
+        );
     }
 
     #[test]
     fn summaries_and_schemas_json() {
-        let v: Value = serde_json::from_str(
-            r#"{"name":"qwen_guard","params":{"url":"http://guard:8080"}}"#,
-        )
-        .unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"name":"qwen_guard","params":{"url":"http://guard:8080"}}"#)
+                .unwrap();
         assert_eq!(spec_summary(&v), "qwen_guard — http://guard:8080");
         let v: Value = serde_json::from_str(r#"{"name":"mystery"}"#).unwrap();
         assert!(spec_summary(&v).contains("unknown plugin"));

@@ -31,7 +31,7 @@ full prefill cost every time.
    (default `["Unsafe"]`) or `reject_categories` (default none); and the
    **result cache** (`result_cache`) answers fresh
    (non-expired) same-key requests with a previously cached backend
-   result stored at `{dir}/{key}.json` — fresh non-streaming results are
+   result stored at `{dir}/{lowercase(model_id)}_{key}.json` — fresh non-streaming results are
    stored there after the backend call; streaming requests are never
    served from the cache by default (set the plugin's `cache_streaming`
    param to `true` to also aggregate completed streaming results into a
@@ -51,12 +51,21 @@ full prefill cost every time.
 2. **Prefix hashing** — the concatenated message contents (roles
    stripped) are split into words (`\w+`, lowercased), chunked into blocks
    of `WORDS_PER_BLOCK` (default 100) words, and each block is SHA256-hashed.
-   The cache key is `sha256(backend_model_id + "\n" + raw_prefix)`.
+   The cache key is `sha256(model + "\n" + raw_prefix)` — the model is the
+   id the cache is addressed by: the first backend's reported model id by
+   default, or the request's (lowercased) `model` with model-aware routing
+   enabled (item 9).
 3. **Big/small requests** — requests with more than `BIG_THRESHOLD_WORDS`
    (default 500) words are "big": they run with `cache_prompt=true` and
    their KV cache is saved to the backend after completion, with a
    `<key>.meta.json` file (block hashes, model id, wpb, timestamp) written
-   to `META_DIR`.
+   to `META_DIR`. When `SKIP_SAVE_ON_SELF_RESTORE` is on (the default) the
+   post-request save is skipped if the request just successfully restored
+   its *own* key — a cold restore's 200 proved the KV file's presence, and
+   a warm "already running" no-op restore skips the save while the key's
+   meta file is still on disk (a missing meta file makes the save re-write
+   the pair, healing it); a ratio-1.0 *prefix* match (a multi-turn
+   extension) is not a self-restore and still saves.
 4. **Restore candidates** — before a big request, the proxy scans the meta
    files and looks for one with the same model and `wpb` whose block list
    shares the longest common prefix; if the LCP ratio is at least `LCP_TH`
@@ -72,10 +81,11 @@ full prefill cost every time.
    use this for backends without slot save/restore support (e.g.
    llama-server < 1.05.40).
 5. **Slot management** — every llama.cpp slot is guarded by a lock.
-   The proxy picks a never-used slot first, otherwise the
-   least recently used one (or, with
-   `SLOT_ROUTING_POLICY=key_affinity`, an idle slot already running the
-   request's KV cache key first), waits up to 300 s for it
+   The proxy prefers an idle slot already running the request's
+   KV cache key (the default `SLOT_ROUTING_POLICY=key_affinity`),
+   otherwise picks a never-used slot first, then the
+   least recently used one (`SLOT_ROUTING_POLICY=lru`), and
+   waits up to 300 s for it
    (`503 all slots busy` on timeout), and releases it when the
    response is fully handled.
 6. **Streaming** — SSE responses are passed through byte-for-byte via a
@@ -86,11 +96,24 @@ full prefill cost every time.
    timestamp) are deleted, together with the KV files of the same name in
    the configured `--slot-save-path` directories. `META_MAX=0` disables
    pruning. A later restore of a pruned key simply fails and falls back to
-   a full prefill.
+   a full prefill. At startup, corrupt `.meta.json` files in `META_DIR`
+   are removed (and, with `STARTUP_CLEANUP_KV=true`, the orphan KV files
+   of the removed metas as well).
 8. **Request log** (optional) — when `REQUEST_LOG` is enabled, every
    finished request (including failed ones) becomes one W3C Extended Log
    Format (XLF) record appended to a size-rotated file — see [Request
    log](#request-log).
+9. **Model-aware routing** (optional) — a `BACKENDS` entry can carry a
+   `model_id`. The field is **all-or-nothing**: set on every backend or on
+   none (a mixed set is a startup error, named per backend). When it is set
+   on every backend, the request's `model` must match one of the configured
+   ids (case-insensitive) or the request is rejected with `404 model not
+   found` (the error lists the available ids); requests then only run on
+   matching backends, `GET /v1/models` advertises the configured ids
+   instead of `MODEL_ID`, and the KV cache files are named
+   `{lowercase(model_id)}_{key}` so different models' caches never collide
+   in a shared `--slot-save-path` dir. Without `model_id`s (the default)
+   behaviour is unchanged.
 
 ## Stack
 
@@ -107,14 +130,16 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 
 | Variable            | Default             | Meaning                                        |
 |---------------------|---------------------|------------------------------------------------|
-| `BACKENDS`          | —                   | JSON array `[{\"url\": \"...\", \"n_slots\": N, \"slot_save_path\": \"...\", \"kv_cache\": true}, ...]` (per-backend `kv_cache` gates KV save/restore; see [How it works](#how-it-works)) |
+| `BACKENDS`          | —                   | JSON array `[{\"url\": \"...\", \"n_slots\": N, \"slot_save_path\": \"...\", \"kv_cache\": true, \"model_id\": \"...\"}, ...]` (per-backend `kv_cache` gates KV save/restore; per-backend `model_id` enables model-aware routing — all-or-nothing; see [How it works](#how-it-works)) |
 | `LLAMA_URL`         | `http://127.0.0.1:8000` | fallback single backend when `BACKENDS` unset |
 | `N_SLOTS`           | `1`                 | fallback slot count per backend                |
 | `WORDS_PER_BLOCK`   | `100`               | words per hash block                           |
 | `BIG_THRESHOLD_WORDS` | `500`             | word count above which a request is "big"      |
 | `LCP_TH`            | `0.1`               | minimum LCP block ratio to restore a cache     |
+| `SKIP_SAVE_ON_SELF_RESTORE` | `true`        | skip the post-request KV save when the request successfully restored its own key (a cold restore's 200 proved the file's presence; a warm "already running" no-op restore skips while the key's meta file is still on disk, and re-saves to heal it when the meta is gone; ratio-1.0 prefix matches, i.e. multi-turn extensions, still save) |
 | `META_DIR`          | `./kv_meta`         | where `<key>.meta.json` files live             |
 | `META_MAX`          | `10`                | max meta files kept (LRU); 0 = unlimited       |
+| `STARTUP_CLEANUP_KV`| `false`             | the startup meta scan also removes the orphan KV files of removed corrupt metas (the corrupt meta files themselves are always removed) |
 | `SLOT_SAVE_PATH`    | —                   | backend's `--slot-save-path` dir (single-backend fallback); pruned KV files are removed from it |
 | `REQUEST_TIMEOUT`   | `600` (s)           | per-request timeout to the backend             |
 | `MODEL_ID`          | `llama.cpp`         | model id advertised by `/v1/models` and used as default |
@@ -123,16 +148,17 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 | `LOG_LEVEL`         | `INFO`              | log level (`RUST_LOG` overrides it)            |
 | `STREAM_QUEUE_SIZE` | `16`                | per-request SSE channel capacity (must be >= 1) |
 | `COALESCE_REQUESTS` | `false`             | group concurrent same-cache-key requests into one backend call (Rust-only) |
-| `SLOT_ROUTING_POLICY` | `lru`             | slot pick policy: `lru` (free-first, then LRU) or `key_affinity` (prefer an idle slot already running the request's KV key, so the restore is a no-op) |
-| `PLUGINS` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables below) and `dashboard` (the real-time statistics web page, at most one); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent prefilter specs (when set, `PLUGINS` takes precedence over them) |
+| `SLOT_ROUTING_POLICY` | `key_affinity`    | slot pick policy: `key_affinity` (prefer an idle slot already running the request's KV key, so the restore is a no-op) or `lru` (free-first, then LRU) |
+| `PLUGINS` | — | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]` — built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables below), `payload_log` (the raw request-payload logger — a spec here takes precedence over `REQUEST_PAYLOAD_DIR` below, at most one) and `dashboard` (the real-time statistics web page, at most one); when unset, the legacy `PREFILTER_*` variables below are translated into the equivalent prefilter specs (when set, `PLUGINS` takes precedence over them) |
 | `REQUEST_LOG` | `false` | when true, one W3C-XLF record per finished request is appended to the request-log file (the built-in `request_log` plugin) |
 | `REQUEST_LOG_PATH` | `lpcache-request.log` | request-log file location; relative paths resolve against the CWD (the parent dir is created) |
 | `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB) | rotation threshold in bytes; the file is rotated when exceeded (`<path>.1`, `<path>.2`, …); `0` = no rotation |
 | `REQUEST_LOG_KEEP` | `5` | rotated generations retained (the oldest is dropped); `0` = keep them all |
 | `REQUEST_LOG_FIELDS` | all 36 fields | comma-separated ordered subset of the known XLF field names (W3C fields + `lpcache-*` pipeline/performance/resource fields — see [Request log](#request-log)) |
+| `REQUEST_PAYLOAD_DIR` | — | when set, each chat request's raw payload (plus its HTTP headers in a paired `.headers` file) is written to a unique file in this directory as it arrives — before parsing, prefiltering or backend dispatch, so malformed and rejected requests are captured too (the built-in `payload_log` plugin — see [Payload log](#payload-log)) |
 | `PREFILTER_BLOCKLIST` | —                 | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; requests whose message contents contain any are rejected with `400` before the backend (default: no prefilter) |
 | `PREFILTER_CASE_INSENSITIVE` | `true`     | **legacy**: keyword matching is case-insensitive           |
-| `PREFILTER_RESULT_CACHE_DIR` | —          | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): cache-result path (`{key}.json` per cache key); fresh same-key requests are answered from the cached backend result before the backend (default: disabled) |
+| `PREFILTER_RESULT_CACHE_DIR` | —          | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): cache-result path (`{lowercase(model_id)}_{key}.json` per cache key); fresh same-key requests are answered from the cached backend result before the backend (default: disabled) |
 | `PREFILTER_RESULT_CACHE_TTL` | `300` (s)    | **legacy**: per-entry result-cache expiry; `0` = never expires |
 | `SAVE_RETRIES` | `3`                 | retries after a failed KV cache save (backend 500 or other error); `0` = no retry |
 | `SAVE_RETRY_DELAY_MS` | `1000` (ms)   | delay between KV cache save retry attempts          |
@@ -140,6 +166,7 @@ and the query string (llama.cpp accepts it in several places depending on the bu
 Every variable is also available as a command-line flag (see
 `./target/release/lpcache --help`): `--backends`, `--llama-url`,
 `--n-slots`, `--words-per-block`, `--big-threshold-words`, `--lcp-th`,
+`--skip-save-on-self-restore`,
 `--meta-dir`, `--meta-max`, `--slot-save-path`, `--request-timeout`,
 `--model-id`, `--port`, `--api-key` (→ `LLAMA_API_KEY`), `--log-level`,
 `--stream-queue-size`,
@@ -149,6 +176,7 @@ Every variable is also available as a command-line flag (see
 `--request-log-max-bytes` (→ `REQUEST_LOG_MAX_BYTES`),
 `--request-log-keep` (→ `REQUEST_LOG_KEEP`),
 `--request-log-fields` (→ `REQUEST_LOG_FIELDS`),
+`--request-payload-dir` (→ `REQUEST_PAYLOAD_DIR`),
 `--prefilter-blocklist` (→ `PREFILTER_BLOCKLIST`, legacy),
 `--prefilter-case-insensitive` (→ `PREFILTER_CASE_INSENSITIVE`, legacy),
 `--prefilter-result-cache-dir` (→ `PREFILTER_RESULT_CACHE_DIR`, legacy),
@@ -243,6 +271,33 @@ BACKENDS='[{"url":"http://127.0.0.1:8000","n_slots":4}]' \
   REQUEST_LOG_MAX_BYTES=10485760 REQUEST_LOG_KEEP=5 ./target/release/lpcache
 ```
 
+## Payload log
+
+When `REQUEST_PAYLOAD_DIR` is set — or a `payload_log` spec is listed in
+`PLUGINS` (which takes precedence) — the built-in `payload_log` plugin writes
+each `POST /v1/chat/completions` request's **raw payload** (plus its HTTP
+headers) to unique files in that directory as it arrives: before JSON parsing,
+prefiltering or backend dispatch, so malformed and rejected requests are
+captured too.
+
+File names: `{dir}/{seq:06}-{timestamp}-{key16}.json` (`.bin` for non-UTF-8
+payloads) paired with `{same base name}.headers` (one `name: value` line per
+request header, names lowercased, in wire order), where `seq` is a per-process
+counter, `timestamp` the UTC receive time (`%Y-%m-%dT%H-%M-%S.%fZ`, colons
+replaced by dashes) and `key16` the first 16 hex chars of the request's KV
+cache key (`nokey` when the payload could not be parsed, so the key was never
+computed). Relative paths resolve against the CWD; the directory is created at
+startup. The files are never rotated or deleted by the proxy — payloads and
+headers may contain sensitive data (messages, system prompts, `Authorization`
+values), so prune the directory as you would any log. Payload-write failures
+are logged and swallowed — logging never breaks request serving. At most one
+`payload_log` plugin.
+
+```bash
+BACKENDS='[{"url":"http://127.0.0.1:8000","n_slots":4}]' \
+  REQUEST_PAYLOAD_DIR=/var/log/lpcache/payloads ./target/release/lpcache
+```
+
 ## Dashboard
 
 Add a `dashboard` spec to `PLUGINS` (at most one) to enable the built-in
@@ -252,7 +307,8 @@ usually runs on). The proxy mounts two routes from the plugin:
 
 - `GET {path}` (default `GET /dashboard`) — the HTML page
 - `GET {path}/api/stats` — the JSON payload the page polls: the proxy's
-  live state (slot occupancy per backend/slot, circuit-breaker state,
+  live state (slot occupancy per backend/slot, circuit-breaker state incl.
+  the per-backend drain flag,
   in-flight count, active coalesced groups, KV meta cache size, uptime)
   merged with the plugin's per-request aggregates (lifetime counters,
   success rate, process resource totals — the proxy's own CPU ms, disk
@@ -280,10 +336,16 @@ them: the **General** tab (shown by default) holds the throughput panel
 (requests, completion tokens and cached tokens per bucket) and a
 resources panel (the proxy's own CPU ms, disk bytes read/written and peak
 RAM per bucket), while the **Backends**, **Slots**, **Recent requests**
-and **KV Cache** tabs hold the per-backend table, the slot-occupancy
-grid, the recent-requests table (which carries the backend index and slot
-of each request) and a per-key restore table (each distinct restored
-request key with its restore count, sorted by the highest) — only one tab
+and **KV Cache** tabs hold the per-backend table (with a **Drain /
+Resume** action column per row — a drained backend shows a `DRAINED`
+badge and is excluded from new requests until resumed; the buttons POST
+to the proxy's own `/_control/backends/<i>/drain|resume` endpoints), the
+slot-occupancy
+grid, the recent-requests table (which carries the backend index, slot
+and the KV-restore / KV-save API call durations of each request) and a
+per-key KV table (each distinct restored or saved request key with its
+restore count and the cumulative restore/save API call durations, sorted
+by the highest restore count) — only one tab
 is visible at a time. Every throughput/resource chart
 also overlays the percentile lines of its metric — per-request p50
 (solid) / p95 (dashed) ticks on each bar, the window-wide per-request
@@ -333,6 +395,120 @@ PLUGINS='[{"name":"dashboard","params":{"path":"/dashboard","refresh_ms":1000}}]
 # → open http://<proxy-host>:<port>/dashboard
 ```
 
+### Live dashboard — 4 backends, 8 slots, one shared KV folder (Sample)
+
+The five screenshots below come from a single live run against real
+`llama-server` processes (not mocks or fixtures). The topology:
+
+- **4 backend instances** — `llama-server` serving Llama-3.2-1B (Q4_K_M,
+  CPU, `--parallel 2`) on ports 9101–9104, so the proxy pins **8 slots**
+  in total;
+- **one shared KV folder** — every backend was started with the same
+  `--slot-save-path`, and the proxy was given the same directory as
+  `SLOT_SAVE_PATH`, so a KV cache saved while a request ran on one backend
+  can be restored into a slot on any of the other three;
+- **`SLOT_ROUTING_POLICY=lru`** — the slot routing policy (a free
+  slot first, otherwise the least recently used one).
+
+The load was **50 chat requests** built from the cross join of two content
+lists: List A — 4 distinct documents of ~1,700 tokens each — and List B — 5
+distinct follow-up prompts. Request *i* sends `A[i mod 4]` as the first
+message and `B[(i div 4) mod 5]` as the second, so requests 1–20 cover all
+20 unique (A, B) pairs once and requests 21–50 repeat pairs (a repeat is a
+KV-restore candidate). The requests were dispatched by **4 concurrent
+workers** with a random 10–100 ms wait between dispatches. Every prompt is
+far above the 500-word `BIG_THRESHOLD_WORDS`, so all 50 requests qualified
+for KV save/restore.
+
+**General tab** (the default view, time filter set to *all time*):
+
+![General tab](docs/screenshots/dashboard-general.png)
+
+The KPI cards show the run's outcome: 50 requests, 100 % success (errors
+0), **44 KV restores** with 69,839 cached tokens, 10 KV meta files (the
+on-disk meta is pruned at `META_MAX=10`), 0/8 slots in flight (the load had
+finished when the shot was taken) and an average end-to-end duration of
+1.9 s. The **throughput** panel plots 5-second buckets: 12 / 14 / 16 / 8
+requests, the completion tokens per bucket, and — the third chart — the
+*cached (restored) prompt tokens* per bucket, peaking at 25,396: after the
+first few requests, most of every prompt was served from the KV cache
+instead of being prefilled. The **resources** panel is the proxy's own
+footprint per bucket: CPU ms (479.6 ms total), peak RAM (14.0 MB) and disk
+writes (4.52 MB — the KV slot files landing in the shared folder). Every
+chart overlays its p50/p95 percentile lines as described above.
+
+**Backends tab**:
+
+![Backends tab](docs/screenshots/dashboard-backends.png)
+
+The per-backend table: all four URLs `UP`, no cooldown, no failure streak,
+and `0 / 2` busy slots each (idle after the run; during the run this column
+tracks the 4 concurrent requests). The **action** column carries the
+per-backend **Drain** / **Resume** control (a drained row shows a `DRAINED`
+badge instead of `UP` and its button flips to **Resume** — see [§4 Runtime
+backend control](PARAMETERS.md#4-runtime-backend-control-no-configuration)).
+
+**Slots tab**:
+
+![Slots tab](docs/screenshots/dashboard-slots.png)
+
+The slot-occupancy grid: backend 0–3 × slot 0–1 — the 8 cells the proxy
+pins across the 4 instances, all idle after the run.
+
+**Recent requests tab** (50 rows, *all time* filter):
+
+![Recent requests tab](docs/screenshots/dashboard-recent.png)
+
+One row per finished request, newest first. Read it bottom-up: the oldest
+six rows have no restore candidate yet (`—`, cached 0), took ~8 s (a full
+CPU prefill of the ~1,650-token prompt) and record a *save* duration —
+their KV was written to the shared folder afterwards. Every row after that
+carries the green **restore** flag: the *restore* column shows the LCP
+candidate ratio (0.923–0.929) and the key it restored, *restore ms* is the
+`restore_cache_slot` API call duration (6–156 ms), and the *tokens* column
+shows prompt/completion/cached — e.g. `1624 / 16 / 1597`, i.e. ~90 % of the
+prompt served from cache, which is why these rows finish in ~1 s instead of
+~8 s. The *backend / slot* column shows the requests spread across all 8
+slots of the 4 backends, and each row's key16 matches the payload files the
+`payload_log` plugin wrote for the same request. Note that 44 rows restored
+even though only 30 requests were exact repeats: the LCP scan matches the
+*closest* prefix, so e.g. the first occurrence of (A1, B3) could restore the
+KV saved by (A1, B1) at ratio ≈ 0.93.
+
+**KV Cache tab**:
+
+![KV Cache tab](docs/screenshots/dashboard-kv.png)
+
+The per-key table, sorted by restore count: 20 distinct keys (the 20 unique
+(A, B) pairs), 44 restores in total (0 *warm* — a warm restore is the
+zero-wire-call skip that happens when the picked slot already ran the key;
+under the default `lru` policy a slot is not picked *because* it runs the
+key, so warm stays 0 here), restore API total 901 ms vs save API total
+1.79 s. The *backend* / *slot* columns show where each key was last
+restored — spread across all four backends, which only works because they
+share one KV folder. The table tracks keys in memory for the proxy's
+lifetime, while the on-disk meta files are pruned at `META_MAX` (10 here),
+which is why the General tab shows 10 KV meta files for 20 keys.
+
+To reproduce a run like this:
+
+```bash
+# 4 llama-server instances, 2 slots each, one shared KV folder
+for i in 1 2 3 4; do
+  llama-server -m MODEL.gguf --port 910$i --parallel 2 \
+    --slot-save-path ./kv -ngl 0 --no-webui &
+done
+
+BACKENDS='[{"url":"http://127.0.0.1:9101","n_slots":2},
+           {"url":"http://127.0.0.1:9102","n_slots":2},
+           {"url":"http://127.0.0.1:9103","n_slots":2},
+           {"url":"http://127.0.0.1:9104","n_slots":2}]' \
+SLOT_SAVE_PATH=./kv SLOT_ROUTING_POLICY=lru \
+PLUGINS='[{"name":"dashboard","params":{"path":"/dashboard"}}]' \
+  ./target/release/lpcache
+# → open http://<proxy-host>:<port>/dashboard
+```
+
 ## Build & run
 
 > 📖 **New here?** Start with the full [Setup Guide](docs/setup-guide.md) —
@@ -375,47 +551,56 @@ words appended — the second request logs
 
 The suite spans the core proxy (`lpcache`), the adapter plugin library
 (`lpcache-plugins`) and the configurator (`lpcache-config`) across unit,
-integration and doc tests — **300 passing tests** plus **2 ignored** doc
+integration and doc tests — **338 passing tests** plus **2 ignored** doc
 tests:
 
 | Suite | Location | Tests | Command |
 | --- | --- | ---: | --- |
-| Core proxy units | `src/` | 98 | `cargo test -p lpcache --lib` |
-| Plugin library units | `plugins/src/` | 99 | `cargo test -p lpcache-plugins --lib` |
-| Proxy integration (end-to-end) | `tests/api.rs` | 61 | `cargo test -p lpcache --test api` |
+| Core proxy units | `src/` | 112 | `cargo test -p lpcache --lib` |
+| Plugin library units | `plugins/src/` | 110 | `cargo test -p lpcache-plugins --lib` |
+| Proxy integration (end-to-end) | `tests/api.rs` | 71 | `cargo test -p lpcache --test api` |
 | Backend-client integration | `tests/client.rs` | 15 | `cargo test -p lpcache --test client` |
-| Configurator units | `configurator/src/` | 26 | `cargo test -p lpcache-config` |
+| Configurator units | `configurator/src/` | 29 | `cargo test -p lpcache-config` |
 | Plugin doc tests | `plugins/src/` | 3 (1 + 2 ignored) | `cargo test -p lpcache-plugins --doc` |
 
 Everything runs at once with `cargo test --workspace`. Narrow the run with a
 name filter (e.g. `cargo test -p lpcache --test api restore`) or add
 `-- --ignored` to also execute the ignored doctests.
 
-### Core proxy units — `lpcache` (98, `src/`)
+### Core proxy units — `lpcache` (123, `src/`)
 
 Unit tests live in `#[cfg(test)]` modules next to the code they cover.
 
-- **Config & CLI** (`config.rs`, 38): defaults and env fallbacks
+- **Config & CLI** (`config.rs`, 44): defaults and env fallbacks
   (`META_DIR`, `META_MAX`, `SLOT_SAVE_PATH`, `API_KEY`, non-numeric values),
-  `BACKENDS` JSON parsing (incl. per-backend `slot_save_path` / `kv_cache`,
-  invalid-JSON fallback), full CLI parsing (space/equal forms, extra `=`,
-  last-wins, unknown/missing flags, `--help`/`--version`, usage text),
-  CLI-over-env-over-default precedence, the `SLOT_ROUTING_POLICY`
+  `BACKENDS` JSON parsing (incl. per-backend `slot_save_path` / `kv_cache`
+  / `model_id`, invalid-JSON fallback), the per-backend `model_id`
+  all-or-nothing rule (mixed set is a startup error naming the offending
+  entries) and `model_routing_enabled` / `available_model_ids`, full CLI
+  parsing (space/equal forms, extra `=`, last-wins, unknown/missing flags,
+  `--help`/`--version`, usage text), CLI-over-env-over-default precedence,
+  the `SLOT_ROUTING_POLICY`
   env/CLI parsing (`lru` default, `key_affinity` / `key-affinity`,
   invalid → default with a warning) and `PLUGINS` / legacy
-  `PREFILTER_*` / `REQUEST_LOG*` spec synthesis and precedence.
-- **Hashing & meta files** (`hashing.rs`, 19): raw-prefix construction
+  `PREFILTER_*` / `REQUEST_LOG*` / `REQUEST_PAYLOAD_DIR` spec synthesis and
+  precedence.
+- **Hashing & meta files** (`hashing.rs`, 24): raw-prefix construction
   (join/strip, empty/missing, non-string content), word tokenization, block
   hashing, LCP ratio, SHA256 known vectors, meta-file round-trip and scanning
   (corrupt/extension/missing-dir), timestamp bump, restore-candidate
-  filtering/thresholds and best-ratio pick, and LRU meta pruning.
+  filtering/thresholds and best-ratio pick, LRU meta pruning (incl. the
+  pruned entry's model id for KV-file removal), startup corrupt-meta
+  cleanup (`clean_corrupt_meta`), and the model-prefixed KV
+  cache filename (`kv_basename`).
 - **Coalescing / single-flight** (`coalesce.rs`, 5): leader/follower entry,
   group forget, finish waking waiters with the outcome (incl. the
   early-finish wakeup race), ordered SSE append/drain.
-- **Slot management** (`slot_manager.rs`, 30): slot selection and ordering
+- **Slot management** (`slot_manager.rs`, 44): slot selection and ordering
   (free-first, used-then-oldest, multi-backend, idle-aware, and the
   `key_affinity` key-free tier — an idle slot already running the
-  requested key is picked before the free/LRU tiers), restore
+  requested key is picked before the free/LRU tiers), model-aware
+  routing (requests only target slots of backends serving their model,
+  the last-used slot of other models stays usable), restore
   targeting and retry-slot exclusion (only `kv_cache`-enabled backends),
   per-slot last-KV tracking (a restore is skipped when the picked slot
   already runs the requested key; the tracking is updated by successful
@@ -423,17 +608,19 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   auto-retry (500 vs other errors, retries until success / exhausted /
   disabled), per-slot locking and acquire timeout, and the circuit breaker
   (skip while others up, all-down fail-open, cooldown expiry, escalating
-  backoff, success/probe recovery).
+  backoff, success/probe recovery) and the runtime drain control
+  (drain/resume: unconditional exclusion — even the all-down fail-open
+  path — success/probe no-ops, probe-based re-join).
 - **Process sampling** (`procsample.rs`, 6): `/proc` status/io parsing
   (the memory gauges and disk counters; other/malformed lines ignored),
   saturating per-field delta, and live-sampling monotonicity.
 
-### Plugin library units — `lpcache-plugins` (99, `plugins/src/`)
+### Plugin library units — `lpcache-plugins` (114, `plugins/src/`)
 
-- **Registry** (`registry.rs`, 10): builtin registration and idempotent
+- **Registry** (`registry.rs`, 11): builtin registration and idempotent
   global registry, custom-plugin registration, unknown/wrong-kind errors,
-  loader kind filtering, zero/one/many `load_prefilters` / `load_dashboard`
-  chaining, error propagation, `PluginSpec` parsing.
+  loader kind filtering, zero/one/many `load_prefilters` / `load_dashboard` /
+  `load_payload_loggers` chaining, error propagation, `PluginSpec` parsing.
 - **`keyword`** (`keyword.rs`, 11): match/accept, case-insensitive default,
   scans all messages, content-part arrays, empty messages, message-text
   flattening, comma-list parsing, trait-object dispatch, factory build and
@@ -453,7 +640,11 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   escaping, custom-field subset/order, invalid field-list rejection, size
   rotation with `keep` bound, rotation-disabled at 0, parent-dir creation,
   lossless concurrent writes, factory params/defaults.
-- **`dashboard`** (`dashboard.rs`, 19): factory defaults/validation, stats
+- **`payload_log`** (`payload_log.rs`, 8): nested-dir preparation, exact-byte
+  payload files with `{seq}-{timestamp}-{key16}` names, unique names per
+  request (incl. concurrent writers), `nokey` fallback for unparseable
+  payloads, `.bin` for non-UTF-8 payloads, factory `dir` validation.
+- **`dashboard`** (`dashboard.rs`, 21): factory defaults/validation, stats
   path join, counters/time-series/recent updates (incl. the per-request
   and per-bucket process resource fields — CPU ms, disk bytes read/written,
   peak RAM), resource metrics absent when records lack them, `?since`
@@ -469,11 +660,15 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   body/options/query (with and without an existing `options` key) and the
   backend factory build/url validation.
 
-### Configurator units — `lpcache-config` (26, `configurator/src/`)
+### Configurator units — `lpcache-config` (29, `configurator/src/`)
 
-- **Template & config model** (`main.rs`, `model.rs`, 7): the default TOML
+- **Template & config model** (`main.rs`, `model.rs`, 10): the default TOML
   template parses and validates, defaults round-trip, dot-key set/get,
-  did-you-mean for typos, section keys, validation and value semantics.
+  did-you-mean for typos, section keys, validation and value semantics,
+  and the per-backend `model_id` all-or-nothing rule (unset everywhere =
+  legacy, set everywhere = enabled, mixed = error naming the missing
+  entries; blank counts as unset) plus its export in the `BACKENDS` JSON
+  and the `show` listing.
 - **Exporters** (`exporters.rs`, 8): env-var pairs (single/multi-backend),
   env-script quoting and grouping, single-line CLI flags, the systemd unit
   and docker-run shapes, and the per-backend llama-server flags.
@@ -484,7 +679,7 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
 - **Wizard** (`wizard.rs`, 3): the menu covers every action, host/port
   parsing, backend list line shapes.
 
-### Integration tests — `lpcache` (76, `tests/`)
+### Integration tests — `lpcache` (92, `tests/`)
 
 - **`tests/client.rs` (15)** — the built-in `llama` plugin's `LlamaClient`
   against the mock backend: model-id lookup (up/down), API-key authorization
@@ -492,7 +687,7 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   non-JSON content-type, malformed/non-object bodies, HTTP errors), streaming
   (chunk reassembly, error status), save/restore status-code mapping, and
   trailing-slash base-URL normalization.
-- **`tests/api.rs` (61)** — the full proxy (axum app) in front of a mock
+- **`tests/api.rs` (77)** — the full proxy (axum app) in front of a mock
   llama.cpp backend:
   - *Basics* (2): configured model id on `/v1/models`, model defaulting.
   - *Cache lifecycle* (3): small request (no save/meta), big request (save +
@@ -504,6 +699,11 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   - *Failover & recovery* (4): dead-backend failover to a live one,
     connection-failure retry, probe recovery of a cooled-down backend,
     failing slots not pinning all traffic.
+  - *Runtime drain control* (4): drain/resume keeping an in-flight request
+    on the drained backend while new traffic reroutes (resume re-joins
+    via the inline probe), fast 503 with every backend drained, resume of
+    a still-down backend staying out until the next probe round, and
+    404/bad-index + idempotent no-op resume on the `/_control` endpoints.
   - *LRU pruning* (3): meta + KV file pruning, restore of surviving entries
     with fallback for pruned keys, LRU timestamp bump keeping hot entries.
   - *Slot routing* (2): small-request successes marking the slot used so
@@ -512,6 +712,12 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
     call (1 under `lru`, 0 under `key_affinity`).
   - *`kv_cache` flag* (3): kv-disabled backends never save/restore (incl.
     stream save), restore prefers a kv-enabled backend.
+  - *Model-aware routing* (4): per-backend `model_id` routing (each model
+    only runs on its backend, case-insensitive match), unknown model →
+    404 listing the available ids (no backend call, no meta), `/v1/models`
+    listing the configured ids, and per-model cache isolation (keys and
+    `{model}_{key}` KV files differ per model, restores only touch the
+    owning backend).
   - *Coalescing* (6): identical-request merge, generation-param independence,
     mixed stream/JSON sharing one call, shared stream group, off-flag
     per-request calls, fresh group after completion.
@@ -527,6 +733,9 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
     when the slot-save dir is unvisible (remote backend).
   - *Request log* (5): XLF record per request, stream perf fields, delivered
     stream bytes, failed request without pipeline fields, rotation + `keep`.
+  - *Payload log* (1): one payload file per request with the exact body bytes
+    and the request's KV cache key in the name; malformed bodies captured as
+    `nokey` files.
   - *Dashboard* (7): page and stats JSON reachable, chart figures (incl.
     the percentile lines/legend and the window totals), counters updated
     after requests, `?since`/`?backend` scoping (incl. the `cached`,

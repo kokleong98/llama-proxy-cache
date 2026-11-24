@@ -3,14 +3,14 @@
 //! validation and backend probes.
 
 use crate::exporters::export;
-use crate::model::{self, LpcacheConfig, DEFAULT_CONFIG_FILE};
+use crate::model::{self, DEFAULT_CONFIG_FILE, LpcacheConfig};
 use crate::plugin_schema;
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::Html,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -175,7 +175,6 @@ pub fn default_config_path() -> PathBuf {
     PathBuf::from(DEFAULT_CONFIG_FILE)
 }
 
-
 #[derive(Deserialize)]
 struct CheckReq {
     url: String,
@@ -240,4 +239,3 @@ async fn check_backend(Json(req): Json<CheckReq>) -> Json<serde_json::Value> {
         }
     }))
 }
-

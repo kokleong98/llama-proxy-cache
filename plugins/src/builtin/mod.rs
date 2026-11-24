@@ -13,12 +13,14 @@
 //! | `result_cache`   | prefilter + result store             | `dir`, `ttl_secs` (default `300`), `cleanup` (`"remove_after_serve"` or omitted) |
 //! | `llama`          | llama.cpp backend client             | `url`, `api_key` (optional), `timeout_secs` (default `600`) |
 //! | `request_log`    | request logger (W3C-XLF request log file) | `path` (default `lpcache-request.log`), `max_bytes` (default 10 MiB, `0` = no rotation), `keep` (default `5`, `0` = keep all), `fields` (optional subset) |
+//! | `payload_log`    | request-payload logger (one payload file + paired `.headers` file per chat request) | `dir` (required; relative paths resolve against the CWD, created at startup) |
 //! | `dashboard`      | real-time statistics web dashboard       | `path` (default `/dashboard`), `refresh_ms` (default `2000`), `window_secs` (default `300`), `bucket_secs` (default `5`), `max_recent` (default `100`, `0` = off) |
 
 pub mod chain;
 pub mod dashboard;
 pub mod keyword;
 pub mod llama;
+pub mod payload_log;
 pub mod qwen_guard;
 pub mod request_log;
 pub mod result_cache;
@@ -43,6 +45,10 @@ pub fn register(registry: &Registry) {
     registry.register(
         "request_log",
         Arc::new(request_log::RequestLogPluginFactory),
+    );
+    registry.register(
+        "payload_log",
+        Arc::new(payload_log::PayloadLogPluginFactory),
     );
     registry.register("dashboard", Arc::new(dashboard::DashboardPluginFactory));
 }

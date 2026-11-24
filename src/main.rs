@@ -9,12 +9,13 @@
 //! `Arc<dyn ResultStore>` / `Arc<dyn LlamaBackend>` objects are wired into
 //! `AppState`.
 
-use lpcache::app::{AppState, router};
+use lpcache::app::{AppState, router, startup_meta_cleanup};
 use lpcache::coalesce::SingleFlight;
 use lpcache::config::{Cli, Config};
 use lpcache::plugins::{
-    Dashboard, LlamaBackend, PluginSpec, Prefilter, RequestLogger, ResultStore, ensure_builtin,
-    global, load_dashboard, load_prefilters, load_request_loggers,
+    Dashboard, LlamaBackend, PayloadLogger, PluginSpec, Prefilter, RequestLogger, ResultStore,
+    ensure_builtin, global, load_dashboard, load_payload_loggers, load_prefilters,
+    load_request_loggers,
 };
 use lpcache::slot_manager::SlotManager;
 use serde_json::json;
@@ -47,6 +48,14 @@ async fn main() {
     // Command line > environment > built-in defaults.
     let config = Config::from_cli(&cli);
 
+    // The per-backend `model_id` must be all-or-nothing: a mixed set would
+    // leave backends that can never match a request (silently dead). A bad
+    // set is a startup error (it names the offending entries).
+    if let Err(e) = config.validate_backends() {
+        eprintln!("lpcache: {e}");
+        std::process::exit(2);
+    }
+
     // RUST_LOG takes precedence, then LOG_LEVEL (uvicorn used LOG_LEVEL too)
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.log_level));
@@ -61,6 +70,11 @@ async fn main() {
             config.meta_dir.display()
         );
     }
+
+    // Startup scan of META_DIR: corrupt meta files are removed (and their
+    // orphan KV files too, when STARTUP_CLEANUP_KV is set) so a
+    // crash-corrupted cache dir self-heals before the first request.
+    startup_meta_cleanup(&config);
 
     // Dynamically load the adapter plugins from configuration: the `PLUGINS`
     // env var / `--plugins` flag, or — when unset — the specs synthesized
@@ -124,6 +138,27 @@ async fn main() {
         tracing::info!("request logging enabled: {}", rlog.name());
     }
 
+    // The optional request-payload-logging plugin (a `payload_log` spec in
+    // `PLUGINS`, or the one synthesized from the `REQUEST_PAYLOAD_DIR`
+    // setting): when present, each chat request's raw payload is written
+    // to a unique file in its configured directory as it arrives (before
+    // parsing, prefiltering or backend dispatch — malformed and rejected
+    // requests are captured too). A bad spec is a startup error.
+    let payload_log: Option<Arc<dyn PayloadLogger>> = match load_payload_loggers(registry, &specs) {
+        Ok(log) => log,
+        Err(e) => {
+            eprintln!("lpcache: failed to load payload-log plugin: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(plog) = &payload_log {
+        if let Err(e) = plog.prepare() {
+            eprintln!("lpcache: failed to prepare payload log: {e}");
+            std::process::exit(2);
+        }
+        tracing::info!("payload logging enabled: {}", plog.name());
+    }
+
     // The optional dashboard plugin (a `dashboard` spec in `PLUGINS`): when
     // present it serves the real-time statistics web page at its configured
     // `path` (default `/dashboard`) and its stats API at
@@ -182,6 +217,7 @@ async fn main() {
         prefilter,
         result_store,
         request_log,
+        payload_log,
         dashboard,
     };
 
@@ -204,6 +240,12 @@ async fn main() {
         config.meta_max,
         config.stream_queue_size
     );
+    if config.model_routing_enabled() {
+        tracing::info!(
+            "model_routing_enabled models={:?}",
+            config.available_model_ids()
+        );
+    }
 
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,

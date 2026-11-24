@@ -1,14 +1,30 @@
 //! Configuration (port of `config.py`).
 //!
 //! Environment variables (same names/defaults as the Python version):
-//! - `BACKENDS`: JSON array of `{"url": "...", "n_slots": N}`; a parse error
-//!   yields an empty backend list (same as Python).
+//! - `BACKENDS`: JSON array of `{"url": "...", "n_slots": N}` (optional per
+//!   entry: `slot_save_path`, `kv_cache`, `model_id`); a parse error
+//!   yields an empty backend list (same as Python). The per-backend
+//!   `model_id` (all-or-nothing across backends) enables model-aware
+//!   routing: the request's `model` must match a backend's `model_id`
+//!   (case-insensitive) or the request is rejected with `404`, and the
+//!   KV cache files are named `{lowercase(model_id)}_{key}`.
 //! - `LLAMA_URL` / `N_SLOTS`: fallback when `BACKENDS` is not set
 //!   (defaults `http://127.0.0.1:8000`, `1`).
 //! - `WORDS_PER_BLOCK` (100), `BIG_THRESHOLD_WORDS` (500), `LCP_TH` (0.1)
+//! - `SKIP_SAVE_ON_SELF_RESTORE` (`true`; when a big request successfully
+//!   restores its own key — the LCP candidate equals the request key — the
+//!   post-request `action=save` + meta write are skipped: a cold restore's
+//!   200 already proved the KV file's presence, and a warm "already
+//!   running" no-op restore skips the save while the key's meta file is
+//!   still on disk (a missing meta file makes the save re-write the pair,
+//!   healing it); a ratio-1.0 *prefix* match, i.e. a multi-turn extension,
+//!   is not a self-restore and still saves)
 //! - `META_DIR` (`kv_meta`, joined to the current working directory)
 //! - `META_MAX` (10; LRU bound on the number of meta files kept,
 //!   0 = unlimited)
+//! - `STARTUP_CLEANUP_KV` (`false`; at startup corrupt `.meta.json` files
+//!   in `META_DIR` are always removed; when true, the orphan KV files of
+//!   the removed metas are removed from the slot-save dirs as well)
 //! - `SLOT_SAVE_PATH` (optional; the backend's `--slot-save-path`
 //!   directory — pruned meta files' KV files are removed from it)
 //! - `REQUEST_TIMEOUT` (600 s), `MODEL_ID` (`llama.cpp`), `PORT` (8081)
@@ -77,6 +93,12 @@
 //!   `lpcache-cpu-ms`, `lpcache-disk-read-bytes`,
 //!   `lpcache-disk-write-bytes`, `lpcache-ram-bytes`,
 //!   `lpcache-peak-ram-bytes`; default: all of them)
+//! - `REQUEST_PAYLOAD_DIR` (optional; when set, each chat request's raw
+//!   payload is written to a unique file in this directory as it arrives
+//!   (before parsing, prefiltering or backend dispatch — malformed and
+//!   rejected requests are captured too; relative paths resolve against
+//!   the current working directory, the directory is created at startup)
+//!   — the built-in `payload_log` plugin)
 //! - `LOG_LEVEL` (`INFO`)
 //!
 //! Every variable can also be set with a command-line flag (see [`Cli`]);
@@ -93,8 +115,10 @@ pub const DEFAULT_N_SLOTS: usize = 1;
 pub const DEFAULT_WORDS_PER_BLOCK: usize = 100;
 pub const DEFAULT_BIG_THRESHOLD_WORDS: usize = 500;
 pub const DEFAULT_LCP_TH: f64 = 0.1;
+pub const DEFAULT_SKIP_SAVE_ON_SELF_RESTORE: bool = true;
 pub const DEFAULT_META_DIR: &str = "kv_meta";
 pub const DEFAULT_META_MAX: usize = 10;
+pub const DEFAULT_STARTUP_CLEANUP_KV: bool = false;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: f64 = 600.0;
 pub const DEFAULT_MODEL_ID: &str = "llama.cpp";
 pub const DEFAULT_PORT: u16 = 8081;
@@ -138,11 +162,11 @@ pub enum RoutingPolicy {
     /// first, otherwise the least recently used slot. The restore key (if
     /// any) never influences the pick — a picked slot that already runs the
     /// key is detected after the pick and the restore is skipped.
-    #[default]
     Lru,
     /// Key-affinity routing: before the free/LRU tiers, prefer an idle slot
     /// already running the requested KV cache key, so the restore becomes a
     /// zero-wire-call skip instead of a redundant backend call.
+    #[default]
     KeyAffinity,
 }
 
@@ -174,6 +198,24 @@ pub struct BackendConf {
     /// served by it. Default: `true`.
     #[serde(default = "default_true")]
     pub kv_cache: bool,
+    /// Optional model id this backend serves. All-or-nothing across
+    /// backends (see [`Config::validate_backends`]): when set on every
+    /// backend, model-aware routing is enabled — the request's `model`
+    /// must match one of them (case-insensitive) or the request is
+    /// rejected with `404`, requests only run on matching backends, and
+    /// the KV cache files for a model are named
+    /// `{lowercase(model_id)}_{key}`.
+    #[serde(default)]
+    pub model_id: Option<String>,
+}
+
+/// Whether `model_id` is considered set on a backend (present and not
+/// blank).
+fn model_id_set(model_id: &Option<String>) -> bool {
+    model_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
 }
 
 /// Serde default for `BackendConf::kv_cache`: KV save/restore enabled.
@@ -187,9 +229,22 @@ pub struct Config {
     pub words_per_block: usize,
     pub big_threshold_words: usize,
     pub lcp_th: f64,
+    /// `SKIP_SAVE_ON_SELF_RESTORE`: when true, a big request that
+    /// successfully restored its own key skips the post-request KV save +
+    /// meta write (a cold restore's 200 proved the file's presence; a warm
+    /// "already running" no-op restore skips while the key's meta file is
+    /// still on disk and heals it by saving when the meta is gone). See the
+    /// module docs for the exact condition.
+    pub skip_save_on_self_restore: bool,
     pub meta_dir: PathBuf,
     /// LRU bound on the number of meta files kept (0 = unlimited).
     pub meta_max: usize,
+    /// `STARTUP_CLEANUP_KV`: at startup corrupt `.meta.json` files in
+    /// `META_DIR` are always removed; when true, the orphan KV files of the
+    /// removed metas are removed from the slot-save dirs as well (the
+    /// corrupt meta lost its `model_id`, so the KV name is matched by key
+    /// suffix — see `app::remove_orphan_kv`).
+    pub startup_cleanup_kv: bool,
     /// `SLOT_SAVE_PATH` env value (single-backend fallback only).
     pub slot_save_path: Option<PathBuf>,
     pub request_timeout: Duration,
@@ -207,7 +262,7 @@ pub struct Config {
     /// key into a single backend call, regardless of generation parameters
     /// (followers receive the leader's result — see the `coalesce` module).
     pub coalesce_requests: bool,
-    /// The slot routing policy (`SLOT_ROUTING_POLICY`; default `Lru`).
+    /// The slot routing policy (`SLOT_ROUTING_POLICY`; default `KeyAffinity`).
     pub slot_routing_policy: RoutingPolicy,
     /// `PLUGINS`: raw JSON array of plugin specs
     /// (`[{"name": "...", "params": {...}}]`). When set, the prefilter
@@ -256,6 +311,12 @@ pub struct Config {
     /// `REQUEST_LOG_FIELDS`: ordered subset of XLF field names to emit
     /// (empty = all known fields).
     pub request_log_fields: Vec<String>,
+    /// `REQUEST_PAYLOAD_DIR`: when set, each chat request's raw payload
+    /// is written to a unique file in this directory as it arrives (the
+    /// built-in `payload_log` plugin; relative paths resolve against the
+    /// current working directory, the directory is created at startup).
+    /// `None` = payload logging disabled (the default).
+    pub request_payload_dir: Option<PathBuf>,
 }
 
 /// Command-line options, one-to-one with the environment variables above.
@@ -272,8 +333,12 @@ pub struct Cli {
     pub words_per_block: Option<String>,
     pub big_threshold_words: Option<String>,
     pub lcp_th: Option<String>,
+    /// Maps to `SKIP_SAVE_ON_SELF_RESTORE` (`true`/`false`, or `1`/`0`).
+    pub skip_save_on_self_restore: Option<String>,
     pub meta_dir: Option<String>,
     pub meta_max: Option<String>,
+    /// Maps to `STARTUP_CLEANUP_KV` (`true`/`false`, or `1`/`0`).
+    pub startup_cleanup_kv: Option<String>,
     pub slot_save_path: Option<String>,
     pub request_timeout: Option<String>,
     pub model_id: Option<String>,
@@ -316,6 +381,9 @@ pub struct Cli {
     pub request_log_keep: Option<String>,
     /// Maps to `REQUEST_LOG_FIELDS` (comma-separated field subset).
     pub request_log_fields: Option<String>,
+    /// Maps to `REQUEST_PAYLOAD_DIR` (the payload-log directory; unset =
+    /// payload logging disabled).
+    pub request_payload_dir: Option<String>,
 }
 
 impl Config {
@@ -336,8 +404,10 @@ impl Config {
             words_per_block,
             big_threshold_words,
             lcp_th,
+            skip_save_on_self_restore: DEFAULT_SKIP_SAVE_ON_SELF_RESTORE,
             meta_dir,
             meta_max: DEFAULT_META_MAX,
+            startup_cleanup_kv: DEFAULT_STARTUP_CLEANUP_KV,
             slot_save_path: None,
             request_timeout,
             model_id,
@@ -359,6 +429,7 @@ impl Config {
             request_log_max_bytes: DEFAULT_REQUEST_LOG_MAX_BYTES,
             request_log_keep: DEFAULT_REQUEST_LOG_KEEP,
             request_log_fields: Vec::new(),
+            request_payload_dir: None,
         }
     }
 
@@ -368,10 +439,24 @@ impl Config {
         self
     }
 
+    /// Override the startup orphan-KV cleanup flag
+    /// (`STARTUP_CLEANUP_KV`).
+    pub fn with_startup_cleanup_kv(mut self, on: bool) -> Self {
+        self.startup_cleanup_kv = on;
+        self
+    }
+
     /// Override the concurrent-request coalescing flag
     /// (`COALESCE_REQUESTS`).
     pub fn with_coalesce_requests(mut self, on: bool) -> Self {
         self.coalesce_requests = on;
+        self
+    }
+
+    /// Override the self-restore save-skip flag
+    /// (`SKIP_SAVE_ON_SELF_RESTORE`).
+    pub fn with_skip_save_on_self_restore(mut self, on: bool) -> Self {
+        self.skip_save_on_self_restore = on;
         self
     }
 
@@ -441,6 +526,13 @@ impl Config {
         self
     }
 
+    /// Enable the request payload log (`REQUEST_PAYLOAD_DIR`) with the
+    /// given directory; `None` disables it (the default).
+    pub fn with_request_payload_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.request_payload_dir = dir;
+        self
+    }
+
     /// The prefilter plugin specs to load from the `lpcache-plugins`
     /// registry, in evaluation order:
     /// - when `PLUGINS` is set, its JSON array is parsed and used as-is
@@ -453,7 +545,9 @@ impl Config {
     ///
     /// When `REQUEST_LOG` is enabled and the list does not already contain
     /// a `request_log` spec, one is appended (a spec in `PLUGINS` always
-    /// wins: its params are used as-is).
+    /// wins: its params are used as-is). When `REQUEST_PAYLOAD_DIR` is set
+    /// and the list does not already contain a `payload_log` spec, one is
+    /// appended the same way.
     ///
     /// An empty list means no prefilter and no request logging (the
     /// default). `Err` when `PLUGINS` is set but is not a JSON array of
@@ -494,6 +588,9 @@ impl Config {
         if self.request_log_enabled && !specs.iter().any(|s| s.name == "request_log") {
             specs.push(self.request_log_spec());
         }
+        if self.request_payload_dir.is_some() && !specs.iter().any(|s| s.name == "payload_log") {
+            specs.push(self.payload_log_spec());
+        }
         Ok(specs)
     }
 
@@ -513,6 +610,18 @@ impl Config {
         PluginSpec::new("request_log", params)
     }
 
+    /// The `payload_log` plugin spec synthesized from the
+    /// `REQUEST_PAYLOAD_DIR` setting (used by [`Config::plugin_specs`]
+    /// when `REQUEST_PAYLOAD_DIR` is set and `PLUGINS` has no
+    /// `payload_log` spec).
+    fn payload_log_spec(&self) -> lpcache_plugins::PluginSpec {
+        use lpcache_plugins::PluginSpec;
+        PluginSpec::new(
+            "payload_log",
+            serde_json::json!({ "dir": self.request_payload_dir.as_ref().expect("set").to_string_lossy() }),
+        )
+    }
+
     /// `--slot-save-path` directories known to the proxy, used to remove
     /// KV files when meta files are pruned: the per-backend
     /// `slot_save_path` entries, or — when none of them is set — the
@@ -529,6 +638,69 @@ impl Config {
             dirs.push(p);
         }
         dirs
+    }
+
+    /// Whether model-aware routing is enabled: at least one backend and
+    /// `model_id` set on every backend (mixed set/unset is a config
+    /// validation error — see [`Config::validate_backends`]). When
+    /// enabled, the request's `model` must match a backend's `model_id`
+    /// (case-insensitive) or the request is rejected with `404`;
+    /// requests only run on matching backends, and the KV cache files for
+    /// a model are named `{lowercase(model_id)}_{key}` (the model id in
+    /// the cache key hash and in the meta files is lowercased too, so
+    /// case variants of one model share the same key).
+    pub fn model_routing_enabled(&self) -> bool {
+        !self.backends.is_empty() && self.backends.iter().all(|b| model_id_set(&b.model_id))
+    }
+
+    /// The distinct backend `model_id`s in order of first appearance
+    /// (advertisable model list for `GET /v1/models` when model-aware
+    /// routing is enabled; empty otherwise).
+    pub fn available_model_ids(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for b in &self.backends {
+            if let Some(m) = b.model_id.as_deref().filter(|m| !m.trim().is_empty())
+                && !out.iter().any(|x| x.eq_ignore_ascii_case(m))
+            {
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    /// Validate the backend list: the per-backend `model_id` must be
+    /// all-or-nothing — set on every backend or on none. Mixed set/unset
+    /// is an error (it would leave backends that can never match a
+    /// request, silently dead). Called at startup; `Err` names the
+    /// offending entries.
+    pub fn validate_backends(&self) -> Result<(), String> {
+        if self.backends.is_empty() {
+            return Ok(());
+        }
+        let set: Vec<usize> = self
+            .backends
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| model_id_set(&b.model_id))
+            .map(|(i, _)| i)
+            .collect();
+        if !set.is_empty() && set.len() != self.backends.len() {
+            let missing: Vec<String> = self
+                .backends
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !set.contains(i))
+                .map(|(i, b)| format!("#{} ({})", i, b.url))
+                .collect();
+            return Err(format!(
+                "BACKENDS model_id must be set on every backend or on none — \
+                 set on #{} ({}), missing on {}",
+                set.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", #"),
+                self.backends[set[0]].model_id.as_deref().unwrap_or_default(),
+                missing.join(", ")
+            ));
+        }
+        Ok(())
     }
 
     /// Load configuration from the process environment (semantics of `config.py`).
@@ -558,6 +730,7 @@ impl Config {
                     n_slots,
                     slot_save_path: None,
                     kv_cache: true,
+                    model_id: None,
                 }]
             }
         };
@@ -585,8 +758,18 @@ impl Config {
             words_per_block: env_int(vars, "WORDS_PER_BLOCK", DEFAULT_WORDS_PER_BLOCK),
             big_threshold_words: env_int(vars, "BIG_THRESHOLD_WORDS", DEFAULT_BIG_THRESHOLD_WORDS),
             lcp_th: env_float(vars, "LCP_TH", DEFAULT_LCP_TH),
+            skip_save_on_self_restore: env_bool(
+                vars,
+                "SKIP_SAVE_ON_SELF_RESTORE",
+                DEFAULT_SKIP_SAVE_ON_SELF_RESTORE,
+            ),
             meta_dir,
             meta_max: env_int(vars, "META_MAX", DEFAULT_META_MAX),
+            startup_cleanup_kv: env_bool(
+                vars,
+                "STARTUP_CLEANUP_KV",
+                DEFAULT_STARTUP_CLEANUP_KV,
+            ),
             slot_save_path,
             request_timeout: Duration::from_secs_f64(env_float(
                 vars,
@@ -660,6 +843,11 @@ impl Config {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
+            request_payload_dir: vars
+                .get("REQUEST_PAYLOAD_DIR")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
         }
     }
 
@@ -757,10 +945,12 @@ fn parse_routing_policy(v: &str) -> RoutingPolicy {
         "lru" => RoutingPolicy::Lru,
         "key_affinity" | "key-affinity" => RoutingPolicy::KeyAffinity,
         other => {
+            let default = RoutingPolicy::default();
             tracing::warn!(
-                "env SLOT_ROUTING_POLICY={other:?} is not a routing policy (lru, key_affinity), using lru"
+                "env SLOT_ROUTING_POLICY={other:?} is not a routing policy (lru, key_affinity), using {}",
+                default.as_str()
             );
-            RoutingPolicy::Lru
+            default
         }
     }
 }
@@ -818,8 +1008,10 @@ impl Cli {
                 "--words-per-block" => cli.words_per_block = Some(value),
                 "--big-threshold-words" => cli.big_threshold_words = Some(value),
                 "--lcp-th" => cli.lcp_th = Some(value),
+                "--skip-save-on-self-restore" => cli.skip_save_on_self_restore = Some(value),
                 "--meta-dir" => cli.meta_dir = Some(value),
                 "--meta-max" => cli.meta_max = Some(value),
+                "--startup-cleanup-kv" => cli.startup_cleanup_kv = Some(value),
                 "--slot-save-path" => cli.slot_save_path = Some(value),
                 "--request-timeout" => cli.request_timeout = Some(value),
                 "--model-id" => cli.model_id = Some(value),
@@ -841,6 +1033,7 @@ impl Cli {
                 "--request-log-max-bytes" => cli.request_log_max_bytes = Some(value),
                 "--request-log-keep" => cli.request_log_keep = Some(value),
                 "--request-log-fields" => cli.request_log_fields = Some(value),
+                "--request-payload-dir" => cli.request_payload_dir = Some(value),
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -856,14 +1049,16 @@ Explicit options take precedence over environment variables, which take
 precedence over the built-in defaults.
 
 Options:
-  --backends <JSON>             BACKENDS             JSON array of backend objects: url, n_slots, slot_save_path
+  --backends <JSON>             BACKENDS             JSON array of backend objects: url, n_slots, slot_save_path, kv_cache, model_id (model_id is all-or-nothing across backends; when set, the request's model must match a backend's model_id (case-insensitive) or the request is a 404, and KV cache files are named {lowercase(model_id)}_{key})
   --llama-url <URL>             LLAMA_URL            single-backend fallback (default http://127.0.0.1:8000)
   --n-slots <N>                 N_SLOTS              slot count for the fallback backend (default 1)
   --words-per-block <N>         WORDS_PER_BLOCK      words per hash block (default 100)
   --big-threshold-words <N>     BIG_THRESHOLD_WORDS  word count making a request "big" (default 500)
   --lcp-th <F>                  LCP_TH               min. shared-block ratio 0..1 to restore a cache (default 0.1)
+  --skip-save-on-self-restore <BOOL>  SKIP_SAVE_ON_SELF_RESTORE  skip the post-request KV save when the request successfully restored its own key (the file already holds that state; ratio-1.0 prefix matches still save) (default true)
   --meta-dir <PATH>             META_DIR             meta file dir (default ./kv_meta, relative to CWD)
   --meta-max <N>                META_MAX             max meta files kept; oldest pruned (default 10, 0 = unlimited)
+  --startup-cleanup-kv <BOOL>   STARTUP_CLEANUP_KV   the startup meta scan also removes the orphan KV files of removed corrupt metas (default false; the corrupt meta files themselves are always removed)
   --slot-save-path <PATH>       SLOT_SAVE_PATH       backend --slot-save-path dir (single-backend fallback)
   --request-timeout <SECS>      REQUEST_TIMEOUT      per-request timeout to the backend (default 600)
   --model-id <ID>               MODEL_ID             model id advertised by /v1/models (default llama.cpp)
@@ -872,7 +1067,7 @@ Options:
   --log-level <LEVEL>           LOG_LEVEL            TRACE..ERROR (default INFO; RUST_LOG overrides)
   --stream-queue-size <N>       STREAM_QUEUE_SIZE    per-request SSE channel capacity (default 16, must be >= 1)
   --coalesce-requests <BOOL>    COALESCE_REQUESTS    group concurrent same-key requests into one backend call (default false)
-  --slot-routing-policy <POL>   SLOT_ROUTING_POLICY  slot pick policy: lru (free-first, then least recently used) or key_affinity (for a request with a KV restore key, prefer an idle slot already running that key so the restore is a no-op) (default lru)
+  --slot-routing-policy <POL>   SLOT_ROUTING_POLICY  slot pick policy: key_affinity (for a request with a KV restore key, prefer an idle slot already running that key so the restore is a no-op) or lru (free-first, then least recently used) (default key_affinity)
   --plugins <JSON>              PLUGINS              JSON array of plugin specs [{"name": "...", "params": {...}}] selecting the prefilter plugins (built-ins: keyword, chain, result_cache) plus optional request_log and dashboard plugins; when set, the legacy PREFILTER_* settings are ignored (default: synthesized from them)
   --prefilter-blocklist <LIST>  PREFILTER_BLOCKLIST  (legacy: keyword plugin) comma-separated keywords; matching requests are rejected (400) before the backend (default: disabled)
   --prefilter-case-insensitive <BOOL>  PREFILTER_CASE_INSENSITIVE  keyword matching is case-insensitive (default true)
@@ -885,6 +1080,7 @@ Options:
   --request-log-max-bytes <N>   REQUEST_LOG_MAX_BYTES rotation threshold in bytes; the file is rotated when exceeded (default 10 MiB, 0 = no rotation)
   --request-log-keep <N>        REQUEST_LOG_KEEP     rotated generations retained (default 5, 0 = keep all)
   --request-log-fields <LIST>   REQUEST_LOG_FIELDS   comma-separated ordered subset of XLF field names (default: all fields)
+  --request-payload-dir <PATH>  REQUEST_PAYLOAD_DIR  write each chat request's raw payload to a unique file in this directory as it arrives (relative paths resolve against the CWD, created at startup; default: disabled)
   -V, --version                 show version and exit
   -h, --help                    show this help and exit
 
@@ -893,6 +1089,13 @@ Notes:
     both --flag value and --flag=value are accepted
   * with BACKENDS set, LLAMA_URL / N_SLOTS / SLOT_SAVE_PATH are ignored —
     per-backend values in the JSON array win
+  * BACKENDS model_id is all-or-nothing (every backend or none): when
+    set, a request's model must match a backend's model_id
+    (case-insensitive) or it is rejected with 404, requests only run on
+    matching backends, GET /v1/models lists the distinct model ids, and
+    KV cache files are named {lowercase(model_id)}_{key}; when unset
+    (the default) routing is model-unaware and the cache key / KV file
+    name use the model id the first backend reports
   * LLAMA_API_KEY is sent to the backend as "Authorization: Bearer <key>"
     (llama-server --api-key); a blank value means no auth
   * META_DIR and a relative SLOT_SAVE_PATH resolve against the CWD
@@ -900,6 +1103,9 @@ Notes:
     booleans accept 1/true/yes/on and 0/false/no/off
   * META_MAX=0 disables pruning; a restore of a pruned key falls back to a
     full prefill
+  * at startup, corrupt .meta.json files in META_DIR (unreadable or failing
+    the meta schema) are removed; with STARTUP_CLEANUP_KV=1 the orphan KV
+    files of the removed metas in the slot-save dirs are removed too
   * PREFILTER_BLOCKLIST is a comma-separated keyword list (surrounding
     whitespace ignored); when set, requests whose message contents contain
     any keyword are rejected with 400 before slot acquisition or backend
@@ -919,6 +1125,14 @@ Notes:
     retained); REQUEST_LOG_FIELDS selects an ordered subset of fields
     (defaults to all W3C + lpcache-* pipeline fields); a request_log spec
     in PLUGINS takes precedence over the REQUEST_LOG_* settings
+  * REQUEST_PAYLOAD_DIR enables the built-in payload_log plugin: each chat
+    request's raw payload is written to
+    {dir}/{seq:06}-{timestamp}-{key16}.json as it arrives (non-UTF-8
+    payloads use .bin, key16 = first 16 hex chars of the KV cache key or
+    "nokey") — before parsing, prefiltering or backend dispatch, so
+    malformed and rejected requests are captured too; relative paths
+    resolve against the CWD and the directory is created at startup; a
+    payload_log spec in PLUGINS takes precedence
   * the backend should be started with matching llama-server flags:
     -np/--parallel (N_SLOTS), --api-key (LLAMA_API_KEY) and a
     --slot-save-path directory (SLOT_SAVE_PATH)
@@ -938,8 +1152,10 @@ Notes:
             ("WORDS_PER_BLOCK", &self.words_per_block),
             ("BIG_THRESHOLD_WORDS", &self.big_threshold_words),
             ("LCP_TH", &self.lcp_th),
+            ("SKIP_SAVE_ON_SELF_RESTORE", &self.skip_save_on_self_restore),
             ("META_DIR", &self.meta_dir),
             ("META_MAX", &self.meta_max),
+            ("STARTUP_CLEANUP_KV", &self.startup_cleanup_kv),
             ("SLOT_SAVE_PATH", &self.slot_save_path),
             ("REQUEST_TIMEOUT", &self.request_timeout),
             ("MODEL_ID", &self.model_id),
@@ -970,6 +1186,7 @@ Notes:
             ("REQUEST_LOG_MAX_BYTES", &self.request_log_max_bytes),
             ("REQUEST_LOG_KEEP", &self.request_log_keep),
             ("REQUEST_LOG_FIELDS", &self.request_log_fields),
+            ("REQUEST_PAYLOAD_DIR", &self.request_payload_dir),
         ];
         for (env_name, value) in opts {
             if let Some(v) = value {
@@ -1014,6 +1231,8 @@ mod tests {
         assert_eq!(c.words_per_block, 100);
         assert_eq!(c.big_threshold_words, 500);
         assert!((c.lcp_th - 0.1).abs() < f64::EPSILON);
+        assert!(c.skip_save_on_self_restore);
+        assert!(!c.startup_cleanup_kv);
         assert_eq!(
             c.meta_dir.file_name().and_then(|f| f.to_str()),
             Some("kv_meta")
@@ -1032,6 +1251,7 @@ mod tests {
         assert_eq!(c.request_log_max_bytes, DEFAULT_REQUEST_LOG_MAX_BYTES);
         assert_eq!(c.request_log_keep, DEFAULT_REQUEST_LOG_KEEP);
         assert!(c.request_log_fields.is_empty());
+        assert!(c.request_payload_dir.is_none());
     }
 
     #[test]
@@ -1141,6 +1361,72 @@ mod tests {
             !c.backends[1].kv_cache,
             "explicit kv_cache=false is honored"
         );
+    }
+
+    #[test]
+    fn backends_model_id_parsed_and_routing_enabled() {
+        // omitted model_id -> disabled (legacy behaviour)
+        let c = Config::from_env_map(&vars(&[(
+            "BACKENDS",
+            r#"[{"url":"http://a:1","n_slots":2}]"#,
+        )]));
+        assert_eq!(c.backends[0].model_id, None);
+        assert!(!c.model_routing_enabled());
+        assert!(c.available_model_ids().is_empty());
+        assert!(c.validate_backends().is_ok());
+
+        // set on every backend -> enabled; ids deduped case-insensitively
+        let c = Config::from_env_map(&vars(&[(
+            "BACKENDS",
+            r#"[{"url":"http://a:1","n_slots":2,"model_id":"Llama-3.2-1B"},{"url":"http://b:2","n_slots":1,"model_id":"Qwen-2.5-0.5B"},{"url":"http://c:3","n_slots":1,"model_id":"llama-3.2-1b"}]"#,
+        )]));
+        assert_eq!(c.backends[0].model_id.as_deref(), Some("Llama-3.2-1B"));
+        assert!(c.model_routing_enabled());
+        assert_eq!(
+            c.available_model_ids(),
+            vec!["Llama-3.2-1B", "Qwen-2.5-0.5B"]
+        );
+        assert!(c.validate_backends().is_ok());
+
+        // single-backend fallback (no BACKENDS) -> disabled
+        let c = Config::from_env_map(&vars(&[(
+            "LLAMA_URL",
+            "http://x:9",
+        )]));
+        assert_eq!(c.backends[0].model_id, None);
+        assert!(!c.model_routing_enabled());
+    }
+
+    #[test]
+    fn backends_model_id_mixed_is_validation_error() {
+        let c = Config::from_env_map(&vars(&[(
+            "BACKENDS",
+            r#"[{"url":"http://a:1","n_slots":2,"model_id":"m1"},{"url":"http://b:2","n_slots":1}]"#,
+        )]));
+        // the config still parses (a parse error would silently drop every
+        // backend); the mixed set is caught by the startup validation
+        assert!(
+            !c.model_routing_enabled(),
+            "a mixed set is not fully enabled — validation must catch it"
+        );
+        let err = c.validate_backends().unwrap_err();
+        assert!(err.contains("model_id"), "{err}");
+        assert!(err.contains("#1"), "names the missing backend: {err}");
+
+        // all set -> ok; blank counts as unset
+        let c = Config::from_env_map(&vars(&[(
+            "BACKENDS",
+            r#"[{"url":"http://a:1","n_slots":2,"model_id":"m1"},{"url":"http://b:2","n_slots":1,"model_id":"m2"}]"#,
+        )]));
+        assert!(c.validate_backends().is_ok());
+        let c = Config::from_env_map(&vars(&[(
+            "BACKENDS",
+            r#"[{"url":"http://a:1","n_slots":2,"model_id":"m1"},{"url":"http://b:2","n_slots":1,"model_id":"  "}]"#,
+        )]));
+        assert!(c.validate_backends().is_err(), "blank model_id counts as unset");
+        // empty backend list (a BACKENDS parse error) -> nothing to validate
+        let c = Config::from_env_map(&vars(&[("BACKENDS", "not json")]));
+        assert!(c.validate_backends().is_ok());
     }
 
     #[test]
@@ -1272,8 +1558,10 @@ mod tests {
             "--words-per-block",
             "--big-threshold-words",
             "--lcp-th",
+            "--skip-save-on-self-restore",
             "--meta-dir",
             "--meta-max",
+            "--startup-cleanup-kv",
             "--slot-save-path",
             "--request-timeout",
             "--model-id",
@@ -1302,8 +1590,10 @@ mod tests {
             "WORDS_PER_BLOCK",
             "BIG_THRESHOLD_WORDS",
             "LCP_TH",
+            "SKIP_SAVE_ON_SELF_RESTORE",
             "META_DIR",
             "META_MAX",
+            "STARTUP_CLEANUP_KV",
             "SLOT_SAVE_PATH",
             "REQUEST_TIMEOUT",
             "MODEL_ID",
@@ -1342,11 +1632,66 @@ mod tests {
     }
 
     #[test]
+    fn startup_cleanup_kv_flag() {
+        // default off
+        assert!(!Config::from_env_map(&HashMap::new()).startup_cleanup_kv);
+        // env on / off
+        assert!(
+            Config::from_env_map(&vars(&[("STARTUP_CLEANUP_KV", "true")]))
+                .startup_cleanup_kv
+        );
+        assert!(
+            Config::from_env_map(&vars(&[("STARTUP_CLEANUP_KV", "1")])).startup_cleanup_kv
+        );
+        assert!(
+            !Config::from_env_map(&vars(&[("STARTUP_CLEANUP_KV", "0")])).startup_cleanup_kv
+        );
+        // invalid -> default
+        assert!(
+            !Config::from_env_map(&vars(&[("STARTUP_CLEANUP_KV", "oops")]))
+                .startup_cleanup_kv
+        );
+        // CLI wins over env
+        let cli = Cli::parse(vec!["--startup-cleanup-kv".to_string(), "false".to_string()])
+            .unwrap();
+        let merged = cli.merged_env(&vars(&[("STARTUP_CLEANUP_KV", "1")]));
+        assert!(!Config::from_env_map(&merged).startup_cleanup_kv);
+    }
+
+    #[test]
+    fn skip_save_on_self_restore_flag() {
+        // default on
+        assert!(Config::from_env_map(&HashMap::new()).skip_save_on_self_restore);
+        // env on / off
+        assert!(
+            Config::from_env_map(&vars(&[("SKIP_SAVE_ON_SELF_RESTORE", "true")]))
+                .skip_save_on_self_restore
+        );
+        assert!(
+            !Config::from_env_map(&vars(&[("SKIP_SAVE_ON_SELF_RESTORE", "0")]))
+                .skip_save_on_self_restore
+        );
+        // invalid -> default
+        assert!(
+            Config::from_env_map(&vars(&[("SKIP_SAVE_ON_SELF_RESTORE", "oops")]))
+                .skip_save_on_self_restore
+        );
+        // CLI wins over env
+        let cli = Cli::parse(vec![
+            "--skip-save-on-self-restore".to_string(),
+            "false".to_string(),
+        ])
+        .unwrap();
+        let merged = cli.merged_env(&vars(&[("SKIP_SAVE_ON_SELF_RESTORE", "1")]));
+        assert!(!Config::from_env_map(&merged).skip_save_on_self_restore);
+    }
+
+    #[test]
     fn slot_routing_policy_env_and_cli() {
         // default
         assert_eq!(
             Config::from_env_map(&HashMap::new()).slot_routing_policy,
-            RoutingPolicy::Lru
+            RoutingPolicy::KeyAffinity
         );
         // env: both values, case-insensitive, hyphen alias accepted
         for raw in ["lru", "LRU", "key_affinity", "KEY_AFFINITY", "key-affinity"] {
@@ -1364,7 +1709,7 @@ mod tests {
         // invalid -> default
         assert_eq!(
             Config::from_env_map(&vars(&[("SLOT_ROUTING_POLICY", "random")])).slot_routing_policy,
-            RoutingPolicy::Lru
+            RoutingPolicy::KeyAffinity
         );
         // CLI wins over env
         let cli = Cli::parse(vec!["--slot-routing-policy".to_string(), "lru".to_string()]).unwrap();
@@ -1498,6 +1843,91 @@ mod tests {
         assert_eq!(specs[1].name, "result_cache");
         assert_eq!(specs[1].params["dir"], "/var/rc");
         assert_eq!(specs[1].params["ttl_secs"], 60.0);
+    }
+
+    #[test]
+    fn request_payload_dir_env_and_spec() {
+        // default: disabled
+        assert!(
+            Config::from_env_map(&HashMap::new())
+                .request_payload_dir
+                .is_none()
+        );
+        // env value (surrounding whitespace trimmed)
+        let c = Config::from_env_map(&vars(&[("REQUEST_PAYLOAD_DIR", "/var/payloads  ")]));
+        assert_eq!(
+            c.request_payload_dir
+                .as_deref()
+                .map(|p| p.to_str().unwrap()),
+            Some("/var/payloads")
+        );
+        // blank = disabled
+        assert!(
+            Config::from_env_map(&vars(&[("REQUEST_PAYLOAD_DIR", "   ")]))
+                .request_payload_dir
+                .is_none()
+        );
+        // synthesized spec, appended after the request_log spec when both
+        // are enabled
+        let c = Config::from_env_map(&vars(&[
+            ("REQUEST_LOG", "true"),
+            ("REQUEST_PAYLOAD_DIR", "/var/payloads"),
+        ]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "request_log");
+        assert_eq!(specs[1].name, "payload_log");
+        assert_eq!(specs[1].params["dir"], "/var/payloads");
+        // an explicit PLUGINS entry wins for prefilter selection; the
+        // payload_log spec is still appended (as with request_log)
+        let c = Config::from_env_map(&vars(&[
+            (
+                "PLUGINS",
+                r#"[{"name":"keyword","params":{"keywords":["a"]}}]"#,
+            ),
+            ("REQUEST_PAYLOAD_DIR", "/var/payloads"),
+        ]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "keyword");
+        assert_eq!(specs[1].name, "payload_log");
+        assert_eq!(specs[1].params["dir"], "/var/payloads");
+        // a PLUGINS payload_log spec is kept as-is (its params win)
+        let c = Config::from_env_map(&vars(&[
+            (
+                "PLUGINS",
+                r#"[{"name":"payload_log","params":{"dir":"/other"}}]"#,
+            ),
+            ("REQUEST_PAYLOAD_DIR", "/var/payloads"),
+        ]));
+        let specs = c.plugin_specs().expect("specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].params["dir"], "/other");
+    }
+
+    #[test]
+    fn request_payload_dir_cli() {
+        let cli = Cli::parse(vec![
+            "--request-payload-dir".to_string(),
+            "/var/payloads".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.merged_env(&HashMap::new())
+                .get("REQUEST_PAYLOAD_DIR")
+                .map(|s| s.as_str()),
+            Some("/var/payloads")
+        );
+        // `--flag=value` form
+        let cli = Cli::parse(vec!["--request-payload-dir=/var/payloads".to_string()]).unwrap();
+        assert_eq!(
+            cli.merged_env(&HashMap::new())
+                .get("REQUEST_PAYLOAD_DIR")
+                .map(|s| s.as_str()),
+            Some("/var/payloads")
+        );
+        // missing value is an error
+        assert!(Cli::parse(vec!["--request-payload-dir".to_string()]).is_err());
     }
 
     #[test]

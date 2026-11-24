@@ -72,9 +72,11 @@ updated (port now `9091`):
 
 The **backends** submenu is a small CRUD list: edit any entry, add new
 ones, remove one, or done. Per backend you set the URL, `n_slots` (must
-match the llama-server's `-np/--parallel`), `slot_save_path` (must match
-its `--slot-save-path`), and a `kv` yes/no for KV save/restore support
-(llama-server ≥ 1.05.40).
+match the llama-server's `-np/--parallel`), the `model_id` (optional —
+the model this backend serves; set it on **every** backend to enable
+model-aware routing, on none to keep the legacy behaviour), `slot_save_path`
+(must match its `--slot-save-path`), and a `kv` yes/no for KV save/restore
+support (llama-server ≥ 1.05.40).
 
 ![backends submenu](configurator/wizard-3-backends.png)
 
@@ -98,7 +100,7 @@ does not know are flagged `(unknown plugin)`):
   stays compact, and params the schema does not know about are carried over
   untouched. Entries whose name the schema does not know (a custom registry
   plugin) fall back to a raw-JSON prompt so nothing is lost.
-- **+ add a plugin** — pick one of the six selectable built-ins, then answer
+- **+ add a plugin** — pick one of the seven selectable built-ins, then answer
   the same per-param prompts. `llama` is not offered: one backend client is
   created automatically per `[[backend]]`, and a `llama` spec in `PLUGINS`
   would be a no-op (the validator tells you so).
@@ -107,9 +109,9 @@ does not know are flagged `(unknown plugin)`):
 ![plugins submenu](configurator/wizard-3b-plugins.png)
 
 The `chain` plugin gets a nested list editor for its `filters` (prefilter
-kinds only, arbitrarily deep), and `request_log` / `dashboard` are
-singletons — a second spec of either is a validation error that blocks
-**save & exit**.
+kinds only, arbitrarily deep), and `request_log` / `payload_log` /
+`dashboard` are singletons — a second spec of any of them is a validation
+error that blocks **save & exit**.
 
 ### Review and save
 
@@ -151,9 +153,10 @@ from what `lpcache` accepts at startup:
 
 ![plugin chain editor](configurator/web-2b-plugin-editor.png)
 
-- **+ Add plugin** offers the six selectable built-ins; `request_log` and
-  `dashboard` disappear from the picker once one is present (they are
-  singletons), and nested lists (`chain.filters`) only offer prefilter kinds.
+- **+ Add plugin** offers the seven selectable built-ins; `request_log`,
+  `payload_log` and `dashboard` disappear from the picker once one is
+  present (they are singletons), and nested lists (`chain.filters`) only
+  offer prefilter kinds.
 - **edit** expands an entry into a form with one control per param kind —
   text inputs (masked for `api_key`), number inputs with min/max, checkboxes,
   dropdowns for enums, comma-separated text for string lists, and a nested
@@ -173,8 +176,9 @@ from what `lpcache` accepts at startup:
   [`validate`](#what-validate-checks)).
 
 When non-empty the chain **takes precedence** over the legacy **Prefilter**
-panel above it (the proxy then ignores `PREFILTER_*`), and a `request_log`
-spec in the chain wins over the **Request log** toggle.
+panel above it (the proxy then ignores `PREFILTER_*`), a `request_log`
+spec in the chain wins over the **Request log** toggle, and a
+`payload_log` spec wins over the **Payload log** toggle.
 
 ### Live validation
 
@@ -242,7 +246,7 @@ code 2:
 | `plugins.json` is not a JSON array of `{"name": …}` objects |
 | an unknown plugin name — with a *did-you-mean* suggestion for near misses |
 | `params` present but not a JSON object |
-| a missing (or empty) required param — `keyword.keywords`, `qwen_guard.url`, `result_cache.dir`, `chain.filters`, `llama.url` |
+| a missing (or empty) required param — `keyword.keywords`, `qwen_guard.url`, `result_cache.dir`, `chain.filters`, `llama.url`, `payload_log.dir` |
 | a wrong type — a string where a number is expected, a quoted number, a float where an int is required, a non-boolean, … |
 | a number outside its range — every `min ≥ 0` param, and the `dashboard` ranges below (range-validated, **not** clamped) |
 | a value outside its allowed set — `on_error` / `on_unparseable`, the guard levels and categories, `cleanup`, every `request_log` field name |
@@ -250,7 +254,7 @@ code 2:
 | `chain.filters` empty (the runtime refuses to start with an empty chain) |
 | an invalid nested spec — reported as `filters[i]: …` so the offending filter is pinpointed; nesting deeper than 8 levels |
 | a `dashboard` with **any** unknown param (it is the only built-in that deserializes with `deny_unknown_fields`) |
-| a second `request_log` or `dashboard` spec (both are singletons) |
+| a second `request_log`, `payload_log` or `dashboard` spec (all three are singletons) |
 | a `dashboard.path` not starting with `/` |
 
 | Warning (saved, but worth reading) |
@@ -313,6 +317,12 @@ Behaviour and worked examples:
 | `max_bytes` | int ≥ 0 | `10485760` | rotation threshold; 0 = no rotation |
 | `keep` | int ≥ 0 | `5` | rotated generations kept; 0 = keep all |
 | `fields` | string list | all 36 | ordered subset of the 36 known XLF field names; **blank / omitted = all 36** — an explicit `[]` or a repeated field is a startup error |
+
+#### `payload_log` — raw request-payload logger (singleton)
+
+| param | type | default | notes |
+| --- | --- | --- | --- |
+| `dir` * | text | — | dir for one payload file + paired `.headers` file per chat-request payload, written as they arrive (`{seq:06}-{timestamp}-{key16}.json`, `.bin` for non-UTF-8 payloads; the headers companion shares the base name); relative paths resolve against the proxy's cwd; created at startup; never rotated or deleted by the proxy |
 
 #### `dashboard` — real-time statistics web dashboard (singleton)
 

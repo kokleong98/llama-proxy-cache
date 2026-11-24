@@ -9,17 +9,18 @@
 
 use crate::model::{self, BackendEntry, LpcacheConfig};
 use crate::plugin_schema::{self, FieldKind, Param, Plugin};
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
 use serde_json::Value;
 use std::path::Path;
 
 /// Menu entries shown on every loop iteration.
-const SECTIONS: [&str; 6] = [
+const SECTIONS: [&str; 7] = [
     "proxy",
     "backends",
     "kv_cache",
     "prefilter",
     "request_log",
+    "payload_log",
     "plugins",
 ];
 
@@ -32,6 +33,7 @@ fn empty_allowed(key: &str) -> bool {
             | "prefilter.blocklist"
             | "prefilter.result_cache_dir"
             | "request_log.fields"
+            | "payload_log.dir"
             | "plugins.json"
     )
 }
@@ -83,7 +85,11 @@ pub fn run(path: &Path) -> Result<i32, String> {
     println!(
         "lpcache-config guided setup — {} ({})",
         path.display(),
-        if exists { "loaded" } else { "new file — starting from built-in defaults" }
+        if exists {
+            "loaded"
+        } else {
+            "new file — starting from built-in defaults"
+        }
     );
     println!("Return keeps the shown default · Esc goes back · Ctrl-C quits.\n");
 
@@ -98,7 +104,7 @@ pub fn run(path: &Path) -> Result<i32, String> {
             .map_err(aborted)?;
         let Some(sel) = sel else { break }; // Esc on the root menu = quit
         match sel {
-            0..=5 => {
+            0..=6 => {
                 let prefix = SECTIONS[sel];
                 let changed = match prefix {
                     "backends" => backends_menu(&mut cfg)?,
@@ -107,8 +113,8 @@ pub fn run(path: &Path) -> Result<i32, String> {
                 };
                 dirty |= changed;
             }
-            6 => review(&cfg, dirty),
-            7 => {
+            7 => review(&cfg, dirty),
+            8 => {
                 if save(path, &cfg)? {
                     return Ok(0);
                 }
@@ -156,7 +162,19 @@ fn menu_items(cfg: &LpcacheConfig, dirty: bool) -> Vec<String> {
         ),
         format!(
             "{mark} request_log   ({})",
-            if cfg.request_log.enabled { "enabled" } else { "disabled" }
+            if cfg.request_log.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        format!(
+            "{mark} payload_log   ({})",
+            if cfg.payload_log.dir.trim().is_empty() {
+                "off"
+            } else {
+                cfg.payload_log.dir.trim()
+            }
         ),
         format!("{mark} plugins       ({})", plugins_state(cfg)),
         "  review & validate".to_string(),
@@ -199,7 +217,7 @@ fn prompt_key(cfg: &mut LpcacheConfig, key: &str) -> Result<bool, String> {
             None => return Ok(false), // Esc keeps the current value
         }
     } else if key == "proxy.slot_routing_policy" {
-        let policies = ["lru", "key_affinity"];
+        let policies = ["key_affinity", "lru"];
         let def = policies
             .iter()
             .position(|p| p.eq_ignore_ascii_case(&cur))
@@ -238,19 +256,25 @@ fn prompt_key(cfg: &mut LpcacheConfig, key: &str) -> Result<bool, String> {
             }
         }
     };
-    cfg.set_key(key, &next).map_err(|e| format!("wizard: {e}"))?;
+    cfg.set_key(key, &next)
+        .map_err(|e| format!("wizard: {e}"))?;
     Ok(next != cur)
 }
 
 /// Show one backend the way the menu lists it.
 fn format_backend(i: usize, b: &BackendEntry) -> String {
     let save = if b.slot_save_path.trim().is_empty() {
-        "save:none"
+        "save:none".to_string()
     } else {
-        b.slot_save_path.as_str()
+        format!("save:{}", b.slot_save_path)
+    };
+    let model = if b.model_id.trim().is_empty() {
+        "model:none".to_string()
+    } else {
+        format!("model:{}", b.model_id.trim())
     };
     format!(
-        "edit {}: {} — {} slot(s), kv {}, {save}",
+        "edit {}: {} — {} slot(s), kv {}, {model}, {save}",
         i + 1,
         b.url,
         b.n_slots,
@@ -283,6 +307,12 @@ fn prompt_backend(be: &BackendEntry) -> Result<BackendEntry, String> {
                 .map_err(|_| "not a non-negative integer".to_string())
         },
     )?;
+    let model = prompt_text(
+        "model_id — the model this backend serves (empty = no model routing)",
+        &be.model_id,
+        true,
+        |_| Ok(()),
+    )?;
     let save = prompt_text(
         "slot_save_path — the backend's --slot-save-path (empty = none)",
         &be.slot_save_path,
@@ -302,6 +332,7 @@ fn prompt_backend(be: &BackendEntry) -> Result<BackendEntry, String> {
             .map_err(|_| "wizard: bad slot count".to_string())?,
         slot_save_path: save,
         kv_cache: kv,
+        model_id: model.trim().to_string(),
     })
 }
 
@@ -442,8 +473,11 @@ fn plugins_menu(cfg: &mut LpcacheConfig) -> Result<bool, String> {
     let mut changed = false;
     loop {
         let n = specs.len();
-        let mut items: Vec<String> =
-            specs.iter().enumerate().map(|(i, s)| format_plugin(i, s)).collect();
+        let mut items: Vec<String> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format_plugin(i, s))
+            .collect();
         items.push("+ add a plugin".into());
         if n > 0 {
             items.push("- remove a plugin".into());
@@ -467,13 +501,14 @@ fn plugins_menu(cfg: &mut LpcacheConfig) -> Result<bool, String> {
                 }
             }
             Some(i) if i == n => {
-                let Some(spec) = prompt_new_plugin()? else { continue };
+                let Some(spec) = prompt_new_plugin()? else {
+                    continue;
+                };
                 specs.push(spec);
                 changed = true;
             }
             Some(i) if n > 0 && i == n + 1 => {
-                let labels: Vec<String> =
-                    specs.iter().map(plugin_schema::spec_summary).collect();
+                let labels: Vec<String> = specs.iter().map(plugin_schema::spec_summary).collect();
                 let Some(j) = Select::with_theme(&theme())
                     .with_prompt("remove which plugin?")
                     .items(&labels)
@@ -555,10 +590,7 @@ fn plugin_entry_prompt(spec: &Value) -> Result<Value, String> {
 /// left at the plugin default are omitted, keeping `PLUGINS` compact.
 /// Params the schema does not know about are carried over untouched (they
 /// are reported by `validate`) instead of being silently dropped.
-fn params_prompt(
-    plg: &Plugin,
-    existing: &serde_json::Map<String, Value>,
-) -> Result<Value, String> {
+fn params_prompt(plg: &Plugin, existing: &serde_json::Map<String, Value>) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
     for par in plg.params {
         if let Some(v) = prompt_param(par, existing.get(par.key))? {
@@ -622,9 +654,12 @@ fn prompt_param(par: &Param, cur: Option<&Value>) -> Result<Option<Value>, Strin
             Value::String(v)
         }
         FieldKind::Int | FieldKind::Float => {
-            let v = prompt_text(&label, &num_default(par, cur), par.min == Some(0.0) && !par.required, |v| {
-                parse_num(par, v).map(|_| ())
-            })?;
+            let v = prompt_text(
+                &label,
+                &num_default(par, cur),
+                par.min == Some(0.0) && !par.required,
+                |v| parse_num(par, v).map(|_| ()),
+            )?;
             parse_num(par, &v).unwrap_or(Value::Null)
         }
         FieldKind::Bool => Confirm::with_theme(&theme())
@@ -714,19 +749,27 @@ fn parse_num(par: &Param, raw: &str) -> Result<Value, String> {
     let raw = raw.trim();
     if par.kind == FieldKind::Int {
         let n: i64 = raw.parse().map_err(|_| "not a whole number".to_string())?;
-        if let Some(min) = par.min && (n as f64) < min {
+        if let Some(min) = par.min
+            && (n as f64) < min
+        {
             return Err(format!("must be >= {}", min as i64));
         }
-        if let Some(max) = par.max && (n as f64) > max {
+        if let Some(max) = par.max
+            && (n as f64) > max
+        {
             return Err(format!("must be <= {}", max as i64));
         }
         return Ok(Value::from(n));
     }
     let f: f64 = raw.parse().map_err(|_| "not a number".to_string())?;
-    if let Some(min) = par.min && f < min {
+    if let Some(min) = par.min
+        && f < min
+    {
         return Err(format!("must be >= {min}"));
     }
-    if let Some(max) = par.max && f > max {
+    if let Some(max) = par.max
+        && f > max
+    {
         return Err(format!("must be <= {max}"));
     }
     serde_json::Number::from_f64(f)
@@ -785,10 +828,7 @@ fn omittable(par: &Param, val: &Value) -> bool {
 }
 /// Edit the `chain` plugin's nested `filters` list (prefilter kinds only).
 fn nested_filters_prompt(cur: Option<&Value>) -> Result<Value, String> {
-    let mut specs: Vec<Value> = cur
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let mut specs: Vec<Value> = cur.and_then(Value::as_array).cloned().unwrap_or_default();
     let pickable = plugin_schema::prefilter_plugins();
     loop {
         let n = specs.len();
@@ -822,8 +862,7 @@ fn nested_filters_prompt(cur: Option<&Value>) -> Result<Value, String> {
                 }
             }
             Some(i) if n > 0 && i == n + 1 => {
-                let labels: Vec<String> =
-                    specs.iter().map(plugin_schema::spec_summary).collect();
+                let labels: Vec<String> = specs.iter().map(plugin_schema::spec_summary).collect();
                 if let Some(j) = Select::with_theme(&theme())
                     .with_prompt("remove which filter?")
                     .items(&labels)
@@ -855,7 +894,12 @@ fn raw_plugins_prompt(cur: &str) -> Result<String, String> {
 fn raw_json_prompt(label: &str, cur: &str) -> Result<String, String> {
     let t = theme();
     loop {
-        let v = ask_text(&t, format!("{label} (raw JSON)"), Some(cur.to_string()), false)?;
+        let v = ask_text(
+            &t,
+            format!("{label} (raw JSON)"),
+            Some(cur.to_string()),
+            false,
+        )?;
         let parsed: Result<Value, _> = serde_json::from_str(v.trim());
         match parsed {
             Ok(Value::Array(_)) | Ok(Value::Object(_)) => return Ok(v.trim().to_string()),
@@ -865,10 +909,13 @@ fn raw_json_prompt(label: &str, cur: &str) -> Result<String, String> {
     }
 }
 
-
 /// Print the review screen: effective config + validation problems.
 fn review(cfg: &LpcacheConfig, dirty: bool) {
-    let source = if dirty { "(session — unsaved)" } else { "(session — unchanged)" };
+    let source = if dirty {
+        "(session — unsaved)"
+    } else {
+        "(session — unchanged)"
+    };
     print!("{}", cfg.show(source));
     let (errors, _) = cfg.validate();
     for e in &errors {
@@ -924,6 +971,7 @@ mod tests {
         assert_eq!(section_keys("kv_cache").len(), 8);
         assert_eq!(section_keys("prefilter").len(), 4);
         assert_eq!(section_keys("request_log").len(), 5);
+        assert_eq!(section_keys("payload_log").len(), 1);
         assert_eq!(section_keys("plugins").len(), 1);
         assert!(section_keys("backends").is_empty()); // managed via its own menu
         assert_eq!(section_keys("nope").len(), 0);
@@ -936,12 +984,22 @@ mod tests {
             n_slots: 4,
             slot_save_path: String::new(),
             kv_cache: false,
+            model_id: String::new(),
         };
         let s = format_backend(0, &be);
         assert!(s.starts_with("edit 1: http://h:8000"));
         assert!(s.contains("4 slot(s)"));
         assert!(s.contains("kv off"));
+        assert!(s.contains("model:none"));
         assert!(s.contains("save:none"));
+        let be = BackendEntry {
+            model_id: "Llama-3.2-1B".into(),
+            slot_save_path: "/data/kv".into(),
+            ..be
+        };
+        let s = format_backend(1, &be);
+        assert!(s.contains("model:Llama-3.2-1B"));
+        assert!(s.contains("save:/data/kv"));
     }
 
     #[test]
@@ -954,6 +1012,3 @@ mod tests {
         assert!(items.last().unwrap().contains("quit"));
     }
 }
-
-
-

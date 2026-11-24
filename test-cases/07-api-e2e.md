@@ -1,9 +1,9 @@
-# 7. API end-to-end — `tests/api.rs` (62)
+# 7. API end-to-end — `tests/api.rs` (77)
 
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (302 tests) runs with
+1:1 to a test function; the full suite (359 tests) runs with
 `cargo test --workspace`.
 
 The real proxy router (axum) in front of `MockLlama`, which records every
@@ -14,19 +14,21 @@ behaviour requires a real connection).
 
 ## Module overview
 
-- **Target:** `lpcache` integration tests — the `api` test binary ([`tests/api.rs`](../tests/api.rs)); 59 tests, all async.
+- **Target:** `lpcache` integration tests — the `api` test binary ([`tests/api.rs`](../tests/api.rs)); 77 tests, all async.
 - **Fixtures & helpers:**
   - `make_state*` family — builds `AppState` in front of `MockLlama`: `make_state` / `make_app` (default: 1 backend, 2 slots, wpb 100, big threshold 500 words, LCP 0.6, meta in a `tempfile` dir, `META_MAX=0`), `make_state_coalesce*` (coalescing on), `make_state*stream_queue*` (custom `STREAM_QUEUE_SIZE`), `make_state_prefilter*` (built-in keyword blocklist), `make_state_result_cache*` (`result_cache` plugin specs, incl. `cache_streaming` and `cache_control` variants), `make_state_with_save_dir` (multi-backend with KV save dirs, per-backend `kv_cache` flags), `make_state_request_log` (logger via `Config::with_request_log`) and `make_state_dashboard` (a `dashboard` spec from JSON params).
   - `load_prefilter` — loads the prefilter + result store through the production `load_prefilters` path from the config's plugin specs.
   - `ServedProxy` — serves the router on a real local TCP port (`axum::serve`) for the client-disconnect tests; `Drop` aborts the task.
-  - Request helpers: `post_json` / `get_req` / `read_body`, `words(n)` (n distinct prompt words), `expected_key(prefix)` (recomputes the exact cache key the proxy computes), `free_port()`.
+  - Request helpers: `post_json` / `get_req` / `read_body`, `control_post` (empty-body `POST` for the operator drain-control endpoints), `words(n)` (n distinct prompt words), `expected_key(prefix)` (recomputes the exact cache key the proxy computes), `free_port()`.
+  - `make_two_backend_state` — two live `MockLlama` backends (one slot each) plus the `SlotManager` handle, for the runtime drain-control tests (the handle lets a test run probe rounds directly — the 1 s background loop only runs in `main`).
   - The `request_log_*` tests build state the way `main.rs` does (`Config::with_request_log` → `load_request_loggers` → `prepare`).
-- **Surface under test:** `router`/`AppState` end-to-end: `GET /v1/models`, `POST /v1/chat/completions` (non-stream JSON and SSE streaming), KV save/restore orchestration (incl. the per-backend `kv_cache` flag), failover/retry on dead or failing backends, meta+KV pruning, request coalescing, prefilters, the result-cache plugin, the request-log plugin and the dashboard plugin (page + stats API).
+- **Surface under test:** `router`/`AppState` end-to-end: `GET /v1/models`, `POST /v1/chat/completions` (non-stream JSON and SSE streaming), KV save/restore orchestration (incl. the per-backend `kv_cache` flag), failover/retry on dead or failing backends, the runtime backend drain control
+(`POST /_control/backends/<i>/drain|resume`), meta+KV pruning, request coalescing, prefilters, the result-cache plugin, the request-log plugin and the dashboard plugin (page + stats API).
 
 ## How to run
 
 ```sh
-cargo test --test api                                       # all 59 E2E tests
+cargo test --test api                                       # all 77 E2E tests
 cargo test --test api models_endpoint_returns_configured_id # one test (exact name)
 ```
 
@@ -94,9 +96,15 @@ into `cargo test` as shown above.
 | 57 | `dashboard_stats_since_scopes_the_range` | async | [L3745](../tests/api.rs#L3745) | a `dashboard` spec; two finished requests (1 ok + 1 client error); stats with `?since=0`, a future `since`, `?backend=0`, `?backend=7` (no traffic), `?backend=cached`, `?backend=coalesced`, `?backend=coalesced_groups`, and invalid `since`/`backend` | `since=0` (all time): `range.counters` holds both requests and the series buckets sum to the range; `?backend=0`: counters/series/recent scoped to the chat request only (the 404 never reached a backend); `?backend=7`: zero statistics with an all-zero series and an empty recent ring; `?backend=cached` / `?backend=coalesced` / `?backend=coalesced_groups`: all accepted (200) with zero statistics, an all-zero series and an empty recent ring (none of the requests were cache hits or group members); a future `since`: empty range with the lifetime counters and recent ring unaffected; `since=abc` / `backend=abc` → `400` |
 | 58 | `dashboard_page_charts_draw_bar_figures_and_baseline` | async | [L3407](../tests/api.rs#L3407) | a `dashboard` spec; `GET /dashboard` | the HTML carries one canvas per chart series (`chart-req`, `chart-tok`, `chart-cached` in the throughput panel; `chart-cpu`, `chart-dr`, `chart-dw`, `chart-ram` in their own resources panel) and the per-bar figure drawing with adaptive stride + hover; the token charts (completion tokens, cached prompt tokens) and the resource charts additionally wire the per-request percentile overlay (solid p50 / dashed p95 ticks per bar plus a legend right-aligned in the top strip, fed by the `*_p50`/`*_p95` point fields of the selected scope — the request-count chart stays plain bars) and the window-wide p50/p95 as full-width lines across each plot (fed by `series.pct_overall` of the selected scope) and the p50/p95 of the drawn per-bucket aggregate values as a second full-width line pair on the legend's second row (the per-request p50/p95 pair is on the first row) (fed by `series.pct_overall_agg`); each legend item is clickable and toggles its related lines (hidden items are drawn faded and dropped from the scale); the additive resource charts (cpu ms, disk read, disk write) draw the window total next to the max in the top-left corner (the peak-ram gauge keeps the max alone) |
 | 59 | `dashboard_coalesced_scopes_track_group_records` | async | [L3902](../tests/api.rs#L3902) | a `dashboard` spec **plus** `COALESCE_REQUESTS`; two concurrent identical requests against a stretched mock (one group: leader + follower, ONE backend call) | `?backend=coalesced`: exactly the follower (total 1, `coalesced_followers` 1, one recent row with `coalesced: true` and no backend index or slot — the follower never acquires a slot); `?backend=coalesced_groups`: the whole group (total 2, one flagged follower row without a backend index or slot + one unflagged leader row on backend 0 / slot 0 — the scopes are views, not a partition); the unfiltered view keeps both requests and the follower count |
-| 60 | `key_affinity_avoids_redundant_restore` | async | [L1437](../tests/api.rs#L1437) | 3 slots; A, B, A traffic under both routing policies | default `lru`: the repeat of A is picked on free slot 2 → **1** restore wire call; `key_affinity`: it is picked on the idle slot already running A's key → **0** restore calls (the post-pick skip) |
+| 60 | `key_affinity_avoids_redundant_restore` | async | [L1437](../tests/api.rs#L1437) | 3 slots; A, B, A traffic under both routing policies | `lru`: the repeat of A is picked on free slot 2 → **1** restore wire call; `key_affinity` (the default): it is picked on the idle slot already running A's key → **0** restore calls (the post-pick skip) |
 | 61 | `small_requests_move_on_to_the_next_free_slot` | async | [L279](../tests/api.rs#L279) | 1 backend, 2 slots; three sequential small (non-big, non-stream) chats | the free tier moves on: request 1 → slot 0, request 2 → slot 1 (not slot 0 again), request 3 → slot 0 via LRU (oldest); no saves — regression for small-request successes never stamping `last_used`, which kept slot 0 in the "never used" tier and pinned all traffic to it |
 | 62 | `request_log_records_restore_candidate_and_lcp_ratio` | async | [L3050](../tests/api.rs#L3050) | 2 sequential big chats with the request log enabled: prompt A, then A + a tail shorter than one block | the XLF records carry the LCP scan's restore decision: record 1 (no meta yet) has `lpcache-restore-candidate`/`lpcache-lcp-ratio` = `-`; record 2 has `lpcache-key` = A+tail's key (≠ the candidate), `lpcache-restore-candidate` = A's key (closest-prefix match) and `lpcache-lcp-ratio` = `1.000` (all 6 blocks match), with `restored` `true` / `restore-call` `ok` |
+| 63 | `startup_scan_removes_corrupt_meta_keeps_orphan_kv_by_default` | async | [L1110](../tests/api.rs#L1110) | corrupt + wrong-schema metas and their KV files (model-prefixed + legacy bare names) pre-seeded, then the startup scan runs | the 2 corrupt metas removed, the healthy pair kept; the orphan KV files are **left in place** (flag unset) |
+| 64 | `startup_scan_with_cleanup_flag_removes_orphan_kv` | async | [L1157](../tests/api.rs#L1157) | same pre-seed with `STARTUP_CLEANUP_KV=true` | the 2 corrupt metas **and** the 3 orphan KV files (model-prefixed + legacy bare) removed; the healthy entry's meta + KV files untouched |
+| 65 | `backend_drain_resume_keeps_in_flight_and_reroutes` | async | [L5081](../tests/api.rs#L5081) | 2 live backends; a slow (800 ms) request in flight on be1 when `POST /_control/backends/1/drain` lands | the in-flight request finishes 200 on the drained backend; all following requests go to be0 only (be1 sees no new chat); `POST .../resume` (mock healthy) re-joins at once (`rejoined: true`) and the LRU pick sends the next request to be1 again |
+| 66 | `drain_all_backends_503s_fast_then_resume_recovers` | async | [L5198](../tests/api.rs#L5198) | both backends drained via the control endpoints | a chat request fails **fast** with 503 (no eligible slot, no 300 s wait); after resuming both, the same request gets 200 |
+| 67 | `resume_of_down_backend_stays_out_until_the_probe_sees_it` | async | [L5241](../tests/api.rs#L5241) | drain be1; mock be1's `/v1/models` made 500; resume; then the mock recovers | `rejoined: false` (unhealthy probe): the backend stays out of rotation (requests go to be0 only) until the next probe round sees it answer, then it re-joins and receives traffic |
+| 68 | `control_endpoints_reject_bad_index_and_resume_is_idempotent` | async | [L5291](../tests/api.rs#L5291) | `POST /_control/backends/9/drain|resume` (out of range) and a resume of a never-drained backend | 404 on both bad-index calls; the no-op resume answers 200 with `drained: false`, `rejoined: true` |
 
 ## Coverage map — feature → tests
 
@@ -106,8 +114,10 @@ into `cargo test` as shown above.
 | Client cancel / disconnect (*real TCP*) | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
 | Provider error mapping & validation | `stream_provider_error_is_passed_through`, `nonstream_provider_error_becomes_500`, `nonstream_json_array_provider_returns_502`, `invalid_json_body_rejected`, `model_defaults_to_configured_id_when_missing` |
 | Failover & circuit breaker | `dead_backend_traffic_fails_over_to_live_backend`, `connection_failure_retries_on_other_backend`, `probe_recovers_cooled_down_backend`, `failing_backend_slots_do_not_pin_all_traffic` |
+| Runtime backend drain control (`/_control`) | `backend_drain_resume_keeps_in_flight_and_reroutes`, `drain_all_backends_503s_fast_then_resume_recovers`, `resume_of_down_backend_stays_out_until_the_probe_sees_it`, `control_endpoints_reject_bad_index_and_resume_is_idempotent` |
 | Pruning (`META_MAX`) + restore LRU touch | `prune_removes_oldest_meta_and_kv_files`, `restore_works_after_prune_and_pruned_key_falls_back`, `restore_touches_lru_timestamp_so_prune_keeps_hot_entry` |
 | Stale-meta cleanup on rejected restore | `restore_rejected_cleans_up_stale_meta`, `restore_rejected_keeps_meta_when_save_dir_unvisible` |
+| Startup corrupt-meta scan (`STARTUP_CLEANUP_KV`) | `startup_scan_removes_corrupt_meta_keeps_orphan_kv_by_default`, `startup_scan_with_cleanup_flag_removes_orphan_kv` |
 | Routing policy (`SLOT_ROUTING_POLICY`) | `key_affinity_avoids_redundant_restore`, `small_requests_move_on_to_the_next_free_slot` |
 | Request coalescing | `coalesce_concurrent_identical_requests_single_backend_call`, `coalesce_different_generation_params_still_merge`, `coalesce_mixed_stream_and_json_share_one_backend_call`, `coalesce_stream_groups_share_one_backend_stream`, `coalesce_flag_off_preserves_per_request_backend_calls`, `coalesce_new_group_after_completion` |
 | `STREAM_QUEUE_SIZE=1` backpressure | `stream_queue_size_one_delivers_full_stream`, `coalesce_stream_queue_size_one_follower_receives_full_stream` |

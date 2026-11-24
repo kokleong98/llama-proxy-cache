@@ -2,9 +2,9 @@
 //! backend, mirroring the request flows in `app.py`.
 
 use axum::body::{Body, to_bytes};
-use lpcache::app::{AppState, router};
+use lpcache::app::{AppState, router, startup_meta_cleanup};
 use lpcache::coalesce::SingleFlight;
-use lpcache::config::{BackendConf, Config, DEFAULT_STREAM_QUEUE_SIZE};
+use lpcache::config::{BackendConf, Config, DEFAULT_STREAM_QUEUE_SIZE, RoutingPolicy};
 use lpcache::mock_backend::MockLlama;
 use lpcache::plugins::registry::PluginFactory;
 use lpcache::plugins::{LlamaBackend, LlamaClient, Prefilter, ResultStore};
@@ -29,13 +29,22 @@ async fn make_state(
         false,
         DEFAULT_STREAM_QUEUE_SIZE,
         None,
+        RoutingPolicy::default(),
     )
     .await
 }
 
 /// Like [`make_state`], but with concurrent-request coalescing enabled.
 async fn make_state_coalesce(n_slots: usize) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, true, DEFAULT_STREAM_QUEUE_SIZE, None).await
+    make_state_inner(
+        n_slots,
+        None,
+        true,
+        DEFAULT_STREAM_QUEUE_SIZE,
+        None,
+        RoutingPolicy::default(),
+    )
+    .await
 }
 
 /// Like [`make_state`], but with a custom `STREAM_QUEUE_SIZE`.
@@ -43,7 +52,15 @@ async fn make_state_stream_queue(
     n_slots: usize,
     stream_queue_size: usize,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, false, stream_queue_size, None).await
+    make_state_inner(
+        n_slots,
+        None,
+        false,
+        stream_queue_size,
+        None,
+        RoutingPolicy::default(),
+    )
+    .await
 }
 
 /// Like [`make_state_coalesce`], but with a custom `STREAM_QUEUE_SIZE`.
@@ -51,7 +68,15 @@ async fn make_state_coalesce_stream_queue(
     n_slots: usize,
     stream_queue_size: usize,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
-    make_state_inner(n_slots, None, true, stream_queue_size, None).await
+    make_state_inner(
+        n_slots,
+        None,
+        true,
+        stream_queue_size,
+        None,
+        RoutingPolicy::default(),
+    )
+    .await
 }
 
 /// Like [`make_state`], but with the built-in keyword prefilter enabled
@@ -66,6 +91,7 @@ async fn make_state_prefilter(
         false,
         DEFAULT_STREAM_QUEUE_SIZE,
         Some((keywords, true)),
+        RoutingPolicy::default(),
     )
     .await
 }
@@ -81,6 +107,7 @@ async fn make_state_prefilter_coalesce(
         true,
         DEFAULT_STREAM_QUEUE_SIZE,
         Some((keywords, true)),
+        RoutingPolicy::default(),
     )
     .await
 }
@@ -106,6 +133,7 @@ async fn make_state_inner(
     coalesce: bool,
     stream_queue_size: usize,
     prefilter: Option<(&[&str], bool)>,
+    policy: RoutingPolicy,
 ) -> (AppState, MockLlama, tempfile::TempDir) {
     let mock = MockLlama::start(BACKEND_MODEL).await;
     let td = tempfile::tempdir().expect("tempdir");
@@ -115,6 +143,7 @@ async fn make_state_inner(
             n_slots,
             slot_save_path: None,
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -136,6 +165,7 @@ async fn make_state_inner(
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
     let sm = SlotManager::new(&cfg.backends, clients.clone());
+    let sm = sm.with_routing_policy(policy);
     let sm = match acquire_timeout {
         Some(d) => sm.with_acquire_timeout(d),
         None => sm,
@@ -150,6 +180,7 @@ async fn make_state_inner(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td)
@@ -157,6 +188,16 @@ async fn make_state_inner(
 
 async fn make_app() -> (axum::Router, MockLlama, tempfile::TempDir) {
     let (state, mock, td) = make_state(2, None).await;
+    (router(state), mock, td)
+}
+
+/// Like [`make_app`], but pinned to the `lru` routing policy: the tests
+/// built on it exercise the free-first/LRU pick and where its restore wire
+/// calls land (the `key_affinity` default would skip the restore on a slot
+/// already running the key).
+async fn make_app_lru() -> (axum::Router, MockLlama, tempfile::TempDir) {
+    let (state, mock, td) =
+        make_state_inner(2, None, false, DEFAULT_STREAM_QUEUE_SIZE, None, RoutingPolicy::Lru).await;
     (router(state), mock, td)
 }
 
@@ -221,6 +262,13 @@ fn words(n: usize) -> String {
 fn expected_key(prefix: &str) -> String {
     let full = format!("{BACKEND_MODEL}\n{prefix}");
     lpcache::hashing::prefix_key_sha256(&full)
+}
+
+/// KV filename the proxy saves/restores in these legacy (model-routing
+/// disabled) tests: `{lowercase(model_id)}_{key}`, where the model id is
+/// the one the mock backend reports (`BACKEND_MODEL`).
+fn kv_name(key: &str) -> String {
+    lpcache::hashing::kv_basename(BACKEND_MODEL, key)
 }
 
 async fn read_body(resp: axum::http::Response<Body>) -> Value {
@@ -318,7 +366,7 @@ async fn nonstream_big_request_saves_and_writes_meta() {
     assert_eq!(v["choices"][0]["message"]["content"], "mock reply");
 
     let calls = mock.state.calls.lock().await;
-    assert_eq!(calls.saves, vec![(0usize, key.clone())]);
+    assert_eq!(calls.saves, vec![(0usize, kv_name(&key))]);
     assert_eq!(calls.chat_bodies[0]["cache_prompt"], true);
     assert!(calls.restores.is_empty());
 
@@ -336,7 +384,7 @@ async fn nonstream_big_request_saves_and_writes_meta() {
 }
 #[tokio::test]
 async fn second_big_request_restores_saved_cache() {
-    let (app, mock, _td) = make_app().await;
+    let (app, mock, _td) = make_app_lru().await;
     let a = words(600);
     // 1st request: no meta exists yet -> no restore, saves key_a
     let body1 = json!({
@@ -351,7 +399,7 @@ async fn second_big_request_restores_saved_cache() {
     let key_a = expected_key(&a);
     assert_eq!(
         mock.state.calls.lock().await.saves.clone(),
-        vec![(0usize, key_a.clone())]
+        vec![(0usize, kv_name(&key_a))]
     );
 
     // 2nd request: same prefix + extra tail -> LCP ratio 1.0 >= 0.6
@@ -368,7 +416,7 @@ async fn second_big_request_restores_saved_cache() {
 
     let calls = mock.state.calls.lock().await;
     // request 1 had no candidate, so this restore belongs to request 2
-    assert_eq!(calls.restores, vec![(1usize, key_a)]);
+    assert_eq!(calls.restores, vec![(1usize, kv_name(&key_a))]);
     assert_eq!(calls.chat_bodies.len(), 2);
     assert_eq!(calls.chat_bodies[1]["options"]["slot_id"], 1);
     assert_eq!(calls.chat_bodies[1]["cache_prompt"], true);
@@ -376,7 +424,10 @@ async fn second_big_request_restores_saved_cache() {
     let key_b = expected_key(&b);
     assert_eq!(
         calls.saves,
-        vec![(0usize, expected_key(&a)), (1usize, key_b)]
+        vec![
+            (0usize, kv_name(&key_a)),
+            (1usize, kv_name(&key_b))
+        ]
     );
 }
 
@@ -424,7 +475,7 @@ async fn stream_request_passes_sse_and_saves_afterwards() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(mock.state.saves().await, vec![(0usize, key.clone())]);
+    assert_eq!(mock.state.saves().await, vec![(0usize, kv_name(&key))]);
     assert!(td.path().join(format!("{key}.meta.json")).exists());
 }
 
@@ -544,7 +595,7 @@ async fn stream_client_cancel_aborts_upstream_over_tcp() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(mock.state.saves().await, vec![(0usize, key.clone())]);
+    assert_eq!(mock.state.saves().await, vec![(0usize, kv_name(&key))]);
     assert!(td.path().join(format!("{key}.meta.json")).exists());
 }
 
@@ -649,12 +700,14 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
                 n_slots: 1,
                 slot_save_path: None,
                 kv_cache: true,
+                model_id: None,
             },
             BackendConf {
                 url: "http://127.0.0.1:9".to_string(),
                 n_slots: 1,
                 slot_save_path: None,
                 kv_cache: true,
+                model_id: None,
             },
         ],
         100,
@@ -686,6 +739,7 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -709,9 +763,12 @@ async fn dead_backend_traffic_fails_over_to_live_backend() {
     //        slot is already running the key from req1's save)
     // req3/4 -> be1 in cooldown -> (0,0) -> restore skipped (already running)
     assert_eq!(statuses, vec![200, 200, 200, 200]);
-    // all chats (including the retry) landed on the live backend
+    // all chats (including the retry) landed on the live backend. Only req1
+    // saved: req2's retry and req3/4 are warm self-restores (the slot was
+    // already running the key, no backend call) and their meta file is still
+    // on disk, so SKIP_SAVE_ON_SELF_RESTORE skips their redundant saves.
     let saves = mock.state.saves().await;
-    assert_eq!(saves.len(), 4);
+    assert_eq!(saves.len(), 1);
     // the only restore attempt was req2's doomed one on the dead backend
     // (unrecorded); the live backend's slot was already running the key, so
     // every restore targeting it was skipped
@@ -735,12 +792,14 @@ async fn connection_failure_retries_on_other_backend() {
                 n_slots: 1,
                 slot_save_path: None,
                 kv_cache: true,
+                model_id: None,
             },
             BackendConf {
                 url: live.url(),
                 n_slots: 1,
                 slot_save_path: None,
                 kv_cache: true,
+                model_id: None,
             },
         ],
         100,
@@ -769,6 +828,7 @@ async fn connection_failure_retries_on_other_backend() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -807,12 +867,14 @@ async fn probe_recovers_cooled_down_backend() {
                 n_slots: 1,
                 slot_save_path: None,
                 kv_cache: true,
+                model_id: None,
             },
             BackendConf {
                 url: live.url(),
                 n_slots: 1,
                 slot_save_path: None,
                 kv_cache: true,
+                model_id: None,
             },
         ],
         100,
@@ -844,6 +906,7 @@ async fn probe_recovers_cooled_down_backend() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -860,8 +923,10 @@ async fn probe_recovers_cooled_down_backend() {
         assert_eq!(resp.status(), 200, "request {i}");
         let _ = to_bytes(resp.into_body(), usize::MAX).await;
     }
-    // all saves landed on the live backend while be0 cooled down
-    assert_eq!(live.state.saves().await.len(), 3);
+    // only req1 saved on the live backend: req2/3 are warm self-restores
+    // (slot (1,0) already running the key, no backend call) and their meta
+    // file is still on disk, so SKIP_SAVE_ON_SELF_RESTORE skips their saves.
+    assert_eq!(live.state.saves().await.len(), 1);
 
     // probe round 1: backend 0 is still down
     assert_eq!(sm.probe_down_backends().await, 0);
@@ -898,12 +963,14 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
                 n_slots: 2,
                 slot_save_path: None,
                 kv_cache: true,
+                model_id: None,
             },
             BackendConf {
                 url: mock1.url(),
                 n_slots: 2,
                 slot_save_path: None,
                 kv_cache: true,
+                model_id: None,
             },
         ],
         100,
@@ -922,7 +989,7 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         Arc::clone(&c0) as Arc<dyn LlamaBackend>,
         Arc::clone(&c1) as Arc<dyn LlamaBackend>,
     ];
-    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()).with_routing_policy(RoutingPolicy::Lru));
     let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
@@ -932,6 +999,7 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -947,13 +1015,18 @@ async fn failing_backend_slots_do_not_pin_all_traffic() {
         statuses.push(resp.status().as_u16());
         let _ = to_bytes(resp.into_body(), usize::MAX).await;
     }
-    // req1 -> (0,0) 200 (save stamps it); req2 -> (0,1) 200 (save stamps it)
+    // req1 -> (0,0) 200 (the save stamps it)
+    // req2 -> (0,1) 200 (a successful self-restore stamps (0,1) running the
+    //        key; its save is skipped by the default SKIP_SAVE_ON_SELF_RESTORE)
     // req3 -> (1,0) free -> provider 500 -> slot marked used
     // req4 -> (1,1) free -> provider 500 -> slot marked used
     // req5 -> no free slots -> LRU -> (0,0) -> 200
     // (without mark_used, req5 would have re-picked the still-"free" (1,0))
     assert_eq!(statuses, vec![200, 200, 500, 500, 200]);
-    assert_eq!(mock0.state.saves().await.len(), 3);
+    // req2's save was skipped (a cold self-restore whose 200 verified the
+    // file) and req5's warm self-restore (the slot already running the key,
+    // meta still on disk) skips too — mock0 saved for req1 only.
+    assert_eq!(mock0.state.saves().await.len(), 1);
     assert_eq!(mock1.state.saves().await.len(), 0);
 }
 
@@ -969,6 +1042,7 @@ async fn prune_removes_oldest_meta_and_kv_files() {
             n_slots: 2,
             slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -993,6 +1067,7 @@ async fn prune_removes_oldest_meta_and_kv_files() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1021,14 +1096,109 @@ async fn prune_removes_oldest_meta_and_kv_files() {
         "oldest meta file should be pruned"
     );
     assert!(
-        !kv.path().join(&keys[0]).exists(),
+        !kv.path().join(kv_name(&keys[0])).exists(),
         "oldest KV file should be pruned"
     );
     // the two newer entries survive in both places
     for key in &keys[1..] {
         assert!(td.path().join(format!("{key}.meta.json")).exists());
-        assert!(kv.path().join(key).exists());
+        assert!(kv.path().join(kv_name(key)).exists());
     }
+}
+
+#[tokio::test]
+async fn startup_scan_removes_corrupt_meta_keeps_orphan_kv_by_default() {
+    // The startup meta scan (main.rs runs it before the listener binds)
+    // removes corrupt .meta.json files; by default (STARTUP_CLEANUP_KV
+    // unset) the orphan KV files are left in place.
+    let kv = tempfile::tempdir().expect("kv dir");
+    let td = tempfile::tempdir().expect("meta dir");
+    let good = "g000000000000000000000000000000000000000000000000000000000000000";
+    let corrupt = "c00000000000000000000000000000000000000000000000000000000000000";
+    let other = "o000000000000000000000000000000000000000000000000000000000000000";
+    lpcache::hashing::write_meta(td.path(), good, "p", &["b".into()], 100, BACKEND_MODEL)
+        .unwrap();
+    std::fs::write(td.path().join(format!("{corrupt}.meta.json")), "not json").unwrap();
+    std::fs::write(td.path().join(format!("{other}.meta.json")), r#"{"key": "oops"}"#).unwrap();
+    for k in [good, corrupt, other] {
+        std::fs::write(kv.path().join(format!("{BACKEND_MODEL}_{k}")), b"kv").unwrap();
+    }
+    std::fs::write(kv.path().join(good), b"kv").unwrap(); // legacy bare name
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: "http://127.0.0.1:1".to_string(),
+            n_slots: 1,
+            slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+            kv_cache: true,
+            model_id: None,
+        }],
+        100,
+        500,
+        0.6,
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    );
+    let (meta_removed, kv_removed) = startup_meta_cleanup(&cfg);
+    assert_eq!((meta_removed, kv_removed), (2, 0));
+    // corrupt metas gone, the good one (and its KV files) intact
+    assert!(!td.path().join(format!("{corrupt}.meta.json")).exists());
+    assert!(!td.path().join(format!("{other}.meta.json")).exists());
+    assert!(td.path().join(format!("{good}.meta.json")).exists());
+    // orphan KV files left in place (flag unset)
+    assert!(kv.path().join(format!("{BACKEND_MODEL}_{corrupt}")).exists());
+    assert!(kv.path().join(format!("{BACKEND_MODEL}_{other}")).exists());
+    assert!(kv.path().join(format!("{BACKEND_MODEL}_{good}")).exists());
+    assert!(kv.path().join(good).exists());
+}
+
+#[tokio::test]
+async fn startup_scan_with_cleanup_flag_removes_orphan_kv() {
+    // With STARTUP_CLEANUP_KV=true the startup scan also removes the
+    // orphan KV files of the corrupt metas (bare and model-prefixed
+    // names), leaving the healthy entry's files intact.
+    let kv = tempfile::tempdir().expect("kv dir");
+    let td = tempfile::tempdir().expect("meta dir");
+    let good = "g000000000000000000000000000000000000000000000000000000000000000";
+    let corrupt = "c00000000000000000000000000000000000000000000000000000000000000";
+    let other = "o000000000000000000000000000000000000000000000000000000000000000";
+    lpcache::hashing::write_meta(td.path(), good, "p", &["b".into()], 100, BACKEND_MODEL)
+        .unwrap();
+    std::fs::write(td.path().join(format!("{corrupt}.meta.json")), "not json").unwrap();
+    std::fs::write(td.path().join(format!("{other}.meta.json")), r#"{"key": "oops"}"#).unwrap();
+    for k in [good, corrupt, other] {
+        std::fs::write(kv.path().join(format!("{BACKEND_MODEL}_{k}")), b"kv").unwrap();
+    }
+    std::fs::write(kv.path().join(corrupt), b"kv").unwrap(); // legacy bare name
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: "http://127.0.0.1:1".to_string(),
+            n_slots: 1,
+            slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
+            kv_cache: true,
+            model_id: None,
+        }],
+        100,
+        500,
+        0.6,
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_startup_cleanup_kv(true);
+    let (meta_removed, kv_removed) = startup_meta_cleanup(&cfg);
+    assert_eq!((meta_removed, kv_removed), (2, 3));
+    // corrupt metas and their orphan KV files (prefixed + legacy bare) gone
+    assert!(!td.path().join(format!("{corrupt}.meta.json")).exists());
+    assert!(!td.path().join(format!("{other}.meta.json")).exists());
+    assert!(!kv.path().join(format!("{BACKEND_MODEL}_{corrupt}")).exists());
+    assert!(!kv.path().join(corrupt).exists());
+    assert!(!kv.path().join(format!("{BACKEND_MODEL}_{other}")).exists());
+    // healthy entry untouched
+    assert!(td.path().join(format!("{good}.meta.json")).exists());
+    assert!(kv.path().join(format!("{BACKEND_MODEL}_{good}")).exists());
 }
 
 #[tokio::test]
@@ -1044,6 +1214,7 @@ async fn kv_cache_disabled_backend_never_saves_or_restores() {
             n_slots: 2,
             slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
             kv_cache: false,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -1067,6 +1238,7 @@ async fn kv_cache_disabled_backend_never_saves_or_restores() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1119,6 +1291,7 @@ async fn kv_cache_disabled_backend_skips_stream_save() {
             n_slots: 2,
             slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
             kv_cache: false,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -1142,6 +1315,7 @@ async fn kv_cache_disabled_backend_skips_stream_save() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1215,12 +1389,14 @@ async fn kv_restore_prefers_kv_enabled_backend() {
                 n_slots: 2,
                 slot_save_path: Some(kv0.path().to_string_lossy().into_owned()),
                 kv_cache: true,
+                model_id: None,
             },
             BackendConf {
                 url: mock1.url(),
                 n_slots: 1,
                 slot_save_path: Some(kv1.path().to_string_lossy().into_owned()),
                 kv_cache: false,
+                model_id: None,
             },
         ],
         100, // words per block
@@ -1241,7 +1417,7 @@ async fn kv_restore_prefers_kv_enabled_backend() {
         Arc::clone(&c0) as Arc<dyn LlamaBackend>,
         Arc::clone(&c1) as Arc<dyn LlamaBackend>,
     ];
-    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()).with_routing_policy(RoutingPolicy::Lru));
     let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
@@ -1251,6 +1427,7 @@ async fn kv_restore_prefers_kv_enabled_backend() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1284,7 +1461,7 @@ async fn kv_restore_prefers_kv_enabled_backend() {
     );
     assert!(mock1.state.saves().await.is_empty());
     assert!(
-        !kv1.path().join(&key).exists(),
+        !kv1.path().join(kv_name(&key)).exists(),
         "no KV file on the disabled backend"
     );
 }
@@ -1306,6 +1483,7 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
             n_slots: 2,
             slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -1330,6 +1508,7 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1359,8 +1538,8 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
         "A must be pruned after the 3rd save"
     );
     assert!(td.path().join(format!("{key_b}.meta.json")).exists());
-    assert!(!kv.path().join(&key_a).exists());
-    assert!(kv.path().join(&key_b).exists());
+    assert!(!kv.path().join(kv_name(&key_a)).exists());
+    assert!(kv.path().join(kv_name(&key_b)).exists());
 
     // (a) the surviving entry B is still matched after the prune: B + a
     // short tail -> LCP ratio 5/6 >= 0.6 -> restore candidate key_b. The
@@ -1402,7 +1581,7 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
     assert_eq!(resp.status(), 200);
     let _ = to_bytes(resp.into_body(), usize::MAX).await;
     let calls = mock.state.calls.lock().await;
-    assert_eq!(calls.restores, vec![(0usize, key_b.clone())]);
+    assert_eq!(calls.restores, vec![(0usize, kv_name(&key_b))]);
     drop(calls);
 
     // (b) the pruned entry A: no meta -> no restore candidate -> full
@@ -1418,13 +1597,13 @@ async fn restore_works_after_prune_and_pruned_key_falls_back() {
     let _ = to_bytes(resp.into_body(), usize::MAX).await;
     let calls = mock.state.calls.lock().await;
     // no new restore happened for the pruned key A
-    assert_eq!(calls.restores, vec![(0usize, key_b)]);
+    assert_eq!(calls.restores, vec![(0usize, kv_name(&key_b))]);
     drop(calls);
     assert!(
         td.path().join(format!("{key_a}.meta.json")).exists(),
         "A must be re-saved after the fallback prefill"
     );
-    assert!(kv.path().join(&key_a).exists());
+    assert!(kv.path().join(kv_name(&key_a)).exists());
     let n_meta = std::fs::read_dir(td.path())
         .expect("read meta dir")
         .filter_map(|e| e.ok())
@@ -1452,6 +1631,7 @@ async fn key_affinity_avoids_redundant_restore() {
                 n_slots: 3,
                 slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
                 kv_cache: true,
+                model_id: None,
             }],
             100, // words per block
             500, // big threshold words
@@ -1478,6 +1658,7 @@ async fn key_affinity_avoids_redundant_restore() {
             prefilter,
             result_store,
             request_log: None,
+            payload_log: None,
             dashboard: None,
         };
         (state, mock, kv, td)
@@ -1497,7 +1678,7 @@ async fn key_affinity_avoids_redundant_restore() {
     let pa = format!("promptA {}", words(518));
     let pb = format!("promptB {}", words(518));
 
-    // default `lru`: the repeat of A lands on free slot 2 -> one restore
+    // under `lru`: the repeat of A lands on free slot 2 -> one restore
     let (state, mock, kv, td) = build(lpcache::config::RoutingPolicy::Lru).await;
     let app = router(state);
     chat(&app, &pa).await; // saved on slot 0
@@ -1547,6 +1728,7 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
             n_slots: 2,
             slot_save_path: Some(kv.path().to_string_lossy().into_owned()),
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -1571,6 +1753,7 @@ async fn restore_touches_lru_timestamp_so_prune_keeps_hot_entry() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -1883,7 +2066,7 @@ async fn stream_queue_size_one_delivers_full_stream() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(mock.state.saves().await, vec![(0usize, key.clone())]);
+    assert_eq!(mock.state.saves().await, vec![(0usize, kv_name(&key))]);
     assert!(td.path().join(format!("{key}.meta.json")).exists());
 }
 
@@ -2153,6 +2336,7 @@ async fn make_state_result_cache(
             n_slots: 2,
             slot_save_path: None,
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -2178,6 +2362,7 @@ async fn make_state_result_cache(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td, td_rc)
@@ -2316,6 +2501,7 @@ async fn make_state_result_cache_streaming(
             n_slots: 2,
             slot_save_path: None,
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -2340,6 +2526,7 @@ async fn make_state_result_cache_streaming(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td, td_rc)
@@ -2443,6 +2630,7 @@ async fn make_state_result_cache_cache_control(
             n_slots: 2,
             slot_save_path: None,
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -2467,6 +2655,7 @@ async fn make_state_result_cache_cache_control(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td, td_rc)
@@ -2587,6 +2776,7 @@ async fn keyword_blocklist_rejects_before_result_cache_serves() {
             n_slots: 2,
             slot_save_path: None,
             kv_cache: true,
+            model_id: None,
         }],
         100,
         500,
@@ -2613,6 +2803,7 @@ async fn keyword_blocklist_rejects_before_result_cache_serves() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     // Pre-populate the cache for the blocked prompt's key (a blocked
@@ -2622,7 +2813,7 @@ async fn keyword_blocklist_rejects_before_result_cache_serves() {
         .result_store
         .as_ref()
         .expect("result store")
-        .store(&key, 200, &json!({ "object": "chat.completion" }))
+        .store(BACKEND_MODEL, &key, 200, &json!({ "object": "chat.completion" }))
         .unwrap();
     let app = router(state);
     let body = json!({
@@ -2643,7 +2834,10 @@ async fn keyword_blocklist_rejects_before_result_cache_serves() {
 }
 
 /// State with a mock that emulates `--slot-save-path` (successful saves
-/// create a KV file) and an explicit META_MAX.
+/// create a KV file) and an explicit META_MAX. Pinned to the `lru` routing
+/// policy: its callers exercise the LRU pick's restore wire calls (under
+/// the `key_affinity` default the restore would be skipped on a slot
+/// already running the key).
 async fn make_state_with_save_dir(
     kv: &std::path::Path,
     meta_max: usize,
@@ -2656,6 +2850,7 @@ async fn make_state_with_save_dir(
             n_slots: 2,
             slot_save_path: Some(kv.to_string_lossy().into_owned()),
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -2670,7 +2865,7 @@ async fn make_state_with_save_dir(
         LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
-    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()).with_routing_policy(RoutingPolicy::Lru));
     let (prefilter, result_store) = load_prefilter(&cfg);
     let state = AppState {
         config: Arc::new(cfg),
@@ -2680,6 +2875,7 @@ async fn make_state_with_save_dir(
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td)
@@ -2712,10 +2908,10 @@ async fn restore_rejected_cleans_up_stale_meta() {
     let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
     assert_eq!(resp.status(), 200);
     assert!(td.path().join(format!("{key1}.meta.json")).exists());
-    assert!(kv.path().join(&key1).exists());
+    assert!(kv.path().join(kv_name(&key1)).exists());
 
     // 2) orphan key1's meta and make the backend reject restores
-    std::fs::remove_file(kv.path().join(&key1)).expect("rm kv");
+    std::fs::remove_file(kv.path().join(kv_name(&key1))).expect("rm kv");
     mock.state.restore_status.store(400, Ordering::SeqCst);
 
     // 3) matching request: rejected restore -> full prefill -> key2 saved;
@@ -2732,7 +2928,7 @@ async fn restore_rejected_cleans_up_stale_meta() {
         "stale meta must be removed after a rejected restore"
     );
     assert!(td.path().join(format!("{key2}.meta.json")).exists());
-    assert!(kv.path().join(&key2).exists());
+    assert!(kv.path().join(kv_name(&key2)).exists());
 
     // 4) same request again: key2's restore is rejected too, but its KV
     //    file still exists -> the meta must be KEPT
@@ -2750,7 +2946,7 @@ async fn restore_rejected_cleans_up_stale_meta() {
     //    key2-matching request hits a slot that does not run key2 ->
     //    rejected restore -> the cleanup removes key2's stale meta (the
     //    request itself then saves a fresh entry, key3)
-    std::fs::remove_file(kv.path().join(&key2)).expect("rm kv");
+    std::fs::remove_file(kv.path().join(kv_name(&key2))).expect("rm kv");
     for p in ["promptU", "promptV"] {
         let filler = format!("{p} {}", words(518));
         let body = json!({
@@ -2788,6 +2984,7 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
             n_slots: 2,
             slot_save_path: Some("/nonexistent/lpcache-unvisible-dir".to_string()),
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -2812,6 +3009,7 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
         prefilter,
         result_store,
         request_log: None,
+        payload_log: None,
         dashboard: None,
     };
     let app = router(state);
@@ -2854,6 +3052,7 @@ async fn restore_rejected_keeps_meta_when_save_dir_unvisible() {
 async fn make_state_request_log(
     max_bytes: u64,
     keep: usize,
+    policy: RoutingPolicy,
 ) -> (AppState, MockLlama, tempfile::TempDir, std::path::PathBuf) {
     let mock = MockLlama::start(BACKEND_MODEL).await;
     let td = tempfile::tempdir().expect("tempdir");
@@ -2864,6 +3063,7 @@ async fn make_state_request_log(
             n_slots: 2,
             slot_save_path: None,
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -2878,7 +3078,7 @@ async fn make_state_request_log(
         LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
-    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()).with_routing_policy(policy));
     let (prefilter, result_store) = load_prefilter(&cfg);
     let specs = cfg.plugin_specs().expect("plugin specs");
     let request_log = lpcache::plugins::load_request_loggers(
@@ -2896,6 +3096,7 @@ async fn make_state_request_log(
         prefilter,
         result_store,
         request_log: Some(request_log),
+        payload_log: None,
         dashboard: None,
     };
     (state, mock, td, log_path)
@@ -2950,7 +3151,7 @@ fn parse_xlf(content: &str) -> (Vec<String>, Vec<std::collections::HashMap<Strin
 
 #[tokio::test]
 async fn request_log_writes_xlf_record() {
-    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await; // 0 = no rotation
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5, RoutingPolicy::default()).await; // 0 = no rotation
     let app = router(state);
     let body = json!({
         "model": "m1",
@@ -3013,7 +3214,10 @@ async fn request_log_writes_xlf_record() {
         rec["lpcache-restore-candidate"], "-",
         "no restore attempt on small requests"
     );
-    assert_eq!(rec["lpcache-lcp-ratio"], "-", "no restore attempt on small requests");
+    assert_eq!(
+        rec["lpcache-lcp-ratio"], "-",
+        "no restore attempt on small requests"
+    );
     assert_eq!(rec["lpcache-cache-hit"], "-", "no prefilter enabled");
     assert_eq!(rec["lpcache-coalesced"], "-");
     assert_eq!(rec["lpcache-reason"], "-", "the request completed normally");
@@ -3051,7 +3255,7 @@ async fn request_log_records_restore_candidate_and_lcp_ratio() {
     // The XLF record carries the restore decision the LCP scan made: the
     // best candidate key it picked (which differs from the request's own
     // key for a closest-prefix match) and the LCP ratio.
-    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await;
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5, RoutingPolicy::Lru).await;
     let app = router(state);
     let a = words(600);
     let body1 = json!({
@@ -3111,7 +3315,7 @@ async fn request_log_records_restore_candidate_and_lcp_ratio() {
 async fn request_log_stream_writes_perf_fields() {
     // Streaming: the proxy-side ttft is measured by the reader; the
     // backend `usage`/`timings` arrive in the stream's final chunk.
-    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await;
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5, RoutingPolicy::default()).await;
     let app = router(state);
     let body = json!({
         "model": "m1",
@@ -3146,7 +3350,7 @@ async fn request_log_stream_writes_perf_fields() {
 
 #[tokio::test]
 async fn request_log_stream_request_counts_delivered_bytes() {
-    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await;
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5, RoutingPolicy::default()).await;
     let app = router(state);
     let body = json!({
         "model": "m1",
@@ -3177,7 +3381,7 @@ async fn request_log_stream_request_counts_delivered_bytes() {
 
 #[tokio::test]
 async fn request_log_logs_failed_request_without_pipeline() {
-    let (state, _mock, _td, log_path) = make_state_request_log(0, 5).await;
+    let (state, _mock, _td, log_path) = make_state_request_log(0, 5, RoutingPolicy::default()).await;
     let app = router(state);
     // Invalid JSON: the handler fails before it builds the pipeline view,
     // so the record still exists (the middleware logs it) with the
@@ -3207,7 +3411,7 @@ async fn request_log_rotates_and_bounds_keep() {
     // max_bytes small enough that a few records rotate the file (the 33
     // field names make each file header large, so the threshold sits
     // between one and a few records); keep=2 caps the rotated generations.
-    let (state, _mock, _td, log_path) = make_state_request_log(2048, 2).await;
+    let (state, _mock, _td, log_path) = make_state_request_log(2048, 2, RoutingPolicy::default()).await;
     let app = router(state);
     let body = json!({
         "model": "m1",
@@ -3268,7 +3472,11 @@ async fn request_log_rotates_and_bounds_keep() {
 /// A state with the built-in `dashboard` plugin loaded from a `dashboard`
 /// plugin spec with `params` — the same dynamic loading path the `lpcache`
 /// binary uses (`load_dashboard`).
-async fn make_state_dashboard(params: Value) -> (AppState, MockLlama, tempfile::TempDir) {
+async fn make_state_dashboard(
+    params: Value,
+    skip_save_on_self_restore: bool,
+    policy: RoutingPolicy,
+) -> (AppState, MockLlama, tempfile::TempDir) {
     let mock = MockLlama::start(BACKEND_MODEL).await;
     let td = tempfile::tempdir().expect("tempdir");
     let cfg = Config::new(
@@ -3277,6 +3485,7 @@ async fn make_state_dashboard(params: Value) -> (AppState, MockLlama, tempfile::
             n_slots: 2,
             slot_save_path: None,
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -3285,12 +3494,13 @@ async fn make_state_dashboard(params: Value) -> (AppState, MockLlama, tempfile::
         Duration::from_secs(30),
         "llama.cpp".to_string(),
         0,
-    );
+    )
+    .with_skip_save_on_self_restore(skip_save_on_self_restore);
     let client = Arc::new(
         LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
     );
     let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
-    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()).with_routing_policy(policy));
     let spec = lpcache::plugins::PluginSpec::new("dashboard", params);
     let dashboard = lpcache::plugins::load_dashboard(
         &lpcache::plugins::Registry::with_builtins(),
@@ -3306,6 +3516,7 @@ async fn make_state_dashboard(params: Value) -> (AppState, MockLlama, tempfile::
         prefilter: None,
         result_store: None,
         request_log: None,
+        payload_log: None,
         dashboard: Some(dashboard),
     };
     (state, mock, td)
@@ -3318,7 +3529,7 @@ async fn drain(resp: axum::http::Response<Body>) {
 
 #[tokio::test]
 async fn dashboard_page_and_stats_reachable() {
-    let (state, mock, _td) = make_state_dashboard(json!({})).await;
+    let (state, mock, _td) = make_state_dashboard(json!({}), true, RoutingPolicy::default()).await;
     let app = router(state);
 
     // The stats API first (its polling never inflates the aggregates —
@@ -3341,7 +3552,7 @@ async fn dashboard_page_and_stats_reachable() {
     assert_eq!(p["total_slots"], 2);
     assert_eq!(p["in_flight"], 0);
     assert_eq!(p["active_groups"], 0);
-    assert_eq!(p["slot_routing_policy"], "lru");
+    assert_eq!(p["slot_routing_policy"], "key_affinity");
     assert_eq!(p["backends"][0]["url"], mock.url());
     assert_eq!(p["backends"][0]["n_slots"], 2);
     assert_eq!(p["backends"][0]["down"], false);
@@ -3405,7 +3616,7 @@ async fn dashboard_page_and_stats_reachable() {
 /// renders the canvas, so this guards the embedded script.
 #[tokio::test]
 async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
-    let (state, _mock, _td) = make_state_dashboard(json!({})).await;
+    let (state, _mock, _td) = make_state_dashboard(json!({}), true, RoutingPolicy::default()).await;
     let app = router(state);
 
     let resp = app.oneshot(get_req("/dashboard")).await.expect("resp");
@@ -3577,7 +3788,7 @@ async fn dashboard_page_charts_draw_bar_figures_and_baseline() {
 
 #[tokio::test]
 async fn dashboard_counters_update_after_requests() {
-    let (state, _mock, _td) = make_state_dashboard(json!({ "refresh_ms": 750 })).await;
+    let (state, _mock, _td) = make_state_dashboard(json!({ "refresh_ms": 750 }), true, RoutingPolicy::default()).await;
     let app = router(state);
 
     // A successful chat request.
@@ -3747,7 +3958,7 @@ async fn dashboard_counters_update_after_requests() {
 
 #[tokio::test]
 async fn dashboard_stats_since_scopes_the_range() {
-    let (state, _mock, _td) = make_state_dashboard(json!({})).await;
+    let (state, _mock, _td) = make_state_dashboard(json!({}), true, RoutingPolicy::default()).await;
     let app = router(state);
 
     // Two finished requests (a successful chat + a 404).
@@ -3914,6 +4125,7 @@ async fn dashboard_coalesced_scopes_track_group_records() {
             n_slots: 2,
             slot_save_path: None,
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -3944,6 +4156,7 @@ async fn dashboard_coalesced_scopes_track_group_records() {
         prefilter: None,
         result_store: None,
         request_log: None,
+        payload_log: None,
         dashboard: Some(dashboard),
     };
     let app = router(state);
@@ -4035,6 +4248,7 @@ async fn dashboard_routes_excluded_from_request_log_and_aggregates() {
             n_slots: 2,
             slot_save_path: None,
             kv_cache: true,
+            model_id: None,
         }],
         100, // words per block
         500, // big threshold words
@@ -4073,6 +4287,7 @@ async fn dashboard_routes_excluded_from_request_log_and_aggregates() {
         prefilter: None,
         result_store: None,
         request_log: Some(request_log),
+        payload_log: None,
         dashboard: Some(dashboard),
     };
     let app = router(state);
@@ -4129,7 +4344,7 @@ async fn dashboard_routes_excluded_from_request_log_and_aggregates() {
 
 #[tokio::test]
 async fn dashboard_custom_path() {
-    let (state, _mock, _td) = make_state_dashboard(json!({ "path": "/stats" })).await;
+    let (state, _mock, _td) = make_state_dashboard(json!({ "path": "/stats" }), true, RoutingPolicy::default()).await;
     let app = router(state);
 
     let resp = app.clone().oneshot(get_req("/stats")).await.expect("resp");
@@ -4153,4 +4368,949 @@ async fn dashboard_custom_path() {
     let resp = app.oneshot(get_req("/dashboard")).await.expect("resp");
     assert_eq!(resp.status(), 404);
     drain(resp).await;
+}
+
+#[tokio::test]
+async fn dashboard_restores_report_the_api_call_duration() {
+    // Self-restore save-skip is pinned OFF: this test exercises the save
+    // timing of *both* requests (the second is a self-restore, which the
+    // default configuration would skip saving).
+    let (state, mock, _td) = make_state_dashboard(json!({}), false, RoutingPolicy::Lru).await;
+    let app = router(state);
+
+    // The same big request (600 words > the 500-word threshold) twice: the
+    // first finds no saved KV cache to restore (no candidate), runs a full
+    // prefill, and saves the KV cache to its slot on completion; the second
+    // finds the saved cache as a restore candidate, lands on the other
+    // (never used) slot, and issues the restore API call to load it there.
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": words(600) }]
+    });
+    for _ in 0..2 {
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200);
+        read_body(resp).await; // dropping the body records the request
+    }
+    let restores = mock.state.restores().await;
+    assert_eq!(restores.len(), 1, "only the second request restored");
+
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    let recent = v["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    // req1 (the older row): no restore candidate existed, so no restore
+    // call was made and the duration field is absent from the JSON.
+    assert_eq!(recent[0]["restored"], false);
+    assert!(recent[0].get("restore_ms").is_none());
+    // req2 (the newer row): the restore API call was made and its duration
+    // is reported as a non-negative number.
+    assert_eq!(recent[1]["restored"], true);
+    assert_eq!(recent[1]["restore_call"], "ok");
+    assert!(
+        recent[1]["restore_ms"].as_f64().is_some_and(|ms| ms >= 0.0),
+        "restore_ms missing on row {:?}",
+        recent[1]
+    );
+    // Both requests are big, so both completed a KV cache save — each row
+    // reports the total duration of its action=save API call.
+    let s1 = recent[0]
+        .get("save_ms")
+        .and_then(Value::as_f64)
+        .expect("save_ms on req1");
+    let s2 = recent[1]
+        .get("save_ms")
+        .and_then(Value::as_f64)
+        .expect("save_ms on req2");
+    assert!(s1 >= 0.0 && s2 >= 0.0);
+    // The KV Cache tab's per-key entry tallies the restored requests and
+    // sums their restore API call durations; its save total is the sum of
+    // both requests' save durations.
+    let kv = v["kv_cache"].as_array().unwrap();
+    assert_eq!(kv.len(), 1);
+    assert_eq!(kv[0]["count"], 1);
+    assert!(
+        kv[0]["restore_ms"].as_f64().is_some_and(|ms| ms >= 0.0),
+        "kv restore total: {:?}",
+        kv[0]
+    );
+    assert_eq!(kv[0]["save_ms"].as_f64(), Some(s1 + s2));
+}
+
+#[tokio::test]
+async fn self_restore_skips_the_kv_save_by_default() {
+    // Default (`SKIP_SAVE_ON_SELF_RESTORE=true`): a big request that
+    // successfully restores its own key does not re-save the KV cache —
+    // the file already holds that key's state — so `action=save` happens
+    // once for two identical requests, and the skipped row reports no
+    // save duration.
+    let (state, mock, _td) = make_state_dashboard(json!({}), true, RoutingPolicy::Lru).await;
+    let app = router(state);
+
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": words(600) }]
+    });
+    // req1: no saved cache exists yet -> full prefill -> KV save.
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await; // dropping the body records the request
+    assert_eq!(mock.state.saves().await.len(), 1);
+    // req2 (same key): the LCP scan finds its own saved cache and the
+    // restore loads it successfully -> the redundant save is skipped.
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await;
+    assert_eq!(mock.state.saves().await.len(), 1, "self-restore re-saved");
+    assert_eq!(mock.state.restores().await.len(), 1);
+
+    let resp = app
+        .clone()
+        .oneshot(get_req("/dashboard/api/stats"))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    let recent = v["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    // req1 (the older row): no restore, one save.
+    let s1 = recent[0]
+        .get("save_ms")
+        .and_then(Value::as_f64)
+        .expect("save_ms on req1");
+    assert!(recent[0].get("restore_ms").is_none());
+    // req2 (the newer row): restored, but the save was skipped, so the row
+    // reports the restore duration and no save duration.
+    assert_eq!(recent[1]["restored"], true);
+    assert!(
+        recent[1]["restore_ms"].as_f64().is_some_and(|ms| ms >= 0.0),
+        "restore_ms missing on row {:?}",
+        recent[1]
+    );
+    assert!(
+        recent[1].get("save_ms").is_none(),
+        "skipped save must not report a duration: {:?}",
+        recent[1]
+    );
+    // The KV Cache tab: one restored request; the save total is req1's
+    // save only (the skipped save contributes nothing).
+    let kv = v["kv_cache"].as_array().unwrap();
+    assert_eq!(kv.len(), 1);
+    assert_eq!(kv[0]["count"], 1);
+    assert_eq!(kv[0]["save_ms"].as_f64(), Some(s1));
+}
+
+#[tokio::test]
+async fn warm_self_restore_skips_save_when_meta_exists() {
+    // Single slot: every repeat of the same big request finds its own key
+    // already running in the only slot — a warm ("already running") no-op
+    // restore with no backend call. With `SKIP_SAVE_ON_SELF_RESTORE` (the
+    // default) and the meta file still on disk, the redundant save is
+    // skipped: the meta's presence is the file-health probe that stands in
+    // for the missing restore call.
+    let (state, mock, _td) = make_state(1, None).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": words(600) }]
+    });
+    // req1: no saved cache exists yet -> full prefill -> one KV save.
+    // req2/req3: warm self-restores -> saves skipped.
+    for i in 0..3 {
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200, "request {i}");
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    }
+    assert_eq!(
+        mock.state.saves().await.len(),
+        1,
+        "warm self-restore re-saved"
+    );
+    // req2/req3 made no backend `action=restore` call (the slot was already
+    // running the key), yet all three chats ran.
+    assert!(
+        mock.state.restores().await.is_empty(),
+        "warm restore made an API call: {:?}",
+        mock.state.restores().await
+    );
+    assert_eq!(mock.state.chat_bodies().await.len(), 3);
+}
+
+#[tokio::test]
+async fn warm_self_restore_heals_missing_meta() {
+    // The warm self-restore skip trusts the KV file only while the meta
+    // file is still on disk: remove the meta between repeats (a prune or
+    // manual cleanup) and the next request's post-request save re-writes the
+    // pair (heal) — save call + meta file reappear.
+    let (state, mock, td) = make_state(1, None).await;
+    let app = router(state);
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": words(600) }]
+    });
+    // req1 saves (and writes the meta); req2 is a warm self-restore with the
+    // meta present -> skip.
+    for i in 0..2 {
+        let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+        assert_eq!(resp.status(), 200, "request {i}");
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    }
+    assert_eq!(mock.state.saves().await.len(), 1);
+    // simulate a prune / cleanup removing the meta file
+    let metas: Vec<_> = std::fs::read_dir(td.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".meta.json"))
+        })
+        .collect();
+    assert_eq!(metas.len(), 1);
+    std::fs::remove_file(&metas[0]).unwrap();
+    // req3: warm self-restore again, but the meta is gone -> the save heals
+    // the pair (KV file + meta file reappear).
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert_eq!(mock.state.saves().await.len(), 2, "missing meta not healed");
+    let metas: Vec<_> = std::fs::read_dir(td.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".meta.json"))
+        })
+        .collect();
+    assert_eq!(metas.len(), 1, "meta file not re-written by the heal save");
+}
+
+/// An `AppState` with the built-in payload log enabled (loaded through
+/// the same plugin-spec path the `lpcache` binary uses, via
+/// `REQUEST_PAYLOAD_DIR`).
+async fn make_state_payload_log() -> (AppState, MockLlama, tempfile::TempDir, std::path::PathBuf) {
+    let mock = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("tempdir");
+    let dir = td.path().join("payloads");
+    let cfg = Config::new(
+        vec![BackendConf {
+            url: mock.url(),
+            n_slots: 2,
+            slot_save_path: None,
+            kv_cache: true,
+            model_id: None,
+        }],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    )
+    .with_request_payload_dir(Some(dir.clone()));
+    let client = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![Arc::clone(&client) as Arc<dyn LlamaBackend>];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let specs = cfg.plugin_specs().expect("plugin specs");
+    let payload_log = lpcache::plugins::load_payload_loggers(
+        &lpcache::plugins::Registry::with_builtins(),
+        &specs,
+    )
+    .expect("load payload log")
+    .expect("payload log spec present");
+    payload_log.prepare().expect("prepare payload log");
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        payload_log: Some(payload_log),
+        dashboard: None,
+    };
+    (state, mock, td, dir)
+}
+
+/// Wait up to ~5 s for at least `n` files to appear in `dir` (payload
+/// writes run on the blocking pool, so they may lag the response).
+async fn wait_for_files(dir: &std::path::Path, n: usize) -> Vec<std::path::PathBuf> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let files = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.path())
+            .collect::<Vec<_>>();
+        if files.len() >= n || tokio::time::Instant::now() >= deadline {
+            return files;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn payload_log_writes_one_file_per_request() {
+    let (state, _mock, _td, dir) = make_state_payload_log().await;
+    let app = router(state);
+    // A valid request: a payload file with the exact body bytes plus a
+    // paired headers file, both named with the request's KV cache key.
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    let raw = body.to_string();
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    read_body(resp).await;
+    let files = wait_for_files(&dir, 2).await;
+    assert_eq!(files.len(), 2, "payload + headers file: {files:?}");
+    let payload = files
+        .iter()
+        .find(|f| f.extension().is_some_and(|e| e == "json"))
+        .expect("payload file");
+    let headers = files
+        .iter()
+        .find(|f| f.extension().is_some_and(|e| e == "headers"))
+        .expect("headers file");
+    let name = payload.file_name().unwrap().to_string_lossy().to_string();
+    assert!(name.starts_with("000001-"), "{name}");
+    assert!(
+        name.contains(&expected_key("hello world")[..16]),
+        "key16 in {name}"
+    );
+    // Same base name (the headers file is the payload name with the
+    // extension swapped).
+    let headers_name = headers.file_name().unwrap().to_string_lossy().to_string();
+    assert!(
+        headers_name.starts_with(&name[..name.len() - ".json".len()]),
+        "paired base names: {name} / {headers_name}"
+    );
+    assert_eq!(
+        std::fs::read(payload).expect("payload file"),
+        raw.as_bytes()
+    );
+    // The headers file holds the request's headers, one `name: value`
+    // line each, names lowercased (post_json sends content-type).
+    let headers_text = std::fs::read_to_string(headers).expect("headers file");
+    assert!(
+        headers_text.lines().all(|l| l.contains(':')),
+        "name: value lines: {headers_text:?}"
+    );
+    assert!(
+        headers_text.contains("content-type: application/json"),
+        "content-type in {headers_text:?}"
+    );
+
+    // A malformed body is captured too (with `nokey`: the payload failed
+    // to parse, so the key was never computed) — payload and headers
+    // file.
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from("not json"))
+        .expect("request");
+    let resp = app.clone().oneshot(req).await.expect("resp");
+    assert_eq!(resp.status(), 422);
+    read_body(resp).await;
+    let files = wait_for_files(&dir, 4).await;
+    assert_eq!(files.len(), 4, "both requests captured: {files:?}");
+    let bad = files
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-nokey.json")
+        })
+        .expect("nokey payload file");
+    assert_eq!(std::fs::read(bad).expect("payload file"), b"not json");
+    let bad_headers = files
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-nokey.headers")
+        })
+        .expect("nokey headers file");
+    assert!(
+        std::fs::read_to_string(bad_headers)
+            .expect("read")
+            .contains("content-type: application/json"),
+        "headers captured for the malformed request too"
+    );
+}
+
+// ---------- model-aware routing (per-backend model_id) ----------
+
+/// Two backends with model-aware routing enabled (a `model_id` on both):
+/// requests for `m1` may only run on backend 0, `m2` only on backend 1.
+async fn make_state_multi_model() -> (
+    AppState,
+    MockLlama,
+    MockLlama,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let kv0 = tempfile::tempdir().expect("kv0");
+    let kv1 = tempfile::tempdir().expect("kv1");
+    let mock0 = MockLlama::start_with_save_dir(BACKEND_MODEL, kv0.path()).await;
+    let mock1 = MockLlama::start_with_save_dir(BACKEND_MODEL, kv1.path()).await;
+    let td = tempfile::tempdir().expect("meta dir");
+    let cfg = Config::new(
+        vec![
+            BackendConf {
+                url: mock0.url(),
+                n_slots: 1,
+                slot_save_path: Some(kv0.path().to_string_lossy().into_owned()),
+                kv_cache: true,
+                model_id: Some("m1".into()),
+            },
+            BackendConf {
+                url: mock1.url(),
+                n_slots: 1,
+                slot_save_path: Some(kv1.path().to_string_lossy().into_owned()),
+                kv_cache: true,
+                model_id: Some("m2".into()),
+            },
+        ],
+        100, // words per block
+        500, // big threshold words
+        0.6, // LCP threshold
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0, // meta_max = unlimited
+    );
+    let c0 = Arc::new(
+        LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("client 0"),
+    );
+    let c1 = Arc::new(
+        LlamaClient::new(&cfg.backends[1].url, cfg.request_timeout, None).expect("client 1"),
+    );
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![
+        Arc::clone(&c0) as Arc<dyn LlamaBackend>,
+        Arc::clone(&c1) as Arc<dyn LlamaBackend>,
+    ];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        payload_log: None,
+        dashboard: None,
+    };
+    (state, mock0, mock1, td, kv0, kv1)
+}
+
+/// Cache key the proxy computes for a routed request: the (lowercased)
+/// requested model is part of the hash, unlike the legacy mode where the
+/// backend-reported model is.
+fn routed_key(model: &str, prefix: &str) -> String {
+    lpcache::hashing::prefix_key_sha256(&format!("{model}\n{prefix}"))
+}
+
+#[tokio::test]
+async fn multi_model_routes_by_request_model() {
+    let (state, mock0, mock1, _td, _kv0, _kv1) = make_state_multi_model().await;
+    let app = router(state);
+    let content = words(600);
+    // m1 -> backend 0 only
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": content }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    assert_eq!(v["model"], "m1");
+    assert_eq!(mock0.state.chat_bodies().await.len(), 1);
+    assert!(mock1.state.chat_bodies().await.is_empty());
+    // m2 -> backend 1 only
+    let body = json!({
+        "model": "m2",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "small hi" }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(mock1.state.chat_bodies().await.len(), 1);
+    assert_eq!(
+        mock0.state.chat_bodies().await.len(),
+        1,
+        "backend 0 only saw its own model"
+    );
+    // matching is case-insensitive: M1 still routes to backend 0
+    let body = json!({
+        "model": "M1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "small hi 2" }]
+    });
+    let resp = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(mock0.state.chat_bodies().await.len(), 2);
+    assert_eq!(mock1.state.chat_bodies().await.len(), 1);
+}
+
+#[tokio::test]
+async fn multi_model_unknown_model_is_404() {
+    let (state, mock0, mock1, td, _kv0, _kv1) = make_state_multi_model().await;
+    let app = router(state);
+    let body = json!({
+        "model": "m9",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let resp = app.oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(resp.status(), 404);
+    let v = read_body(resp).await;
+    let msg = v["error"].as_str().expect("error string");
+    assert!(msg.contains("model not found: m9"), "{msg}");
+    assert!(msg.contains("m1") && msg.contains("m2"), "lists the available models: {msg}");
+    // the request never reached a backend
+    assert!(mock0.state.chat_bodies().await.is_empty());
+    assert!(mock1.state.chat_bodies().await.is_empty());
+    // and left no meta behind
+    assert!(
+        std::fs::read_dir(td.path()).unwrap().next().is_none(),
+        "no meta file for a 404"
+    );
+}
+
+#[tokio::test]
+async fn multi_model_lists_configured_ids() {
+    let (state, _mock0, _mock1, _td, _kv0, _kv1) = make_state_multi_model().await;
+    let app = router(state);
+    let resp = app.oneshot(get_req("/v1/models")).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let v = read_body(resp).await;
+    let ids: Vec<&str> = v["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|m| m["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["m1", "m2"]);
+}
+
+#[tokio::test]
+async fn multi_model_cache_isolated_per_model() {
+    let (state, mock0, mock1, td, kv0, kv1) = make_state_multi_model().await;
+    let app = router(state);
+    let content = words(600);
+    let body1 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": content.clone() }]
+    });
+    // 1) m1 + content: full prefill, saved on backend 0 as m1_{key1}
+    let resp = app.clone().oneshot(post_json(&body1)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    let key1 = routed_key("m1", &content);
+    assert!(
+        kv0.path().join(format!("m1_{key1}")).exists(),
+        "m1 KV file on backend 0's save dir"
+    );
+    assert!(td.path().join(format!("{key1}.meta.json")).exists());
+
+    // 2) the SAME prompt as m2: different key (the model is in the hash),
+    // no restore of m1's cache, its own prefixed file on backend 1
+    let body2 = json!({
+        "model": "m2",
+        "stream": false,
+        "messages": [{ "role": "user", "content": content.clone() }]
+    });
+    let resp = app.clone().oneshot(post_json(&body2)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    let key2 = routed_key("m2", &content);
+    assert_ne!(key1, key2, "the model id is part of the cache key");
+    assert!(
+        kv1.path().join(format!("m2_{key2}")).exists(),
+        "m2 KV file on backend 1's save dir"
+    );
+    assert!(
+        mock1.state.restores().await.is_empty(),
+        "m2 never restores m1's cache"
+    );
+    assert_eq!(mock0.state.saves().await, vec![(0usize, format!("m1_{key1}"))]);
+    assert_eq!(mock1.state.saves().await, vec![(0usize, format!("m2_{key2}"))]);
+
+    // 3) rotate backend 0's slot off key1 (a near-identical m1 prompt: the
+    // candidate key1 restore is a warm self-skip, then the new key is saved)
+    let rot = format!("rotated {}", words(599));
+    let body3 = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": rot.clone() }]
+    });
+    let resp = app.clone().oneshot(post_json(&body3)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    let key_rot = routed_key("m1", &rot);
+
+    // 4) m1 + content again: the only m1 slot now runs key_rot, so the
+    // restore of m1's own prefixed file is actually issued — on backend 0
+    let resp = app.clone().oneshot(post_json(&body1)).await.expect("resp");
+    assert_eq!(resp.status(), 200);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    assert_eq!(
+        mock0.state.restores().await,
+        vec![(0usize, format!("m1_{key1}"))],
+        "the restore carries the model-prefixed filename"
+    );
+    assert!(
+        mock1.state.restores().await.is_empty(),
+        "backend 1 is never touched by an m1 request"
+    );
+    // (no 3rd save: step 4 restored its own key, so the post-chat save is
+    // skipped — the slot already runs key1)
+    assert_eq!(
+        mock0.state.saves().await,
+        vec![
+            (0usize, format!("m1_{key1}")),
+            (0usize, format!("m1_{key_rot}")),
+        ]
+    );
+    // all three m1 entries plus the m2 one are in META_DIR, each under its
+    // own model-prefixed KV file
+    for k in [key1.clone(), key2.clone(), key_rot.clone()] {
+        assert!(td.path().join(format!("{k}.meta.json")).exists());
+    }
+}
+
+/// `POST` with an empty body (the operator drain-control endpoints take no
+/// body).
+fn control_post(uri: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request")
+}
+
+/// Two live mock backends behind the proxy (one slot each). Returns the
+/// state plus the two mocks and the `SlotManager` handle (so a test can
+/// run probe rounds directly — the 1 s background loop only runs in
+/// `main`, not in the harness).
+async fn make_two_backend_state() -> (
+    AppState,
+    MockLlama,
+    MockLlama,
+    Arc<SlotManager>,
+    tempfile::TempDir,
+) {
+    let mock0 = MockLlama::start(BACKEND_MODEL).await;
+    let mock1 = MockLlama::start(BACKEND_MODEL).await;
+    let td = tempfile::tempdir().expect("tempdir");
+    let cfg = Config::new(
+        vec![
+            BackendConf {
+                url: mock0.url(),
+                n_slots: 1,
+                slot_save_path: None,
+                kv_cache: true,
+                model_id: None,
+            },
+            BackendConf {
+                url: mock1.url(),
+                n_slots: 1,
+                slot_save_path: None,
+                kv_cache: true,
+                model_id: None,
+            },
+        ],
+        100,
+        500,
+        0.6,
+        td.path().to_path_buf(),
+        Duration::from_secs(30),
+        "llama.cpp".to_string(),
+        0,
+    );
+    let c0 =
+        Arc::new(LlamaClient::new(&cfg.backends[0].url, cfg.request_timeout, None).expect("c0"));
+    let c1 =
+        Arc::new(LlamaClient::new(&cfg.backends[1].url, cfg.request_timeout, None).expect("c1"));
+    let clients: Vec<Arc<dyn LlamaBackend>> = vec![
+        Arc::clone(&c0) as Arc<dyn LlamaBackend>,
+        Arc::clone(&c1) as Arc<dyn LlamaBackend>,
+    ];
+    let sm = Arc::new(SlotManager::new(&cfg.backends, clients.clone()));
+    let sm_keep = Arc::clone(&sm);
+    let (prefilter, result_store) = load_prefilter(&cfg);
+    let state = AppState {
+        config: Arc::new(cfg),
+        clients,
+        sm,
+        sf: Arc::new(SingleFlight::new()),
+        prefilter,
+        result_store,
+        request_log: None,
+        payload_log: None,
+        dashboard: None,
+    };
+    (state, mock0, mock1, sm_keep, td)
+}
+
+#[tokio::test]
+async fn backend_drain_resume_keeps_in_flight_and_reroutes() {
+    let (state, mock0, mock1, _sm, _td) = make_two_backend_state().await;
+    let app = router(state);
+
+    let body = |marker: &str| {
+        json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{ "role": "user", "content": marker }]
+        })
+    };
+
+    // req A: free tier -> be0's slot (first in insertion order)
+    let r = app
+        .clone()
+        .oneshot(post_json(&body("marker-a")))
+        .await
+        .expect("resp");
+    assert_eq!(r.status(), 200);
+    let _ = to_bytes(r.into_body(), usize::MAX).await;
+    assert_eq!(mock0.state.chat_bodies().await.len(), 1);
+
+    // req B: be0's slot is used -> free tier -> be1's slot; the mock takes
+    // 800 ms to produce the body, so the request stays in flight on be1
+    mock1.state.set_chat_body_delay(Duration::from_millis(800));
+    let fb = post_json(&body("marker-b"));
+    let app_b = app.clone();
+    let fut = tokio::spawn(async move {
+        let r = app_b
+            .oneshot(fb)
+            .await
+            .expect("resp");
+        (r.status().as_u16(), to_bytes(r.into_body(), usize::MAX).await.unwrap())
+    });
+    // wait until the request has actually reached backend 1
+    for _ in 0..400 {
+        if !mock1.state.chat_bodies().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !mock1.state.chat_bodies().await.is_empty(),
+        "req B must reach be1"
+    );
+
+    // drain backend 1 while req B is in flight
+    let r = app
+        .clone()
+        .oneshot(control_post("/_control/backends/1/drain"))
+        .await
+        .expect("resp");
+    assert_eq!(r.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(v["drained"], true);
+    assert_eq!(v["down"], true);
+
+    // the in-flight request finishes normally on the drained backend
+    let (st, _) = fut.await.expect("join");
+    assert_eq!(st, 200);
+    mock1.state.set_chat_body_delay(Duration::ZERO);
+
+    // new requests never land on the drained backend
+    for marker in ["marker-c", "marker-d"] {
+        let r = app
+            .clone()
+            .oneshot(post_json(&body(marker)))
+            .await
+            .expect("resp");
+        assert_eq!(r.status(), 200);
+        let _ = to_bytes(r.into_body(), usize::MAX).await;
+    }
+    let b1 = mock1.state.chat_bodies().await;
+    assert_eq!(
+        b1.len(),
+        1,
+        "no new request may reach the drained backend"
+    );
+    assert_eq!(
+        b1[0]["messages"][0]["content"].as_str(),
+        Some("marker-b")
+    );
+
+    // resume: the mock is healthy, so the inline probe re-joins it at once
+    let r = app
+        .clone()
+        .oneshot(control_post("/_control/backends/1/resume"))
+        .await
+        .expect("resp");
+    assert_eq!(r.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(v["drained"], false);
+    assert_eq!(v["rejoined"], true);
+
+    // req E: both slots are used and be1's is the oldest (LRU) -> be1 again
+    let r = app
+        .clone()
+        .oneshot(post_json(&body("marker-e")))
+        .await
+        .expect("resp");
+    assert_eq!(r.status(), 200);
+    let _ = to_bytes(r.into_body(), usize::MAX).await;
+    let b1 = mock1.state.chat_bodies().await;
+    assert_eq!(
+        b1.len(),
+        2,
+        "the resumed backend receives traffic again"
+    );
+    assert_eq!(
+        b1[1]["messages"][0]["content"].as_str(),
+        Some("marker-e")
+    );
+}
+
+#[tokio::test]
+async fn drain_all_backends_503s_fast_then_resume_recovers() {
+    let (state, _mock0, _mock1, _sm, _td) = make_two_backend_state().await;
+    let app = router(state);
+
+    for i in [0usize, 1] {
+        let r = app
+            .clone()
+            .oneshot(control_post(&format!("/_control/backends/{i}/drain")))
+            .await
+            .expect("resp");
+        assert_eq!(r.status(), 200);
+        let _ = to_bytes(r.into_body(), usize::MAX).await;
+    }
+
+    // every backend drained -> no slot is eligible -> the request fails
+    // fast with 503 (no 300 s acquire wait)
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "marker-x" }]
+    });
+    let t0 = std::time::Instant::now();
+    let r = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r.status(), 503);
+    let _ = to_bytes(r.into_body(), usize::MAX).await;
+    assert!(t0.elapsed() < Duration::from_secs(5), "must fail fast");
+
+    // resume both -> traffic flows again
+    for i in [0usize, 1] {
+        let r = app
+            .clone()
+            .oneshot(control_post(&format!("/_control/backends/{i}/resume")))
+            .await
+            .expect("resp");
+        assert_eq!(r.status(), 200);
+        let _ = to_bytes(r.into_body(), usize::MAX).await;
+    }
+    let r = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r.status(), 200);
+    let _ = to_bytes(r.into_body(), usize::MAX).await;
+}
+
+#[tokio::test]
+async fn resume_of_down_backend_stays_out_until_the_probe_sees_it() {
+    let (state, _mock0, mock1, sm, _td) = make_two_backend_state().await;
+    let app = router(state);
+
+    let r = app
+        .clone()
+        .oneshot(control_post("/_control/backends/1/drain"))
+        .await
+        .expect("resp");
+    assert_eq!(r.status(), 200);
+    let _ = to_bytes(r.into_body(), usize::MAX).await;
+
+    // the backend is still starting up when it is resumed
+    mock1.state.set_models_down(true);
+    let r = app
+        .clone()
+        .oneshot(control_post("/_control/backends/1/resume"))
+        .await
+        .expect("resp");
+    assert_eq!(r.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(v["drained"], false);
+    assert_eq!(v["rejoined"], false, "unhealthy probe: not re-joined yet");
+
+    // it stays out of rotation until it answers /v1/models
+    let body = json!({
+        "model": "m1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "marker-y" }]
+    });
+    let r = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r.status(), 200);
+    let _ = to_bytes(r.into_body(), usize::MAX).await;
+    assert!(
+        mock1.state.chat_bodies().await.is_empty(),
+        "no request may reach the not-yet-healthy backend"
+    );
+
+    // the backend comes up; the next probe round (the 1 s background loop)
+    // re-joins it
+    mock1.state.set_models_down(false);
+    assert_eq!(sm.probe_down_backends().await, 1);
+    let r = app.clone().oneshot(post_json(&body)).await.expect("resp");
+    assert_eq!(r.status(), 200);
+    let _ = to_bytes(r.into_body(), usize::MAX).await;
+    assert!(!mock1.state.chat_bodies().await.is_empty(), "re-joined");
+}
+
+#[tokio::test]
+async fn control_endpoints_reject_bad_index_and_resume_is_idempotent() {
+    let (state, _mock0, _mock1, _sm, _td) = make_two_backend_state().await;
+    let app = router(state);
+
+    for uri in [
+        "/_control/backends/9/drain",
+        "/_control/backends/9/resume",
+    ] {
+        let r = app.clone().oneshot(control_post(uri)).await.expect("resp");
+        assert_eq!(r.status(), 404, "{uri}");
+        let _ = to_bytes(r.into_body(), usize::MAX).await;
+    }
+
+    // resuming a backend that was never drained is a harmless no-op (it
+    // probes and reports it healthy)
+    let r = app
+        .clone()
+        .oneshot(control_post("/_control/backends/0/resume"))
+        .await
+        .expect("resp");
+    assert_eq!(r.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(v["drained"], false);
+    assert_eq!(v["rejoined"], true);
 }

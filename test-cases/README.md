@@ -8,38 +8,40 @@ documents every test with its exact runnable filter, sync/async kind and
 source line, plus the module's fixtures/helpers, how to run just that
 module, and a coverage map of the surface it exercises.
 
-**Total: 273 test cases** — 98 lpcache unit + 99 lpcache-plugins
-unit + 61 API integration + 15 client integration.
+**Total: 317 test cases** — 116 lpcache unit + 113 lpcache-plugins
+unit + 73 API integration + 15 client integration.
 
 | # | Suite | Location | Tests | Kinds |
 |---|-------|----------|-------|-------|
-| 1 | [Configuration (env vars, CLI, precedence, `PLUGINS` specs)](01-configuration.md) | `src/config.rs` | 38 | 38 sync |
+| 1 | [Configuration (env vars, CLI, precedence, `PLUGINS` specs)](01-configuration.md) | `src/config.rs` | 44 | 44 sync |
 | 2 | [Prefilter plugins (keyword, chain)](02-prefilter-plugins.md) | `plugins/src/builtin/keyword.rs`, `chain.rs` | 14 | 10 async + 4 sync |
-| 3 | [Hashing, meta files, pruning](03-hashing.md) | `src/hashing.rs` | 19 | 19 sync |
+| 3 | [Hashing, meta files, pruning](03-hashing.md) | `src/hashing.rs` | 24 | 24 sync |
 | 4 | [Request coalescing (`SingleFlight`)](04-coalescing.md) | `src/coalesce.rs` | 5 | 3 sync + 2 async |
 | 5 | [llama backend client plugin](05-llama-backend-plugin.md) | `plugins/src/builtin/llama.rs` | 5 | 4 sync + 1 async |
-| 6 | [Slot management (selection, locks, breaker)](06-slot-management.md) | `src/slot_manager.rs` | 30 | 30 async |
-| 7 | [API end-to-end (proxy ↔ mock llama.cpp)](07-api-e2e.md) | `tests/api.rs` | 62 | 62 async |
+| 6 | [Slot management (selection, locks, breaker, drain)](06-slot-management.md) | `src/slot_manager.rs` | 36 | 36 async |
+| 7 | [API end-to-end (proxy ↔ mock llama.cpp)](07-api-e2e.md) | `tests/api.rs` | 77 | 77 async |
 | 8 | [Backend client — HTTP behavior](08-backend-client.md) | `tests/client.rs` | 15 | 15 async |
-| 9 | [Result cache plugin](09-result-cache-plugin.md) | `plugins/src/builtin/result_cache.rs` | 20 | 9 sync + 11 async |
+| 9 | [Result cache plugin](09-result-cache-plugin.md) | `plugins/src/builtin/result_cache.rs` | 23 | 12 sync + 11 async |
 | 10 | [Plugin registry (specs, loading, chaining)](10-plugin-registry.md) | `plugins/src/registry.rs` | 10 | 10 sync |
 | 11 | [Request log plugin (W3C-XLF format, rotation)](11-request-log-plugin.md) | `plugins/src/builtin/request_log.rs` | 14 | 14 sync |
 | 12 | [Qwen guard prefilter (Qwen3Guard-Gen safety check)](12-qwen-guard-plugin.md) | `plugins/src/builtin/qwen_guard.rs` | 17 | 8 sync + 9 async |
 
-The module pages catalog 249 of the 275 cases; the remaining 26 (the
-20 `dashboard` plugin unit tests and the 6 `procsample` unit tests,
-which have no dedicated module pages) run
-in the same suites and pass under `cargo test --workspace`.
+The module pages catalog 284 of the 358 tests; the remaining 74 (the
+22 `dashboard` + 8 `payload_log` plugin unit tests, the 7 `procsample`
+and 6 `mock_backend` unit tests, and 1 registry unit test — none with a
+dedicated module page — plus the 29 `lpcache-config` configurator unit
+tests and 1 doctest) run in the same suites and pass under
+`cargo test --workspace`.
 
 ## How to run
 
 ```sh
-cargo test --workspace        # full regression suite (300 tests incl. 1 doctest, ~4 s)
-cargo test --lib              # 98 lpcache unit tests only
-cargo test -p lpcache-plugins # 100 plugin library unit tests
-cargo test --test api         # 62 API integration tests
+cargo test --workspace        # full regression suite (359 tests incl. 1 doctest, ~4 s)
+cargo test --lib              # 123 lpcache unit tests only
+cargo test -p lpcache-plugins # 114 plugin library unit tests
+cargo test --test api         # 77 API integration tests
 cargo test --test client      # 15 client integration tests
-cargo test -p lpcache-config  # 26 configurator unit tests
+cargo test -p lpcache-config  # 29 configurator unit tests
 cargo test <name-substring>   # run a single test by name filter
 cargo clippy --all-targets    # lint gate (expected: 0 warnings)
 ```
@@ -69,6 +71,7 @@ client-disconnect behaviour.
 | Failed requests mark the slot used | `failing_backend_slots_do_not_pin_all_traffic` (E2E; the selection effect is also asserted by the `save_after_*` unit tests) |
 | Idle-aware slot selection | `pick_skips_held_slot_in_favor_of_idle` |
 | Bounded cache pruning (`META_MAX`) | `prune_meta_*` (unit), `prune_removes_oldest_meta_and_kv_files` (E2E) |
+| Startup corrupt-meta scan (`STARTUP_CLEANUP_KV`) | `clean_corrupt_meta_*` (unit), `startup_scan_*` (E2E) |
 | Concurrent-request coalescing (Rust-only feature) | 5 unit + 6 E2E coalesce tests |
 | Prefilter plugins (Rust-only feature) | 14 plugin unit tests (keyword 11, chain 3) + 8 E2E prefilter tests |
 | Result cache plugin (Rust-only feature) | 20 plugin unit + 8 E2E tests (7 result-cache, incl. `cache_streaming` and `no-cache` header bypass + 1 blocklist-over-cache chain) |
@@ -76,11 +79,44 @@ client-disconnect behaviour.
 | Per-backend `kv_cache` flag (Rust-only feature) | `backends_kv_cache_flag` (config), `acquire_excluding_respects_kv_flag` / `restore_prefers_kv_enabled_backend` / `restore_skipped_when_no_kv_enabled_backend` (unit), `kv_cache_disabled_backend_never_saves_or_restores` / `kv_cache_disabled_backend_skips_stream_save` / `kv_restore_prefers_kv_enabled_backend` (E2E) |
 | Skip redundant restores — per-slot last-KV tracking (Rust-only feature) | `restore_skipped_when_slot_already_running_key` / `save_updates_last_kv_tracking` / `failed_restore_forgets_last_kv_tracking` (unit) + the E2E assertions in `dead_backend_traffic_fails_over_to_live_backend`, `kv_restore_prefers_kv_enabled_backend`, `restore_works_after_prune_and_pruned_key_falls_back`, `restore_touches_lru_timestamp_so_prune_keeps_hot_entry` and `restore_rejected_cleans_up_stale_meta` |
 | Request log (`REQUEST_LOG*` env/flags or a `request_log` spec in `PLUGINS`, Rust-only feature) | 3 config tests + 14 plugin unit tests (section 11) + 5 E2E tests (`request_log_writes_xlf_record` — incl. the performance fields, `request_log_stream_request_counts_delivered_bytes`, `request_log_logs_failed_request_without_pipeline`, `request_log_rotates_and_bounds_keep`, `request_log_stream_writes_perf_fields`) |
-| Dashboard plugin (`dashboard` spec in `PLUGINS`, Rust-only feature) | 19 plugin unit tests (counters — incl. the process resource metrics (CPU ms / disk bytes / peak RAM), the `?backend` filter (index scopes + the `cached`, `coalesced` and `coalesced_groups` scopes), per-scope recent rings, the series percentiles (per-request and overall p50/p95, incl. the coarsening merge), `?since` range scoping, bucket pruning/coarsening, chart rendering, self-contained HTML) + 7 E2E tests |
+| Dashboard plugin (`dashboard` spec in `PLUGINS`, Rust-only feature) | 22 plugin unit tests (counters — incl. the process resource metrics (CPU ms / disk bytes / peak RAM), the `?backend` filter (index scopes + the `cached`, `coalesced` and `coalesced_groups` scopes), per-scope recent rings, the series percentiles (per-request and overall p50/p95, incl. the coarsening merge), `?since` range scoping, bucket pruning/coarsening, chart rendering, the backends table's drain flag, self-contained HTML) + 7 E2E tests |
 | KV cache save auto-retry (`SAVE_RETRIES` / `SAVE_RETRY_DELAY_MS`, Rust-only feature) | `save_after_retries_until_success`, `save_after_retries_exhausted_propagates_error`, `save_after_retries_exhausted_500_returns_false`, `save_after_no_retry_when_retries_disabled` (unit), `save_retry_env_and_cli` (config) |
 | Upstream abort on client cancel/disconnect | `nonstream_client_cancel_aborts_upstream`, `stream_client_cancel_aborts_upstream_over_tcp` |
-**Suite health (2026-11-19).** 300/300 passing, clippy clean, ~4 s wall
+**Suite health (2026-11-24).** 359/359 passing, clippy clean, ~4 s wall
 clock. Timing-sensitive tests use explicit delays with bounded 5 s waits.
+On 2026-11-24 the runtime backend drain control landed (+11 cases):
+`SlotManager` gained the operator drain state (a drained backend is
+excluded from slot selection *unconditionally* — the all-down fail-open
+path never routes into it, in-flight requests finish normally, and only
+an explicit resume re-joins it, via one inline `GET /v1/models` probe
+that falls back to the 1 s background probe loop while the backend is
+unhealthy). New cases: 6 `slot_manager` unit tests (drained skipping on
+free-first/LRU, drain never fail-opens, all-drained acquire fails fast,
+success/failure no-ops on a drained backend, probe rounds skipping
+drained backends, resume re-joins when healthy / waits for the probe
+when unhealthy) and 4 E2E tests (`backend_drain_resume_keeps_in_flight_and_reroutes`
+— in-flight request completes on the drained backend while new traffic
+reroutes, resume restores it; `drain_all_backends_503s_fast_then_resume_recovers`
+— fast 503 with every backend drained; `resume_of_down_backend_stays_out_until_the_probe_sees_it`;
+`control_endpoints_reject_bad_index_and_resume_is_idempotent`), plus 1
+`dashboard` unit test (the stats payload carries the per-backend
+`drained` flag the Backends tab renders as a `DRAINED` badge + Drain /
+Resume button). The mock backend gained a `set_models_down` hook (its
+`GET /v1/models` answers 500). The endpoints `POST
+/_control/backends/<i>/drain|resume` are always mounted (no config),
+404 on an out-of-range index, and are excluded from the request log and
+dashboard aggregates (operator traffic, not proxied traffic).
+On 2026-11-24 the `SLOT_ROUTING_POLICY` default flipped from `lru` to
+`key_affinity` (no new cases): `RoutingPolicy::default()`, the invalid-value
+fallback (and its warning), the `--help` text, the configurator template /
+wizard / UI defaults and the `PARAMETERS.md` / `README.md` tables now say
+`key_affinity`; `slot_routing_policy_env_and_cli` asserts the new default
+(unset and invalid → `key_affinity`). Seven E2E cases whose scenarios
+depend on the free-first/LRU pick and its restore wire calls were pinned
+to an explicit `RoutingPolicy::Lru` (a new `make_app_lru` builder; the
+`make_state_request_log` / `make_state_dashboard` builders gained a
+`policy` param; `make_state_with_save_dir` and two inline `SlotManager`
+constructions), so both policies stay covered exactly as before.
 On 2026-11-19 the dashboard charts gained the percentile overlays, the
 toggleable legend, the `?backend=` deep link and the window totals
 (+10 cases): each throughput/resource bar overlays its per-request
