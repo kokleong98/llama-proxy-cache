@@ -19,7 +19,7 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -52,6 +52,10 @@ pub struct MockState {
     /// immediate, the default). Emulates a long-running generation so a test
     /// can observe whether the client (the proxy) aborted the request.
     pub chat_body_delay_ms: AtomicU64,
+    /// When set, `GET /v1/models` answers 500 (emulates a backend that is
+    /// starting up / restarting, so the proxy's health probe sees it as
+    /// down and keeps it out of the slot pool).
+    pub models_down: AtomicBool,
     /// Number of non-streaming JSON bodies produced so far.
     pub json_bodies_produced: AtomicUsize,
     /// When set, chat completions return this raw `(content_type, body)`
@@ -80,6 +84,7 @@ impl MockState {
             stream_chunk_delay_ms: AtomicU64::new(0),
             chunks_produced: AtomicUsize::new(0),
             chat_body_delay_ms: AtomicU64::new(0),
+            models_down: AtomicBool::new(false),
             json_bodies_produced: AtomicUsize::new(0),
             raw_response: Mutex::new(None),
             save_dir,
@@ -105,6 +110,13 @@ impl MockState {
     pub fn set_chat_body_delay(&self, d: Duration) {
         self.chat_body_delay_ms
             .store(d.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// Make `GET /v1/models` answer 500 (for tests; emulates a backend that
+    /// is starting up / restarting — the proxy's health probe sees it as
+    /// down).
+    pub fn set_models_down(&self, down: bool) {
+        self.models_down.store(down, Ordering::SeqCst);
     }
 
     pub async fn chat_bodies(&self) -> Vec<Value> {
@@ -208,8 +220,11 @@ impl MockLlama {
         self._handle.abort();
     }
 }
-async fn models_handler(State(st): State<Arc<MockState>>) -> impl IntoResponse {
-    Json(json!({ "data": [{ "id": st.model_id }] }))
+async fn models_handler(State(st): State<Arc<MockState>>) -> Response {
+    if st.models_down.load(Ordering::SeqCst) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "down").into_response();
+    }
+    Json(json!({ "data": [{ "id": st.model_id }] })).into_response()
 }
 
 async fn chat_handler(

@@ -74,7 +74,10 @@
 //! columns) above the resources bar-chart panel (one row of four
 //! columns of the proxy's own CPU ms, peak RAM, disk bytes read and disk
 //! bytes written per bucket — the additive cpu/disk charts also draw the
-//! window total next to the max); the remaining tabs hold the backend table, the
+//! window total next to the max); the remaining tabs hold the backend table
+//! (with a per-backend Drain/Resume control button that POSTs to the
+//! proxy's own /_control operator endpoint — a drained backend shows a
+//! DRAINED badge and no new request is assigned to it until resumed), the
 //! per-backend slot occupancy grid (each backend's slots grouped under
 //! its label), the recent-requests table (with the backend index and slot
 //! of each request and the duration of its KV-cache restore API call when
@@ -1716,6 +1719,13 @@ tr:last-child td { border-bottom:none; }
 .b-err { background:rgba(248,81,73,.15); color:var(--err); }
 .b-dim { background:rgba(139,148,158,.15); color:var(--dim); }
 .b-acc { background:rgba(88,166,255,.15); color:var(--accent); }
+/* Backends tab: the per-backend Drain / Resume control button (POSTs to
+   the proxy's own /_control operator endpoint; see `beAction`). */
+.bebtn { font:inherit; font-size:11px; font-weight:600; padding:2px 10px; border-radius:10px; cursor:pointer; border:1px solid var(--border); background:transparent; }
+.bebtn.drain { color:var(--warn); }
+.bebtn.drain:hover { background:rgba(210,153,34,.15); border-color:var(--warn); }
+.bebtn.resume { color:var(--accent); }
+.bebtn.resume:hover { background:rgba(88,166,255,.15); border-color:var(--accent); }
 .slotgroups { display:flex; flex-direction:column; gap:10px; }
 .slotgroup { display:flex; align-items:center; gap:10px; }
 .slotlabel { flex:none; max-width:340px; font-size:11px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1907,6 +1917,13 @@ function statsUrl(){
   }
   if(BE!=null) q.push("backend="+BE);
   return q.length ? STATS+"?"+q.join("&") : STATS;
+}
+// Runtime per-backend drain control: POST to the proxy's own operator
+// endpoint (`/_control/backends/<i>/drain|resume`); on success re-poll
+// immediately so the badge/button flips without waiting for the next tick.
+async function beAction(i, act){
+  const r = await fetch("/_control/backends/"+i+"/"+act, {method:"POST", cache:"no-store"});
+  if(r.ok) poll();
 }
 function fmtN(v){ return v==null ? "\u2013" : Math.round(v).toLocaleString(); }
 function fmtDur(v){ if(v==null) return "\u2013"; if(v<1) return Math.round(v*1000)+" ms"; if(v<120) return v.toFixed(1)+" s"; if(v<7200) return Math.floor(v/60)+" m "+Math.round(v%60)+" s"; return Math.floor(v/3600)+" h "+Math.floor((v%3600)/60)+" m"; }
@@ -2357,9 +2374,13 @@ function render(d){
   $("cap-dr").textContent = spanLabel;
   $("cap-dw").textContent = spanLabel;
   $("cap-ram").textContent = spanLabel;
-  let bt = "<table><tr><th>url</th><th>state</th><th>cooldown</th><th>fail streak</th><th>slots</th></tr>";
+  let bt = "<table><tr><th>url</th><th>model</th><th>state</th><th>cooldown</th><th>fail streak</th><th>slots</th><th>action</th></tr>";
   p.backends.forEach((b,i)=>{
-    bt += "<tr><td>"+esc(b.url)+"</td><td>"+(b.down ? '<span class="badge b-err">DOWN</span>' : '<span class="badge b-ok">UP</span>')+"</td><td>"+(b.cooldown_secs>0 ? b.cooldown_secs.toFixed(0)+" s" : "\u2013")+"</td><td>"+(b.failure_streak||"\u2013")+"</td><td>"+b.busy_slots+" / "+b.n_slots+"</td></tr>";
+    const st = b.drained ? '<span class="badge b-warn">DRAINED</span>' : (b.down ? '<span class="badge b-err">DOWN</span>' : '<span class="badge b-ok">UP</span>');
+    const act = b.drained
+      ? '<button type="button" class="bebtn resume" title="Clear the drain and re-join this backend: one GET /v1/models now \u2014 if it answers it re-joins immediately, otherwise the 1 s probe keeps checking until it does" onclick="beAction('+i+',\'resume\')">Resume</button>'
+      : '<button type="button" class="bebtn drain" title="Take this backend out of rotation: no new request is assigned to it (in-flight requests finish normally). Hit Resume to re-join" onclick="beAction('+i+',\'drain\')">Drain</button>';
+    bt += "<tr><td>"+esc(b.url)+"</td><td>"+esc(b.model_id||"\u2013")+"</td><td>"+st+"</td><td>"+(b.cooldown_secs>0 ? b.cooldown_secs.toFixed(0)+" s" : "\u2013")+"</td><td>"+(b.failure_streak||"\u2013")+"</td><td>"+b.busy_slots+" / "+b.n_slots+"</td><td>"+act+"</td></tr>";
   });
   bt += "</table>";
   $("backends").innerHTML = bt;
@@ -2605,6 +2626,8 @@ mod tests {
                 down: false,
                 cooldown_secs: 0.0,
                 failure_streak: 0,
+                drained: false,
+                model_id: Some("test-model".into()),
             }],
             slots: vec![
                 crate::api::SlotStatus {
@@ -3250,9 +3273,19 @@ mod tests {
         // the proxy snapshot rides along
         assert_eq!(v["proxy"]["in_flight"], 1);
         assert_eq!(v["proxy"]["slots"][0]["busy"], true);
+        assert_eq!(v["proxy"]["backends"][0]["drained"], Value::Bool(false));
         // success_rate = 2/3
         let r = v["counters"]["success_rate"].as_f64().unwrap();
         assert!((r - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_payload_carries_backend_drain_flag() {
+        let d = DashboardPlugin::new(params(json!({}))).unwrap();
+        let mut p = proxy();
+        p.backends[0].drained = true;
+        let v = d.stats(&p, Some(0), BackendScope::All);
+        assert_eq!(v["proxy"]["backends"][0]["drained"], Value::Bool(true));
     }
 
     #[test]
@@ -3846,6 +3879,13 @@ mod tests {
         assert!(page.contains("data-tab=\"kv\""));
         assert!(page.contains("id=\"tab-kv\""));
         assert!(page.contains("id=\"kv-cache\""));
+        // the backends table's per-backend drain control: the action
+        // column, the DRAINED badge and the Drain/Resume buttons that
+        // POST to the proxy's own /_control operator endpoint
+        assert!(page.contains("<th>action</th>"));
+        assert!(page.contains("badge b-warn\">DRAINED"));
+        assert!(page.contains("beAction("));
+        assert!(page.contains("/_control/backends/"));
         // inline favicon (prevents the browser's automatic /favicon.ico
         // request from surfacing as a 404 in the stats and request log)
         assert!(page.contains("<link rel=\"icon\" href=\"data:image/svg+xml"));

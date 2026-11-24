@@ -1,7 +1,13 @@
 //! HTTP API (port of `app.py`).
 //!
-//! - `GET /v1/models` -> `{"data": [{"id": MODEL_ID}]}`
+//! - `GET /v1/models` -> `{"data": [{"id": MODEL_ID}]}` — with
+//!   model-aware routing (every backend has a configured `model_id`) the
+//!   distinct configured model ids instead
 //! - `POST /v1/chat/completions`:
+//!   - model-aware routing: the request's `model` must match a backend's
+//!     `model_id` (case-insensitive) or the request is a `404`
+//!     (`model not found`); requests only run on matching backends, and
+//!     the KV cache files are named `{lowercase(model_id)}_{key}`
 //!   - big requests (word count > BIG_THRESHOLD_WORDS): `cache_prompt=true`,
 //!     restore candidate lookup, save + meta after completion
 //!   - small requests: no restore, no save/meta on the non-stream path
@@ -16,6 +22,14 @@
 //!     handler future, which drops the backend-client future and aborts the
 //!     upstream request to llama-server the same way
 //!   - 503 when no slot could be acquired within the 300 s timeout
+//! - `POST /_control/backends/{index}/drain|resume` — runtime per-backend
+//!   drain control (operator endpoints, always mounted): drain takes a
+//!   backend out of rotation (in-flight requests finish, no new ones are
+//!   assigned — not even via the all-down fail-open path); resume clears
+//!   the drain and re-joins the backend via one inline `GET /v1/models`
+//!   probe (the 1 s background probe loop keeps checking while it stays
+//!   unhealthy). 404 on an out-of-range index; excluded from the request
+//!   log and dashboard aggregates (operator traffic, not proxy traffic)
 //!
 //! Request prefilter (optional): when a prefilter plugin is enabled
 //! (e.g. the `keyword` and/or `result_cache` plugins from the
@@ -66,7 +80,7 @@ use crate::procsample::ProcSample;
 use crate::slot_manager::{AcquireTimeout, GSlot, SaveOutcome, SlotGuard, SlotManager};
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -148,7 +162,12 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat));
+        .route("/v1/chat/completions", post(chat))
+        // Runtime per-backend drain control (operator endpoints; keep the
+        // proxy on a trusted network, like the rest of its surface):
+        // take a backend out of / back into rotation at runtime.
+        .route("/_control/backends/{index}/drain", post(control_drain))
+        .route("/_control/backends/{index}/resume", post(control_resume));
     // The dashboard plugin (when loaded) owns its routes: the page at its
     // configured `path` and the stats API at `{path}/api/stats`.
     if let Some(d) = &state.dashboard {
@@ -166,8 +185,80 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn models(State(state): State<AppState>) -> impl IntoResponse {
-    axum::Json(json!({ "data": [{ "id": state.config.model_id }] }))
+async fn models(State(state): State<AppState>) -> Response {
+    // Model-aware routing: advertise the distinct configured model ids
+    // (one entry per model, order of first backend); legacy mode: the
+    // single configured MODEL_ID.
+    if state.config.model_routing_enabled() {
+        let data: Vec<Value> = state
+            .config
+            .available_model_ids()
+            .into_iter()
+            .map(|id| json!({ "id": id }))
+            .collect();
+        return axum::Json(json!({ "data": data })).into_response();
+    }
+    axum::Json(json!({ "data": [{ "id": state.config.model_id }] })).into_response()
+}
+
+/// `POST /_control/backends/{index}/drain` — take backend `index` out of
+/// rotation at runtime (idempotent). From now on no new request is
+/// assigned to it (the pick excludes it unconditionally, even via the
+/// all-down fail-open path), while requests already in flight on its
+/// slots finish normally. Only the matching resume re-joins it.
+///
+/// 404 when `index` is out of range. Not logged in the request log (like
+/// the dashboard's own routes): this is operator traffic, not proxied
+/// traffic.
+async fn control_drain(AxumPath(index): AxumPath<usize>, State(state): State<AppState>) -> Response {
+    if index >= state.config.backends.len() {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({ "error": "backend index out of range" })),
+        )
+            .into_response();
+    }
+    state.sm.drain(index);
+    let br = state.sm.breaker_state()[index].clone();
+    axum::Json(json!({
+        "index": index,
+        "drained": br.drained,
+        "down": br.down,
+        "cooldown_secs": br.cooldown_secs,
+        "failure_streak": br.failure_streak,
+    }))
+    .into_response()
+}
+
+/// `POST /_control/backends/{index}/resume` — clear backend `index`'s
+/// drain and re-join it with the same health check the background probe
+/// loop uses (one `GET /v1/models`): when it answers, the backend is
+/// eligible immediately (`rejoined: true`); when it does not, the backend
+/// stays out of the pool and the 1 s probe loop keeps checking until it
+/// answers (`rejoined: false`). Idempotent.
+///
+/// 404 when `index` is out of range. Not logged in the request log (like
+/// the dashboard's own routes): this is operator traffic, not proxied
+/// traffic.
+async fn control_resume(AxumPath(index): AxumPath<usize>, State(state): State<AppState>) -> Response {
+    if index >= state.config.backends.len() {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({ "error": "backend index out of range" })),
+        )
+            .into_response();
+    }
+    let rejoined = state.sm.resume(index).await;
+    let br = state.sm.breaker_state()[index].clone();
+    axum::Json(json!({
+        "index": index,
+        "drained": br.drained,
+        "down": br.down,
+        "cooldown_secs": br.cooldown_secs,
+        "failure_streak": br.failure_streak,
+        "rejoined": rejoined,
+    }))
+    .into_response()
 }
 
 /// Process start (for the dashboard's `uptime_secs`).
@@ -278,6 +369,8 @@ pub(crate) fn capture_status(state: &AppState) -> ProxyStatus {
                 down: br.down,
                 cooldown_secs: br.cooldown_secs,
                 failure_streak: br.failure_streak,
+                drained: br.drained,
+                model_id: b.model_id.clone(),
             }
         })
         .collect();
@@ -666,9 +759,13 @@ async fn request_log_middleware(
     // The dashboard's own routes (the page + the stats API) are its
     // internal polling, not proxy traffic: skip them entirely so they
     // are neither logged nor counted in the dashboard's own statistics.
-    if dashboard
-        .as_deref()
-        .is_some_and(|d| is_dashboard_own_route(req.uri().path(), d))
+    // Same for the operator drain control routes (`/_control/...`):
+    // operational traffic, not proxied traffic.
+    let path = req.uri().path();
+    if path.starts_with("/_control/")
+        || dashboard
+            .as_deref()
+            .is_some_and(|d| is_dashboard_own_route(path, d))
     {
         return next.run(req).await;
     }
@@ -784,8 +881,43 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
     if state.clients.is_empty() {
         return json_error(503, "no backends configured");
     }
-    // model_id is taken from the first backend (used for cache keys only)
-    let backend_model_id = state.clients[0].get_model_id().await;
+    // The model id the cache key and KV filenames are addressed by. With
+    // model-aware routing (every backend has a configured `model_id`) the
+    // request's `model` must match one of them (case-insensitive) —
+    // otherwise the request is a 404 (the model is not served) — and the
+    // matched id, lowercased, is used in the key and in the KV file
+    // prefix. Without it (the default), the model id the first backend
+    // reports (used for cache keys only, as before).
+    let backend_model_id = if state.config.model_routing_enabled() {
+        let available = state.config.available_model_ids();
+        if !available
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(&client_model))
+        {
+            let list = available.join(", ");
+            tracing::info!("model_not_found model={client_model}");
+            let mut pl = PipelineLog {
+                model: Some(client_model.clone()),
+                stream: Some(stream),
+                ..Default::default()
+            };
+            pl.reason = Some("model_not_found".into());
+            return with_pipeline_log(
+                json_error(
+                    404,
+                    format!("model not found: {client_model} (available: {list})"),
+                ),
+                pl,
+            );
+        }
+        client_model.to_lowercase()
+    } else {
+        // model_id is taken from the first backend (used for cache keys only)
+        state.clients[0].get_model_id().await
+    };
+    // Lowercase model id for the KV filenames (`{kv_model}_{key}`); the
+    // slot manager also filters slot selection on it (model-aware routing).
+    let kv_model = backend_model_id.to_lowercase();
 
     let prefix = hashing::raw_prefix(&messages);
     let full_for_key = format!("{}\n{}", backend_model_id, prefix);
@@ -919,6 +1051,7 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
         let body2 = body.clone();
         let client_model2 = client_model.clone();
         let backend_model_id2 = backend_model_id.clone();
+        let kv_model2 = kv_model.clone();
         let key2 = key.clone();
         let blocks2 = blocks.clone();
         let prefix2 = prefix.clone();
@@ -931,6 +1064,7 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
                 &client_model2,
                 stream,
                 &backend_model_id2,
+                &kv_model2,
                 &key2,
                 &blocks2,
                 &prefix2,
@@ -974,6 +1108,7 @@ async fn chat(State(state): State<AppState>, req: axum::http::Request<Body>) -> 
         &client_model,
         stream,
         &backend_model_id,
+        &kv_model,
         &key,
         &blocks,
         &prefix,
@@ -1001,6 +1136,7 @@ async fn run_pipeline(
     client_model: &str,
     stream: bool,
     backend_model_id: &str,
+    kv_model: &str,
     key: &str,
     blocks: &[String],
     prefix: &str,
@@ -1051,7 +1187,7 @@ async fn run_pipeline(
         restore_key.as_ref().map(|k| short16(k)).unwrap_or_default()
     );
 
-    let mut guard = match state.sm.acquire(restore_key.as_deref()).await {
+    let mut guard = match state.sm.acquire(restore_key.as_deref(), kv_model).await {
         Ok(g) => g,
         Err(AcquireTimeout) => {
             tracing::error!(
@@ -1106,6 +1242,7 @@ async fn run_pipeline(
                         g,
                         guard,
                         &restore_key,
+                        kv_model,
                         attempt,
                         &e.to_string(),
                     )
@@ -1192,6 +1329,7 @@ async fn run_pipeline(
             let prefix2 = prefix.to_string();
             let blocks2: Vec<String> = blocks.to_vec();
             let model_id2 = backend_model_id.to_string();
+            let kv_model2 = kv_model.to_string();
             // Result cache: aggregate the completed stream into a
             // non-streaming completion and store it (only when the store
             // opts into caching streaming results).
@@ -1313,7 +1451,7 @@ async fn run_pipeline(
                     prune_cache(&cfg);
                     false
                 } else if cfg.backends[g.be].kv_cache {
-                    match sm.save_after(g, &key2).await {
+                    match sm.save_after(g, &key2, &kv_model2).await {
                         Ok(out) => {
                             sm.report_success(g);
                             // Request log: the total duration of the
@@ -1373,7 +1511,7 @@ async fn run_pipeline(
                     && store.caches_streaming()
                 {
                     let completion = sse_to_completion(&sse_all, &client_model2);
-                    if let Err(e) = store.store(&key2, 200, &completion) {
+                    if let Err(e) = store.store(&model_id2, &key2, 200, &completion) {
                         tracing::warn!("result_cache_store_fail key={}: {e}", short16(&key2));
                     }
                 }
@@ -1428,6 +1566,7 @@ async fn run_pipeline(
                         g,
                         guard,
                         &restore_key,
+                        kv_model,
                         attempt,
                         &e.to_string(),
                     )
@@ -1502,7 +1641,7 @@ async fn run_pipeline(
                             prune_cache(&state.config);
                             false
                         } else if state.config.backends[g.be].kv_cache {
-                            match save_big(state, g, key, prefix, blocks, backend_model_id).await {
+                            match save_big(state, g, key, prefix, blocks, backend_model_id, kv_model).await {
                                 Ok(out) => {
                                     // Request log: the total duration of the
                                     // action=save API calls (the backend may
@@ -1578,7 +1717,7 @@ async fn run_pipeline(
                             prune_cache(&state.config);
                             false
                         } else if state.config.backends[g.be].kv_cache {
-                            match save_big(state, g, key, prefix, blocks, backend_model_id).await {
+                            match save_big(state, g, key, prefix, blocks, backend_model_id, kv_model).await {
                                 Ok(out) => {
                                     // Request log: the total duration of the
                                     // action=save API calls (the backend may
@@ -1621,7 +1760,7 @@ async fn run_pipeline(
                     // before any slot/backend work (see the `result_cache`
                     // plugin). Streaming results are not stored.
                     if let Some(store) = &state.result_store
-                        && let Err(e) = store.store(key, 200, &out)
+                        && let Err(e) = store.store(backend_model_id, key, 200, &out)
                     {
                         tracing::warn!("result_cache_store_fail key={}: {e}", short16(key));
                     }
@@ -1829,7 +1968,21 @@ fn remove_stale_meta(state: &AppState, guard: &SlotGuard, restore_key: &Option<S
             // the file is gone — keep the meta (status quo).
             return;
         }
-        if dirs.iter().any(|d| d.join(rk).is_file()) {
+        // The KV file is addressed by its model-prefixed name
+        // ({lowercase(model_id)}_{key}; the model id from the restore
+        // key's meta file) — or, for caches saved before the prefix, by
+        // the legacy bare name.
+        let meta_model_id = std::fs::read_to_string(state.config.meta_dir.join(format!("{rk}.meta.json")))
+            .ok()
+            .and_then(|txt| serde_json::from_str::<hashing::Meta>(&txt).ok())
+            .map(|m| m.model_id);
+        if dirs.iter().any(|d| {
+            d.join(rk).is_file()
+                || meta_model_id
+                    .as_deref()
+                    .filter(|m| !m.is_empty())
+                    .is_some_and(|m| d.join(hashing::kv_basename(m, rk)).is_file())
+        }) {
             // The file still exists somewhere (or the 400 was "no
             // available space"): it may still restore — keep the meta.
             return;
@@ -1854,12 +2007,14 @@ fn remove_stale_meta(state: &AppState, guard: &SlotGuard, restore_key: &Option<S
 /// re-attempted there). `None` when the retry budget is spent or no other
 /// backend has an eligible slot (single-backend deployment, or every other
 /// backend cooling down).
+#[allow(clippy::too_many_arguments)]
 async fn retry_after_failure(
     state: &AppState,
     key: &str,
     g: GSlot,
     guard: SlotGuard,
     restore_key: &Option<String>,
+    kv_model: &str,
     attempt: usize,
     err: &str,
 ) -> Option<SlotGuard> {
@@ -1872,7 +2027,7 @@ async fn retry_after_failure(
     }
     let g2 = state
         .sm
-        .acquire_excluding(g.be, restore_key.as_deref())
+        .acquire_excluding(g.be, restore_key.as_deref(), kv_model)
         .await
         .ok()?;
     tracing::info!("chat_retry from_g={g} to_g={} attempt=1", g2.slot);
@@ -1893,8 +2048,9 @@ async fn save_big(
     prefix: &str,
     blocks: &[String],
     backend_model_id: &str,
+    kv_model: &str,
 ) -> Result<SaveOutcome, Box<(Response, SharedOutcome)>> {
-    let out = state.sm.save_after(g, key).await.map_err(|e| {
+    let out = state.sm.save_after(g, key, kv_model).await.map_err(|e| {
         if matches!(e, BackendError::Other(_)) {
             tracing::warn!("save_error g={g} key={}: {e}", short16(key));
             state.sm.report_failure(g);
@@ -1935,9 +2091,12 @@ async fn save_big(
 ///
 /// After a successful save: if `META_DIR` holds more than `meta_max` meta
 /// files, the oldest ones are removed — together with the KV files that
-/// bear the same names in the configured `--slot-save-path` directories
-/// (per-backend `slot_save_path` entries, or `SLOT_SAVE_PATH` for the
-/// single-backend fallback). Pruning only ever deletes files, and a later
+/// bear the model-prefixed name `{lowercase(model_id)}_{key}` (the model
+/// id from the pruned meta file) in the configured `--slot-save-path`
+/// directories (per-backend `slot_save_path` entries, or `SLOT_SAVE_PATH`
+/// for the single-backend fallback). A missing prefixed file falls back
+/// to removing the legacy bare `{key}` file (caches saved before the
+/// model prefix self-heal). Pruning only ever deletes files, and a later
 /// restore of a pruned key simply fails and falls back to a full prefill.
 fn prune_cache(config: &Config) {
     if config.meta_max == 0 {
@@ -1947,19 +2106,106 @@ fn prune_cache(config: &Config) {
     if pruned.is_empty() {
         return;
     }
-    for key in &pruned {
+    for (key, model_id) in &pruned {
         for dir in config.slot_save_dirs() {
-            // NotFound is normal: the KV file may only exist in some
-            // backends' directories (or nowhere if none is configured).
-            if let Err(e) = std::fs::remove_file(dir.join(key)) {
-                tracing::debug!(
-                    "prune_kv_fail dir={} key={}: {e}",
-                    dir.display(),
-                    short16(key)
-                );
+            let prefixed = dir.join(hashing::kv_basename(model_id, key));
+            match std::fs::remove_file(&prefixed) {
+                Ok(()) => {}
+                // NotFound is normal: the KV file may only exist in some
+                // backends' directories (or nowhere if none is configured)
+                // — fall back to the legacy bare name.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Err(e) = std::fs::remove_file(dir.join(key)) {
+                        tracing::debug!(
+                            "prune_kv_fail dir={} key={}: {e}",
+                            dir.display(),
+                            short16(key)
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "prune_kv_fail dir={} key={}: {e}",
+                        dir.display(),
+                        short16(key)
+                    );
+                }
             }
         }
     }
+}
+
+/// Startup scan of `META_DIR` (see [`hashing::clean_corrupt_meta`]): the
+/// corrupt `.meta.json` files are always removed; their orphan KV files
+/// are removed as well only when `STARTUP_CLEANUP_KV` is enabled — with a
+/// corrupt meta the `model_id` is unrecoverable, so the KV names are
+/// matched by key suffix (see [`remove_orphan_kv`]). Called once at
+/// startup, before the listener binds (no concurrent proxy writers yet),
+/// and from the e2e tests. Returns the number of corrupt meta files and
+/// KV files removed.
+pub fn startup_meta_cleanup(config: &Config) -> (usize, usize) {
+    let keys = hashing::clean_corrupt_meta(&config.meta_dir);
+    if keys.is_empty() {
+        return (0, 0);
+    }
+    let kv_removed = if config.startup_cleanup_kv {
+        remove_orphan_kv(&config.slot_save_dirs(), &keys)
+    } else {
+        0
+    };
+    if config.startup_cleanup_kv {
+        tracing::info!(
+            "startup_meta_cleanup removed_corrupt={} kv_removed={kv_removed}",
+            keys.len()
+        );
+    } else {
+        tracing::info!(
+            "startup_meta_cleanup removed_corrupt={} (orphan KV files left \
+             in place; set STARTUP_CLEANUP_KV=true to remove them)",
+            keys.len()
+        );
+    }
+    (keys.len(), kv_removed)
+}
+
+/// Remove the orphan KV files of `keys` in `dirs`: the legacy bare
+/// `{dir}/{key}` file plus any file whose name ends in `_{key}` (the
+/// model-prefixed `{lowercase(model_id)}_{key}` form — when the meta file
+/// is corrupt the model id is unrecoverable, so the key suffix is matched;
+/// cache keys are 64-hex sha256, so a suffix match can only ever hit the
+/// key's own files). A missing dir or file is normal (the KV file may live
+/// in only some of the slot-save dirs, or in none when no dir is
+/// configured). Returns the number of files removed.
+pub fn remove_orphan_kv(dirs: &[&Path], keys: &[String]) -> usize {
+    let mut removed = 0usize;
+    for key in keys {
+        for dir in dirs {
+            // The legacy bare name (caches saved before the model prefix).
+            if std::fs::remove_file(dir.join(key)).is_ok() {
+                removed += 1;
+            }
+            // The model-prefixed form, matched by key suffix.
+            let suffix = format!("_{key}");
+            let rd = match std::fs::read_dir(dir) {
+                Ok(rd) => rd,
+                Err(e) => {
+                    tracing::debug!(
+                        "remove_orphan_kv read_dir failed dir={}: {e}",
+                        dir.display()
+                    );
+                    continue;
+                }
+            };
+            for entry in rd.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(&suffix)
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
 }
 
 fn json_error(status: u16, msg: impl Into<String>) -> Response {

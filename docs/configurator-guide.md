@@ -72,9 +72,11 @@ updated (port now `9091`):
 
 The **backends** submenu is a small CRUD list: edit any entry, add new
 ones, remove one, or done. Per backend you set the URL, `n_slots` (must
-match the llama-server's `-np/--parallel`), `slot_save_path` (must match
-its `--slot-save-path`), and a `kv` yes/no for KV save/restore support
-(llama-server ≥ 1.05.40).
+match the llama-server's `-np/--parallel`), the `model_id` (optional —
+the model this backend serves; set it on **every** backend to enable
+model-aware routing, on none to keep the legacy behaviour), `slot_save_path`
+(must match its `--slot-save-path`), and a `kv` yes/no for KV save/restore
+support (llama-server ≥ 1.05.40).
 
 ![backends submenu](configurator/wizard-3-backends.png)
 

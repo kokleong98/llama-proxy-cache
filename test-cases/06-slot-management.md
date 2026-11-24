@@ -1,29 +1,30 @@
-# 6. Slot management — `src/slot_manager.rs` (30)
+# 6. Slot management — `src/slot_manager.rs` (36)
 
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (302 tests) runs with
+1:1 to a test function; the full suite (359 tests) runs with
 `cargo test --workspace`.
 
 In-memory `TestClient` backends; verifies selection (incl. the
 `SLOT_ROUTING_POLICY` routing policy), per-slot locking,
 save/restore semantics, per-slot last-KV tracking (a restore is skipped
-when the slot already runs the requested key), the backend circuit breaker
-and the per-backend `kv_cache` flag.
+when the slot already runs the requested key), the backend circuit breaker,
+the runtime drain control (drain/resume) and the per-backend `kv_cache`
+flag.
 
 ## Module overview
 
-- **Target:** `lpcache` library — the `mod tests` at the bottom of [`src/slot_manager.rs`](../src/slot_manager.rs); 30 tests, all async (`#[tokio::test]`).
+- **Target:** `lpcache` library — the `mod tests` at the bottom of [`src/slot_manager.rs`](../src/slot_manager.rs); 36 tests, all async (`#[tokio::test]`).
 - **Fixtures & helpers:**
   - `TestClient` — an in-memory `LlamaBackend` that records every `save_slot`/`restore_slot` call and is steered with `save_mode` (Ok(true) / Ok(false) / Err), `save_fail_first_n` (N transient failures) and `restore_ok`.
   - `make(n_backends, n_slots)` builds a `SlotManager` over `TestClient`s with the production-default retry count but a 1 ms retry delay, so retry-driven tests stay fast; `make_kv(n_backends, n_slots, kv_disabled)` is the same with per-backend `kv_cache` flags; `make_policy(n_backends, n_slots, policy)` is the same with an explicit `SLOT_ROUTING_POLICY`.
-- **Surface under test:** `SlotManager::acquire` (free-first → LRU ordering, per-slot `Semaphore(1)` locking, acquire timeout, restore gating incl. the per-backend `kv_cache` flag, idle-aware pick, the `SLOT_ROUTING_POLICY` routing policy (`lru` vs `key_affinity` — the latter adds a key-free tier: an idle slot already running the requested key is picked before the free/LRU tiers), circuit-breaker skipping, fail-open), per-slot last-KV tracking (restore skipped when the slot already runs the key; tracking updated by successful restores/saves and cleared by failed restores), `save_after` (mark-used semantics incl. 500 vs other errors, auto-retry), `report_failure`/`report_success` (escalating backoff), `probe_down_backends`, `acquire_excluding`.
+- **Surface under test:** `SlotManager::acquire` (free-first → LRU ordering, per-slot `Semaphore(1)` locking, acquire timeout, restore gating incl. the per-backend `kv_cache` flag, idle-aware pick, the `SLOT_ROUTING_POLICY` routing policy (`lru` vs `key_affinity` — the latter adds a key-free tier: an idle slot already running the requested key is picked before the free/LRU tiers), circuit-breaker skipping, fail-open), per-slot last-KV tracking (restore skipped when the slot already runs the key; tracking updated by successful restores/saves and cleared by failed restores), `save_after` (mark-used semantics incl. 500 vs other errors, auto-retry), `report_failure`/`report_success` (escalating backoff), `probe_down_backends`, `acquire_excluding`, and the runtime drain control (`drain`/`resume`: unconditional exclusion — even the all-down fail-open path — no-op success/probe handling, probe-based re-join).
 
 ## How to run
 
 ```sh
-cargo test --lib slot_manager::tests                                       # all 30 slot manager tests
+cargo test --lib slot_manager::tests                                       # all 36 slot manager tests
 cargo test --lib slot_manager::tests::free_slot_picked_first_in_order      # one test, exact path
 ```
 
@@ -62,6 +63,13 @@ into `cargo test` as shown above.
 | 28 | `slot_manager::tests::key_affinity_picks_idle_slot_running_key` | async | [L878](../src/slot_manager.rs#L878) | `key_affinity`; slot 0 runs "k" (newer), slot 1 runs "other" (older/LRU pick) | a repeat of "k" is picked on the idle slot running "k" (not the LRU slot), the post-pick skip counts as `restored = Some(Restored)`, and no redundant restore wire call is issued |
 | 29 | `slot_manager::tests::lru_policy_ignores_key_on_pick` | async | [L897](../src/slot_manager.rs#L897) | default `lru`; same setup as 28 | the key never influences the pick: the oldest slot (running "other") is picked and the restore is actually issued there |
 | 30 | `slot_manager::tests::key_affinity_without_key_matches_lru_pick` | async | [L915](../src/slot_manager.rs#L915) | `key_affinity`, acquire without a restore key | the policy has no effect: free-first ordering, no restore calls |
+| 31 | `slot_manager::tests::drained_backend_is_skipped_while_others_available` | async | [L1657](../src/slot_manager.rs#L1657) | drain be0; free-first + LRU picks | be0's slots are ineligible on both paths: be1's slots are picked |
+| 32 | `slot_manager::tests::drain_never_fail_opens` | async | [L1673](../src/slot_manager.rs#L1673) | be1 drained + be0 in failure cooldown (every backend out of the pool) | the all-down fail-open path routes into the *non-drained* be0 — never the drained be1 |
+| 33 | `slot_manager::tests::all_drained_acquire_fails_fast` | async | [L1686](../src/slot_manager.rs#L1686) | every backend drained | `acquire` errors immediately (`AcquireTimeout`), no acquire-timeout wait |
+| 34 | `slot_manager::tests::report_success_on_drained_backend_keeps_drain` | async | [L1698](../src/slot_manager.rs#L1698) | drain, then `report_success` (an in-flight request finishing on it) | drain + sentinel survive: the backend stays excluded; `report_failure` neither escalates the streak nor overwrites the sentinel |
+| 35 | `slot_manager::tests::probe_round_skips_drained_backend` | async | [L1714](../src/slot_manager.rs#L1714) | drain, then a probe round while the backend answers `/v1/models` | a drained backend is neither counted as recovered nor re-joined — only an explicit resume does that |
+| 36 | `slot_manager::tests::resume_rejoins_when_healthy` | async | [L1725](../src/slot_manager.rs#L1725) | drain, then resume while the backend answers `/v1/models` | the inline probe re-joins at once (flag cleared, cooldown 0) and the backend is eligible again |
+| 37 | `slot_manager::tests::resume_waits_for_probe_when_unhealthy` | async | [L1740](../src/slot_manager.rs#L1740) | drain, resume while the probe fails, recover, then a probe round | the flag clears but the sentinel stays (still excluded); once the backend answers, the next probe round re-joins it |
 
 ## Coverage map — surface → tests
 
@@ -76,4 +84,5 @@ into `cargo test` as shown above.
 | Per-slot locking + timeout | `second_acquire_waits_until_release`, `acquire_times_out_when_slot_held` |
 | Circuit breaker | `failed_backend_is_skipped_while_others_available`, `all_backends_down_fails_open`, `backend_cooldown_expires`, `report_failure_escalates_backoff`, `report_success_resets_cooldown_and_streak` |
 | Probe recovery | `probe_down_backends_recovers_up_backend` |
+| Runtime drain control | `drained_backend_is_skipped_while_others_available`, `drain_never_fail_opens`, `all_drained_acquire_fails_fast`, `report_success_on_drained_backend_keeps_drain`, `probe_round_skips_drained_backend`, `resume_rejoins_when_healthy`, `resume_waits_for_probe_when_unhealthy` |
 | Retry on another backend | `acquire_excluding_picks_other_backend`, `acquire_excluding_respects_kv_flag` |

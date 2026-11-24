@@ -9,7 +9,7 @@
 //! `Arc<dyn ResultStore>` / `Arc<dyn LlamaBackend>` objects are wired into
 //! `AppState`.
 
-use lpcache::app::{AppState, router};
+use lpcache::app::{AppState, router, startup_meta_cleanup};
 use lpcache::coalesce::SingleFlight;
 use lpcache::config::{Cli, Config};
 use lpcache::plugins::{
@@ -48,6 +48,14 @@ async fn main() {
     // Command line > environment > built-in defaults.
     let config = Config::from_cli(&cli);
 
+    // The per-backend `model_id` must be all-or-nothing: a mixed set would
+    // leave backends that can never match a request (silently dead). A bad
+    // set is a startup error (it names the offending entries).
+    if let Err(e) = config.validate_backends() {
+        eprintln!("lpcache: {e}");
+        std::process::exit(2);
+    }
+
     // RUST_LOG takes precedence, then LOG_LEVEL (uvicorn used LOG_LEVEL too)
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.log_level));
@@ -62,6 +70,11 @@ async fn main() {
             config.meta_dir.display()
         );
     }
+
+    // Startup scan of META_DIR: corrupt meta files are removed (and their
+    // orphan KV files too, when STARTUP_CLEANUP_KV is set) so a
+    // crash-corrupted cache dir self-heals before the first request.
+    startup_meta_cleanup(&config);
 
     // Dynamically load the adapter plugins from configuration: the `PLUGINS`
     // env var / `--plugins` flag, or — when unset — the specs synthesized
@@ -227,6 +240,12 @@ async fn main() {
         config.meta_max,
         config.stream_queue_size
     );
+    if config.model_routing_enabled() {
+        tracing::info!(
+            "model_routing_enabled models={:?}",
+            config.available_model_ids()
+        );
+    }
 
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,

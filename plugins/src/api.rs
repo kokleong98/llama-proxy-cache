@@ -150,9 +150,19 @@ pub trait ResultStore: Send + Sync {
         Ok(())
     }
 
-    /// Store (or refresh) the result for `key`. Failures are logged by the
-    /// proxy; they never affect the in-flight response.
-    fn store(&self, key: &str, status: u16, body: &Value) -> Result<(), String>;
+    /// Store (or refresh) the result for `model_id` + `key`. `model_id` is
+    /// the backend model id used in the cache key (the proxy passes the
+    /// same value it hashed into `key`); stores that keep files on disk use
+    /// it for the entry filename following the KV cache file naming
+    /// convention (`{lowercase(model_id)}_{key}`). Failures are logged by
+    /// the proxy; they never affect the in-flight response.
+    fn store(
+        &self,
+        model_id: &str,
+        key: &str,
+        status: u16,
+        body: &Value,
+    ) -> Result<(), String>;
 
     /// Whether this store should also accept results produced by *streaming*
     /// backend calls. When `true`, the proxy aggregates a completed SSE
@@ -545,6 +555,10 @@ pub struct BackendBreaker {
     /// Consecutive connection-failure count (drives the escalating
     /// cooldown; reset by any success).
     pub failure_streak: u32,
+    /// `true` while the backend is operator-drained (taken out of rotation
+    /// via the runtime drain control; in-flight requests finish on it, no
+    /// new ones are assigned, and only an explicit resume re-joins it).
+    pub drained: bool,
 }
 
 /// Live state of one backend (the dashboard's backend table).
@@ -562,6 +576,13 @@ pub struct BackendStatus {
     pub cooldown_secs: f64,
     /// Consecutive connection-failure count (reset by any success).
     pub failure_streak: u32,
+    /// `true` while the backend is operator-drained (no new requests are
+    /// assigned to it until an explicit resume).
+    pub drained: bool,
+    /// The configured model id this backend serves (model-aware routing;
+    /// `None` when model routing is disabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 /// Snapshot of the proxy's live state, handed to a [`Dashboard`] plugin on

@@ -3,10 +3,14 @@
 //!
 //! [`ResultCache`] stores completed non-streaming backend results (a JSON
 //! response body plus its status code) on disk, one file per request KV
-//! cache key: `{dir}/{key}.json` with a `stored_at` timestamp. Entries
-//! expire after the configured TTL; expired entries are removed lazily on
-//! read (there is no background sweeper). Writes are atomic (temp file +
-//! rename), so a concurrent reader never sees a torn entry.
+//! cache key, named after the KV cache file convention:
+//! `{dir}/{lowercase(model_id)}_{key}.json` with a `stored_at` timestamp.
+//! Legacy bare `{key}.json` entries (written before the model prefix
+//! existed) are still read and migrated to the new name in place on first
+//! access. Entries expire after the configured TTL; expired entries are
+//! removed lazily on read (there is no background sweeper). Writes are
+//! atomic (temp file + rename), so a concurrent reader never sees a torn
+//! entry.
 //!
 //! [`CachedResultPrefilter`] is the prefilter side of the plugin: on a
 //! fresh (non-expired) cache hit for the request's hash key it answers the
@@ -29,8 +33,8 @@
 //! one-shot cache where each result is served at most once.
 //!
 //! Params:
-//! - `dir` (required): the cache-result path (dir holding the `{key}.json`
-//!   entries); created on first write.
+//! - `dir` (required): the cache-result path (dir holding the
+//!   `{lowercase(model_id)}_{key}.json` entries); created on first write.
 //! - `ttl_secs` (default `300`): per-entry expiry in seconds, `0` = entries
 //!   never expire.
 //! - `cleanup` (optional): `"remove_after_serve"` attaches the built-in
@@ -73,6 +77,15 @@ fn now_secs() -> f64 {
 /// Monotonic suffix for per-put temp files (unique within this process).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// The result-cache entry filename for `model_id` + `key`: the KV cache
+/// file naming convention (`{lowercase(model_id)}_{key}` — the same scheme
+/// `lpcache::hashing::kv_basename` uses for the backend's KV files) plus a
+/// `.json` extension, so both caches are addressed by the same visible
+/// model prefix.
+pub fn entry_name(model_id: &str, key: &str) -> String {
+    format!("{}_{key}.json", model_id.to_lowercase())
+}
+
 /// File-based cache of non-streaming backend results, keyed by the
 /// request's KV cache key (sha256 hex).
 pub struct ResultCache {
@@ -109,7 +122,8 @@ impl ResultCache {
         self.cache_streaming
     }
 
-    /// The cache-result path (directory holding the `{key}.json` entries).
+    /// The cache-result path (directory holding the
+    /// `{lowercase(model_id)}_{key}.json` entries).
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -119,17 +133,51 @@ impl ResultCache {
         self.ttl
     }
 
-    /// The file path for `key` (`{dir}/{key}.json`).
-    pub fn path_for(&self, key: &str) -> PathBuf {
+    /// The file path for the entry of `model_id` + `key`
+    /// (`{dir}/{lowercase(model_id)}_{key}.json`).
+    pub fn path_for(&self, model_id: &str, key: &str) -> PathBuf {
+        self.dir.join(entry_name(model_id, key))
+    }
+
+    /// The legacy (pre model-prefix) entry path for `key`
+    /// (`{dir}/{key}.json`).
+    fn legacy_path_for(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{key}.json"))
     }
 
-    /// Read the entry for `key`: `None` on a miss, an expired entry
-    /// (lazily removed), or a corrupt entry (lazily removed).
-    pub fn get(&self, key: &str) -> Option<(u16, Value)> {
-        let path = self.path_for(key);
-        let Ok(raw) = std::fs::read(&path) else {
-            return None;
+    /// Read the entry for `model_id` + `key`: `None` on a miss, an expired
+    /// entry (lazily removed), or a corrupt entry (lazily removed). A
+    /// legacy bare `{key}.json` entry is still served and migrated to the
+    /// new name in place (best effort — a concurrent request may have won
+    /// the rename race).
+    pub fn get(&self, model_id: &str, key: &str) -> Option<(u16, Value)> {
+        let path = self.path_for(model_id, key);
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            Err(_) => {
+                let legacy = self.legacy_path_for(key);
+                let Ok(raw) = std::fs::read(&legacy) else {
+                    return None;
+                };
+                match std::fs::rename(&legacy, &path) {
+                    Ok(()) => tracing::info!(
+                        "result_cache_migrated legacy={} -> {}",
+                        legacy.display(),
+                        path.display()
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // A concurrent request already migrated it.
+                    }
+                    Err(e) => {
+                        // Migration is best effort; the entry is still served.
+                        tracing::debug!(
+                            "result_cache_migrate_fail path={}: {e}",
+                            path.display()
+                        );
+                    }
+                }
+                raw
+            }
         };
         let Ok(entry) = serde_json::from_slice::<Entry>(&raw) else {
             // Corrupt entry: drop it so it is not served (or retried) again.
@@ -151,11 +199,17 @@ impl ResultCache {
         Some((entry.status, entry.body))
     }
 
-    /// Store (or refresh) the entry for `key`. The write is atomic: the
-    /// JSON is written to a temp file in the same directory and renamed
-    /// over `{key}.json`, so a concurrent reader sees either the old or
-    /// the new file, never a torn one.
-    pub fn put(&self, key: &str, status: u16, body: &Value) -> std::io::Result<()> {
+    /// Store (or refresh) the entry for `model_id` + `key`. The write is
+    /// atomic: the JSON is written to a temp file in the same directory and
+    /// renamed over the entry file, so a concurrent reader sees either the
+    /// old or the new file, never a torn one.
+    pub fn put(
+        &self,
+        model_id: &str,
+        key: &str,
+        status: u16,
+        body: &Value,
+    ) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let entry = Entry {
             status,
@@ -171,7 +225,7 @@ impl ResultCache {
             serde_json::to_vec(&entry)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
         );
-        if let Err(e) = result.and_then(|_| std::fs::rename(&tmp, self.path_for(key))) {
+        if let Err(e) = result.and_then(|_| std::fs::rename(&tmp, self.path_for(model_id, key))) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
@@ -187,9 +241,15 @@ impl ResultStore for ResultCache {
             .map_err(|e| format!("create {}: {e}", self.dir.display()))
     }
 
-    fn store(&self, key: &str, status: u16, body: &Value) -> Result<(), String> {
-        self.put(key, status, body)
-            .map_err(|e| format!("write {}: {e}", self.path_for(key).display()))
+    fn store(
+        &self,
+        model_id: &str,
+        key: &str,
+        status: u16,
+        body: &Value,
+    ) -> Result<(), String> {
+        self.put(model_id, key, status, body)
+            .map_err(|e| format!("write {}: {e}", self.path_for(model_id, key).display()))
     }
 
     fn caches_streaming(&self) -> bool {
@@ -331,7 +391,7 @@ impl Prefilter for CachedResultPrefilter {
         if req.stream && !self.cache.cache_streaming() {
             return PrefilterDecision::Accept;
         }
-        let Some((status, body)) = self.cache.get(&req.key) else {
+        let Some((status, body)) = self.cache.get(&req.backend_model_id, &req.key) else {
             return PrefilterDecision::Accept;
         };
         tracing::info!(
@@ -341,7 +401,11 @@ impl Prefilter for CachedResultPrefilter {
             self.cleanup.as_ref().map(|c| c.name()).unwrap_or("none")
         );
         if let Some(c) = &self.cleanup {
-            c.cleanup(&req.key, &self.cache.path_for(&req.key)).await;
+            c.cleanup(
+                &req.key,
+                &self.cache.path_for(&req.backend_model_id, &req.key),
+            )
+            .await;
         }
         PrefilterDecision::Serve { status, body }
     }
@@ -455,17 +519,19 @@ mod tests {
     fn put_get_roundtrip() {
         let td = tempfile::tempdir().unwrap();
         let cache = ResultCache::new(td.path().to_path_buf(), Duration::from_secs(60));
-        assert!(cache.get("nope").is_none());
+        assert!(cache.get("m", "nope").is_none());
         cache
-            .put("k1", 200, &json!({ "object": "chat.completion" }))
+            .put("m", "k1", 200, &json!({ "object": "chat.completion" }))
             .unwrap();
+        // the entry file follows the KV cache naming convention
+        assert!(td.path().join("m_k1.json").exists());
         assert_eq!(
-            cache.get("k1"),
+            cache.get("m", "k1"),
             Some((200, json!({ "object": "chat.completion" })))
         );
         // put overwrites (refreshes) an existing entry
-        cache.put("k1", 200, &json!({ "n": 2 })).unwrap();
-        assert_eq!(cache.get("k1"), Some((200, json!({ "n": 2 }))));
+        cache.put("m", "k1", 200, &json!({ "n": 2 })).unwrap();
+        assert_eq!(cache.get("m", "k1"), Some((200, json!({ "n": 2 }))));
         // no temp files left behind
         let leftovers: Vec<_> = std::fs::read_dir(td.path())
             .unwrap()
@@ -482,28 +548,28 @@ mod tests {
             td.path().to_path_buf(),
             Duration::from_secs(60),
         ));
-        cache.store("k1", 200, &json!({ "n": 1 })).unwrap();
-        assert_eq!(cache.store("k2", 200, &json!({ "n": 2 })), Ok(()));
+        cache.store("m", "k1", 200, &json!({ "n": 1 })).unwrap();
+        assert_eq!(cache.store("m", "k2", 200, &json!({ "n": 2 })), Ok(()));
     }
 
     #[test]
     fn expired_entry_misses_and_is_removed() {
         let td = tempfile::tempdir().unwrap();
         let cache = ResultCache::new(td.path().to_path_buf(), Duration::from_millis(50));
-        cache.put("k", 200, &json!({})).unwrap();
-        assert!(cache.get("k").is_some());
+        cache.put("m", "k", 200, &json!({})).unwrap();
+        assert!(cache.get("m", "k").is_some());
         std::thread::sleep(Duration::from_millis(60));
-        assert!(cache.get("k").is_none());
-        assert!(!cache.path_for("k").exists());
+        assert!(cache.get("m", "k").is_none());
+        assert!(!cache.path_for("m", "k").exists());
     }
 
     #[test]
     fn zero_ttl_never_expires() {
         let td = tempfile::tempdir().unwrap();
         let cache = ResultCache::new(td.path().to_path_buf(), Duration::ZERO);
-        cache.put("k", 200, &json!({ "x": 1 })).unwrap();
+        cache.put("m", "k", 200, &json!({ "x": 1 })).unwrap();
         std::thread::sleep(Duration::from_millis(10));
-        assert_eq!(cache.get("k"), Some((200, json!({ "x": 1 }))));
+        assert_eq!(cache.get("m", "k"), Some((200, json!({ "x": 1 }))));
     }
 
     #[test]
@@ -511,9 +577,56 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let cache = ResultCache::new(td.path().to_path_buf(), Duration::from_secs(60));
         std::fs::create_dir_all(td.path()).unwrap();
-        std::fs::write(cache.path_for("bad"), "not json").unwrap();
-        assert!(cache.get("bad").is_none());
-        assert!(!cache.path_for("bad").exists());
+        std::fs::write(cache.path_for("m", "bad"), "not json").unwrap();
+        assert!(cache.get("m", "bad").is_none());
+        assert!(!cache.path_for("m", "bad").exists());
+    }
+
+    #[test]
+    fn entry_name_follows_the_kv_convention() {
+        // The KV cache file scheme (`{lowercase(model_id)}_{key}`) plus the
+        // `.json` extension.
+        assert_eq!(entry_name("Llama-3.2-1B", "ab12"), "llama-3.2-1b_ab12.json");
+        assert_eq!(
+            entry_name("Llama-3.2-1B-v2", "ab12"),
+            "llama-3.2-1b-v2_ab12.json"
+        );
+        // The id is lowercased (case-insensitive prefix).
+        assert_eq!(entry_name("ABC", "k"), entry_name("abc", "k"));
+        // Different models, same key -> distinct files.
+        assert_ne!(entry_name("model-a", "k"), entry_name("model-b", "k"));
+    }
+
+    #[test]
+    fn legacy_bare_entry_is_served_and_migrated() {
+        let td = tempfile::tempdir().unwrap();
+        let cache = ResultCache::new(td.path().to_path_buf(), Duration::from_secs(60));
+        // Write an entry, then rename it to the pre-rename bare name.
+        cache.put("m", "k1", 200, &json!({ "n": 1 })).unwrap();
+        let new_path = cache.path_for("m", "k1");
+        let legacy_path = td.path().join("k1.json");
+        std::fs::rename(&new_path, &legacy_path).unwrap();
+        // The legacy entry is still served ...
+        assert_eq!(cache.get("m", "k1"), Some((200, json!({ "n": 1 }))));
+        // ... and the file now lives under the new name.
+        assert!(new_path.exists());
+        assert!(!legacy_path.exists());
+        // Still a hit after the migration.
+        assert_eq!(cache.get("m", "k1"), Some((200, json!({ "n": 1 }))));
+    }
+
+    #[test]
+    fn different_models_do_not_share_entries() {
+        let td = tempfile::tempdir().unwrap();
+        let cache = ResultCache::new(td.path().to_path_buf(), Duration::from_secs(60));
+        cache.put("model-a", "k", 200, &json!({ "m": "a" })).unwrap();
+        // The same key under another model: a miss (a different file).
+        assert!(cache.get("model-b", "k").is_none());
+        // The original entry is untouched under its own name.
+        assert_eq!(
+            cache.get("model-a", "k"),
+            Some((200, json!({ "m": "a" })))
+        );
     }
 
     #[tokio::test]
@@ -532,7 +645,7 @@ mod tests {
         );
         // store a result, then hit -> Serve with status + body
         cache
-            .put("k1", 200, &json!({ "object": "chat.completion" }))
+            .put("backend-model", "k1", 200, &json!({ "object": "chat.completion" }))
             .unwrap();
         assert_eq!(
             pf.check(&preq("k1", false)).await,
@@ -570,7 +683,7 @@ mod tests {
             Duration::from_secs(60),
         ));
         cache
-            .put("k1", 200, &json!({ "object": "chat.completion" }))
+            .put("backend-model", "k1", 200, &json!({ "object": "chat.completion" }))
             .unwrap();
         let pf = CachedResultPrefilter::new(Arc::clone(&cache)).with_cache_control(true);
         let no_cache = vec![("cache-control".to_string(), "no-cache".to_string())];
@@ -605,7 +718,7 @@ mod tests {
             td.path().to_path_buf(),
             Duration::from_secs(60),
         ));
-        cache.put("k1", 200, &json!({ "n": 1 })).unwrap();
+        cache.put("backend-model", "k1", 200, &json!({ "n": 1 })).unwrap();
         // Flag off (the default): `no-cache` requests are still served.
         let pf = CachedResultPrefilter::new(Arc::clone(&cache));
         assert!(!pf.cache_control());
@@ -632,7 +745,7 @@ mod tests {
             .expect("prefilter");
         pf.result_store()
             .expect("store")
-            .store("k1", 200, &json!({ "n": 1 }))
+            .store("backend-model", "k1", 200, &json!({ "n": 1 }))
             .unwrap();
         let no_cache = vec![("cache-control".to_string(), "no-cache".to_string())];
         assert_eq!(
@@ -660,7 +773,7 @@ mod tests {
             .result_store()
             .expect("result cache plugin exposes a store");
         // The store and the prefilter share one cache instance.
-        store.store("k1", 200, &json!({ "n": 1 })).unwrap();
+        store.store("backend-model", "k1", 200, &json!({ "n": 1 })).unwrap();
         assert_eq!(
             pf.check(&preq("k1", false)).await,
             PrefilterDecision::Serve {
@@ -677,7 +790,7 @@ mod tests {
             td.path().to_path_buf(),
             Duration::from_secs(60),
         ));
-        cache.put("k1", 200, &json!({})).unwrap();
+        cache.put("backend-model", "k1", 200, &json!({})).unwrap();
         let pf = CachedResultPrefilter::new(cache);
         // stream=true even with a fresh hit -> Accept (never served)
         assert_eq!(pf.check(&preq("k1", true)).await, PrefilterDecision::Accept);
@@ -692,6 +805,7 @@ mod tests {
         );
         cache
             .put(
+                "backend-model",
                 "k1",
                 200,
                 &json!({ "object": "chat.completion", "choices": [] }),
@@ -736,7 +850,7 @@ mod tests {
             td.path().to_path_buf(),
             Duration::from_millis(50),
         ));
-        cache.put("k1", 200, &json!({})).unwrap();
+        cache.put("backend-model", "k1", 200, &json!({})).unwrap();
         std::thread::sleep(Duration::from_millis(60));
         let pf = CachedResultPrefilter::new(cache);
         assert_eq!(
@@ -752,14 +866,14 @@ mod tests {
             Duration::from_secs(60),
         ));
         cache
-            .put("k1", 200, &json!({ "object": "chat.completion" }))
+            .put("backend-model", "k1", 200, &json!({ "object": "chat.completion" }))
             .unwrap();
         let pf =
             CachedResultPrefilter::new(Arc::clone(&cache)).with_cleanup(Arc::new(RemoveAfterServe));
         let d = pf.check(&preq("k1", false)).await;
         assert!(matches!(d, PrefilterDecision::Serve { status: 200, .. }));
         // served once: the file is gone, so the next request misses
-        assert!(!cache.path_for("k1").exists());
+        assert!(!cache.path_for("backend-model", "k1").exists());
         assert_eq!(
             pf.check(&preq("k1", false)).await,
             PrefilterDecision::Accept
@@ -797,7 +911,10 @@ mod tests {
             .expect("prefilter");
         assert_eq!(pf.name(), "result_cache");
         let store = pf.result_store().expect("exposes the store");
-        assert_eq!(store.store("k", 200, &json!({ "n": 1 })), Ok(()));
+        assert_eq!(
+            store.store("backend-model", "k", 200, &json!({ "n": 1 })),
+            Ok(())
+        );
     }
 
     #[test]

@@ -59,6 +59,12 @@ pub struct BackendEntry {
     pub slot_save_path: String,
     /// KV cache save/restore support (`false` for llama-server < 1.05.40).
     pub kv_cache: bool,
+    /// The model id this backend serves (`BACKENDS[].model_id`, `""` = none).
+    /// All-or-nothing across backends (see [`LpcacheConfig::validate`]):
+    /// when set on every backend, the proxy routes requests by the requested
+    /// `model` (unknown model → `404`) and names the KV cache files
+    /// `{lowercase(model_id)}_{key}`.
+    pub model_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +168,7 @@ impl Default for BackendEntry {
             n_slots: lpcache::config::DEFAULT_N_SLOTS,
             slot_save_path: String::new(),
             kv_cache: true,
+            model_id: String::new(),
         }
     }
 }
@@ -281,6 +288,32 @@ impl LpcacheConfig {
                 ));
             }
         }
+        // The per-backend model_id is all-or-nothing (a mixed set would
+        // leave backends that can never match a request — the proxy itself
+        // refuses to start with one).
+        let with_model: Vec<usize> = self
+            .backends
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !b.model_id.trim().is_empty())
+            .map(|(i, _)| i + 1)
+            .collect();
+        if !with_model.is_empty() && with_model.len() != self.backends.len() {
+            let missing: Vec<String> = (1..=self.backends.len())
+                .filter(|n| !with_model.contains(n))
+                .map(|n| n.to_string())
+                .collect();
+            errors.push(format!(
+                "backend model_id must be set on every backend or on none — \
+                 set on {}, missing on {}",
+                with_model
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                missing.join(", ")
+            ));
+        }
 
         if self.proxy.port == 0 {
             errors.push("proxy.port must be in 1..=65535".into());
@@ -369,7 +402,8 @@ impl LpcacheConfig {
     }
 
     /// The compact `BACKENDS` JSON array for this configuration (defaults
-    /// omitted: `slot_save_path` only when set, `kv_cache` only when false).
+    /// omitted: `slot_save_path` only when set, `kv_cache` only when false,
+    /// `model_id` only when set).
     pub fn backends_json(&self) -> String {
         let arr: Vec<serde_json::Value> = self
             .backends
@@ -384,6 +418,9 @@ impl LpcacheConfig {
                 }
                 if !be.kv_cache {
                     o["kv_cache"] = serde_json::json!(false);
+                }
+                if !be.model_id.trim().is_empty() {
+                    o["model_id"] = serde_json::json!(be.model_id.trim());
                 }
                 o
             })
@@ -645,11 +682,16 @@ impl LpcacheConfig {
             };
             let _ = writeln!(
                 s,
-                "  {}. {}  slots={}  kv_cache={}  slot_save_path={}",
+                "  {}. {}  slots={}  kv_cache={}  model_id={}  slot_save_path={}",
                 i + 1,
                 be.url,
                 be.n_slots,
                 be.kv_cache,
+                if be.model_id.trim().is_empty() {
+                    "(none)"
+                } else {
+                    be.model_id.as_str()
+                },
                 save
             );
         }
@@ -995,7 +1037,7 @@ mod tests {
         assert_eq!(get("N_SLOTS").as_deref(), Some("1"));
         assert_eq!(get("SLOT_SAVE_PATH").as_deref(), Some("kvcache"));
         assert_eq!(get("LLAMA_API_KEY").as_deref(), Some("sekret"));
-        assert_eq!(get("SLOT_ROUTING_POLICY").as_deref(), Some("lru"));
+        assert_eq!(get("SLOT_ROUTING_POLICY").as_deref(), Some("key_affinity"));
         assert_eq!(get("PREFILTER_BLOCKLIST").as_deref(), Some("bad"));
         assert!(get("BACKENDS").is_none());
         assert!(get("REQUEST_LOG").is_none());
@@ -1019,6 +1061,7 @@ mod tests {
             n_slots: 2,
             slot_save_path: "/data/kv2".into(),
             kv_cache: false,
+            model_id: String::new(),
         });
         let pairs = cfg.env_pairs();
         let get = |k: &str| {
@@ -1066,7 +1109,68 @@ mod tests {
         assert!(args.contains(&"--port 8081".to_string()));
         assert!(args.contains(&"--llama-url http://127.0.0.1:8000".to_string()));
         assert!(args.contains(&"--coalesce-requests false".to_string()));
-        assert!(args.contains(&"--slot-routing-policy lru".to_string()));
+        assert!(args.contains(&"--slot-routing-policy key_affinity".to_string()));
         assert!(!args.iter().any(|a| a.starts_with("--request-log ")));
+    }
+
+    #[test]
+    fn backend_model_id_all_or_nothing() {
+        // none set -> valid (legacy mode)
+        let mut cfg = LpcacheConfig::default();
+        cfg.backends.push(BackendEntry::default());
+        let (errors, _) = cfg.validate();
+        assert!(errors.is_empty(), "unset everywhere is legacy: {errors:?}");
+
+        // all set -> valid
+        let mut cfg = LpcacheConfig::default();
+        cfg.backends[0].model_id = "m1".into();
+        let be2 = BackendEntry {
+            model_id: "m2".into(),
+            ..Default::default()
+        };
+        cfg.backends.push(be2);
+        let (errors, _) = cfg.validate();
+        assert!(errors.is_empty(), "set everywhere is enabled: {errors:?}");
+
+        // mixed -> error naming the missing backend
+        let mut cfg = LpcacheConfig::default();
+        cfg.backends[0].model_id = "m1".into();
+        cfg.backends.push(BackendEntry::default());
+        let (errors, _) = cfg.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("model_id") && e.contains("missing on 2")),
+            "{errors:?}"
+        );
+
+        // blank counts as unset
+        let mut cfg = LpcacheConfig::default();
+        cfg.backends[0].model_id = "m1".into();
+        cfg.backends.push(BackendEntry {
+            model_id: "   ".into(),
+            ..Default::default()
+        });
+        let (errors, _) = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("model_id")), "{errors:?}");
+    }
+
+    #[test]
+    fn backends_json_includes_model_id_when_set() {
+        let mut cfg = LpcacheConfig::default();
+        let json = cfg.backends_json();
+        assert!(!json.contains("model_id"), "default (empty) must be omitted: {json}");
+        cfg.backends[0].model_id = "Llama-3.2-1B".into();
+        let json = cfg.backends_json();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v[0]["model_id"], "Llama-3.2-1B");
+    }
+
+    #[test]
+    fn show_lists_backend_model_id() {
+        let mut cfg = LpcacheConfig::default();
+        let s = cfg.show("test");
+        assert!(s.contains("model_id=(none)"), "{s}");
+        cfg.backends[0].model_id = "m1".into();
+        let s = cfg.show("test");
+        assert!(s.contains("model_id=m1"), "{s}");
     }
 }

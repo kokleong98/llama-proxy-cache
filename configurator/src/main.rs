@@ -166,14 +166,20 @@ log_level = "INFO"
 request_timeout_secs = 600
 stream_queue_size = 16
 coalesce_requests = false
-slot_routing_policy = "lru"
+slot_routing_policy = "key_affinity"
 api_key = ""
 
 # One entry per llama-server backend; the url/port must match the
 # backend's --host/--port, n_slots its -np/--parallel.
+# model_id (optional, all-or-nothing across backends): the model this
+# backend serves — set it on every backend to enable model-aware routing
+# (unknown request models get a 404, KV files are named
+# {lowercase(model_id)}_{key}); leave it empty on all backends for the
+# legacy behaviour.
 [[backend]]
 url = "http://127.0.0.1:8000"
 n_slots = 1
+model_id = ""
 slot_save_path = ""
 kv_cache = true
 

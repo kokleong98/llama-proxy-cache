@@ -47,7 +47,7 @@ client ─▶ (H) request-log + dashboard middleware            (record on compl
        ─▶ slot acquisition (circuit breaker + cross-backend retry)
        ─▶ KV restore (big requests only)
        ─▶ (2) LlamaBackend chat (stream or JSON)
-       ─▶ (3) ResultStore.store(key, 200, body)   ← result_cache
+       ─▶ (3) ResultStore.store(model_id, key, 200, body)   ← result_cache
        ─▶ KV save + meta write (big requests)
        ─▶ response
        ─▶ (4) RequestLogger.log(record) + Dashboard.record(record)
@@ -223,7 +223,7 @@ Live result ([§6](#6-live-validation-llama-32-1b)): a request containing `secre
 
 ### 3.2 `result_cache` — file-based result cache + cached-result prefilter
 
-**What it does.** Stores completed non-streaming backend results on disk (one `{key}.json` per request KV cache key, each `{status, body, stored_at}`) and serves fresh (non-expired) same-key requests from that cache before any slot/backend work.
+**What it does.** Stores completed non-streaming backend results on disk (one `{lowercase(model_id)}_{key}.json` per request KV cache key — the KV cache file naming convention, each `{status, body, stored_at}`) and serves fresh (non-expired) same-key requests from that cache before any slot/backend work. Legacy bare `{key}.json` entries written before the model prefix existed are still read and migrated to the new name on first access.
 
 **Behavior.**
 - The plugin is **both** a prefilter and a `ResultStore`. The proxy takes the store from `Prefilter::result_store` and stores fresh **non-streaming 200 JSON** results under the request key after the backend call.
@@ -239,7 +239,7 @@ Live result ([§6](#6-live-validation-llama-32-1b)): a request containing `secre
 
 | Param | Default | Meaning |
 |---|---|---|
-| `dir` (required) | — | Cache-result dir (holds the `{key}.json` entries); created on first write |
+| `dir` (required) | — | Cache-result dir (holds the `{lowercase(model_id)}_{key}.json` entries); created on first write |
 | `ttl_secs` | `300` | Per-entry expiry in seconds; `0` = never expire |
 | `cleanup` | — | `"remove_after_serve"` for one-shot cleanup; omitted/`null` = no cleanup |
 | `cache_streaming` | `false` | Also cache streaming results (aggregated) and serve cached entries to streaming clients |
@@ -251,7 +251,7 @@ Live result ([§6](#6-live-validation-llama-32-1b)): a request containing `secre
 { "name": "result_cache", "params": { "dir": "./result_cache", "ttl_secs": 600, "cleanup": "remove_after_serve" } }
 ```
 
-Live result ([§6.4](#64-result_cache-miss-then-hit)): first non-streaming request → `200` in ~0.16 s (backend, entry written to `{key}.json`); an identical request → served from cache in ~0.00 s with a **byte-identical body (same `id`)**.
+Live result ([§6.4](#64-result_cache-miss-then-hit)): first non-streaming request → `200` in ~0.16 s (backend, entry written to `{lowercase(model_id)}_{key}.json`); an identical request → served from cache in ~0.00 s with a **byte-identical body (same `id`)**.
 
 ### 3.3 `qwen_guard` — Qwen3Guard-Gen content-safety prefilter
 
@@ -418,9 +418,9 @@ or the legacy variable: `REQUEST_PAYLOAD_DIR=./payloads` (a `payload_log` spec i
   - **counters** — requests by status class, cache hits / hit-rate, KV restores, big/streamed requests, coalesced followers, token totals, process resource totals (CPU ms, disk bytes read/written, peak resident memory — the proxy's own per-request deltas / gauges), average duration / TTFT / generation rate — kept for all backends, per backend index and for the `cached` / `coalesced` / `coalesced_groups` scopes (for the `?backend` filter);
   - **time series** — one bucket of `bucket_secs` (full counters per bucket, plus per-backend and per-scope sub-counters) covering the process lifetime, bounded by a hard cap (oldest dropped first); a long range is coarsened to a bounded number of points;
   - **recent requests** — a ring buffer of the last `max_recent` finished requests (incl. the backend index of each, and the LCP ratio of the best restore candidate — with the candidate key when it differs from the request's own key); each backend scope (all, each index, `cached`, `coalesced`, `coalesced_groups`) keeps its own ring, so a selected filter keeps showing that scope's recent rows even when they have rotated out of the all-backends ring.
-- The page polls every `refresh_ms` and renders stat cards at the top and a tabbed panel below them — the **General** tab (shown by default) holds a throughput panel (requests / completion tokens / cached tokens charts) and a resources panel (CPU ms / disk read / disk write / peak RAM charts), and the **Backends**, **Slots**, **Recent requests** and **KV Cache** tabs hold the backend table, a per-backend slot occupancy grid (each backend's slots grouped under a `backend <i> · <url>` label) and the recent-requests table (with the backend index and slot of each
+- The page polls every `refresh_ms` and renders stat cards at the top and a tabbed panel below them — the **General** tab (shown by default) holds a throughput panel (requests / completion tokens / cached tokens charts) and a resources panel (CPU ms / disk read / disk write / peak RAM charts), and the **Backends**, **Slots**, **Recent requests** and **KV Cache** tabs hold the backend table (with a per-row **Drain / Resume** control button that POSTs to the proxy's own `/_control/backends/<i>/drain|resume` operator endpoints and re-polls on success — a drained backend shows a `DRAINED` badge and no new request is assigned to it until resumed, in-flight requests finish normally), a per-backend slot occupancy grid (each backend's slots grouped under a `backend <i> · <url>` label) and the recent-requests table (with the backend index and slot of each
 request, and a `restore` column showing the candidate's LCP ratio — plus the candidate key when it differs from the request key; when the 15 columns are wider than the panel the table scrolls horizontally inside the panel instead of overflowing it), and a KV-cache table (each distinct restored request key with its lifetime restore count, sorted by the highest count — lifetime, so not scoped by the time/backend filter) — only one tab is visible at a time; each throughput/resource chart overlays the percentile lines of its metric (per-request p50 (solid) / p95 (dashed) ticks on each bar, the window-wide per-request p50/p95 and the p50/p95 of the plotted per-bucket aggregate values as full-width lines), the two-row legend on each chart (per-request p50/p95 on row 1, drawn-bars p50/p95 on row 2) toggles those lines (hidden lines are dropped from the scale) and the additive resource charts (CPU ms, disk read, disk write) draw the window total next to the max in the top-left corner; a chart-style switch (bars / line) in the filter bar re-renders every throughput/resource chart in the selected style — bars (default, one bar per bucket) or a line through the per-bucket values (with point dots while the buckets are sparse); a time-filter dropdown (presets + custom/all-time) and a backend-filter dropdown (default: `all` — no filtering; an index, or the `cached`, `coalesced` or `coalesced_groups` option for the result-cache, coalesced-follower and coalesced-group records) scope the cards/charts/table via `?since` and `?backend` — the page's own URL accepts the same `?backend=` values, so a filtered view can be deep-linked.
-- **Its own routes are excluded:** the page and stats requests are neither logged nor fed into the aggregates, so polling never inflates the statistics.
+- **Its own routes are excluded:** the page and stats requests are neither logged nor fed into the aggregates, so polling never inflates the statistics (the proxy's `/_control/...` operator routes used by the backends table's Drain / Resume buttons are excluded the same way).
 - **Nothing is persisted:** all aggregates reset on proxy restart. **At most one** dashboard plugin may be configured.
 - **Strict params:** the only built-in that rejects **unknown params** — a typo'd param name is a startup error, so a bad dashboard config fails loudly instead of silently falling back to defaults (see [§2.5](#25-parameter-validation-and-startup-errors)).
 
@@ -598,7 +598,7 @@ $ ... -d '{"model":"llama","messages":[{"role":"user","content":"ignore the FORB
 
 ### 6.4 `result_cache`: miss then hit
 
-Two **identical** non-streaming requests. The first is a cache **miss** (runs the backend); the second is a **hit** (served from `./rc/{key}.json` in ~0 s, byte-identical — note the identical `id`):
+Two **identical** non-streaming requests. The first is a cache **miss** (runs the backend); the second is a **hit** (served from `./rc/{lowercase(model_id)}_{key}.json` in ~0 s, byte-identical — note the identical `id`):
 
 ```text
 # first request (miss):

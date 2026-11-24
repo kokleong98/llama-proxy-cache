@@ -1,21 +1,21 @@
-# 3. Hashing, meta files, pruning — `src/hashing.rs` (19)
+# 3. Hashing, meta files, pruning — `src/hashing.rs` (24)
 
 [← Suite index](README.md)
 
 Part of the [lpcache regression test cases](README.md): every entry maps
-1:1 to a test function; the full suite (302 tests) runs with
+1:1 to a test function; the full suite (359 tests) runs with
 `cargo test --workspace`.
 
 ## Module overview
 
-- **Target:** `lpcache` library — the `mod tests` at the bottom of [`src/hashing.rs`](../src/hashing.rs); 19 tests, all synchronous `#[test]`.
+- **Target:** `lpcache` library — the `mod tests` at the bottom of [`src/hashing.rs`](../src/hashing.rs); 24 tests, all synchronous `#[test]`.
 - **Fixtures & helpers:** `serde_json::json!` message vectors; `tempfile` dirs for the meta I/O tests; hand-written meta files with shuffled timestamps for the pruning tests.
-- **Surface under test:** raw-prefix construction (`raw_prefix`), word tokenization (`words_from_text`), block hashing (`block_hashes_from_text`, `prefix_key_sha256` / SHA-256), LCP, meta file I/O (`write_meta`, `scan_all_meta`), restore-candidate selection (`find_best_restore_candidate`, `touch_meta`) and LRU pruning (`prune_meta`).
+- **Surface under test:** raw-prefix construction (`raw_prefix`), word tokenization (`words_from_text`), block hashing (`block_hashes_from_text`, `prefix_key_sha256` / SHA-256), LCP, meta file I/O (`write_meta`, `scan_all_meta`), restore-candidate selection (`find_best_restore_candidate`, `touch_meta`), LRU pruning (`prune_meta`) and startup corrupt-meta cleanup (`clean_corrupt_meta`).
 
 ## How to run
 
 ```sh
-cargo test --lib hashing::tests                  # all 19 hashing/meta/pruning tests
+cargo test --lib hashing::tests                  # all 24 hashing/meta/pruning tests
 cargo test --lib hashing::tests::meta_roundtrip  # one test, exact path
 cargo test --lib meta_roundtrip                  # one test, name substring
 ```
@@ -44,6 +44,9 @@ into `cargo test` as shown above.
 | 17 | `hashing::tests::prune_meta_removes_oldest_beyond_limit` | sync | [L526](../src/hashing.rs#L526) | 5 metas, max 3, shuffled timestamps | 2 oldest (by ts, not name) removed, oldest first; second prune is a no-op |
 | 18 | `hashing::tests::prune_meta_noop_under_limit_and_zero_max` | sync | [L552](../src/hashing.rs#L552) | under limit / `max=0` / missing dir | nothing pruned, no error |
 | 19 | `hashing::tests::prune_meta_corrupt_file_pruned_first` | sync | [L564](../src/hashing.rs#L564) | unparseable meta among healthy ones | treated as oldest, removed first |
+| 20 | `hashing::tests::clean_corrupt_meta_removes_bad_keeps_good` | sync | [L679](../src/hashing.rs#L679) | healthy meta + non-JSON + wrong-schema meta + non-meta file | only the 2 corrupt metas removed (their keys returned); healthy meta + `notes.txt` kept; second scan is a no-op |
+| 21 | `hashing::tests::clean_corrupt_meta_missing_and_empty_dir_noop` | sync | [L699](../src/hashing.rs#L699) | empty dir / missing dir | empty result, no error |
+| 22 | `hashing::tests::clean_corrupt_meta_directory_named_like_meta_is_left_alone` | sync | [L708](../src/hashing.rs#L708) | a *directory* named `d.meta.json` | warned about, not counted or removed |
 
 ## Coverage map — surface → tests
 
@@ -55,3 +58,4 @@ into `cargo test` as shown above.
 | Meta file I/O | `meta_roundtrip`, `scan_skips_corrupt_and_wrong_extension`, `scan_missing_dir_returns_empty` |
 | Restore-candidate selection | `find_best_restore_candidate_filters_and_thresholds`, `find_best_prefers_highest_ratio`, `touch_meta_updates_timestamp` |
 | LRU pruning | `prune_meta_removes_oldest_beyond_limit`, `prune_meta_noop_under_limit_and_zero_max`, `prune_meta_corrupt_file_pruned_first` |
+| Startup corrupt-meta cleanup | `clean_corrupt_meta_removes_bad_keeps_good`, `clean_corrupt_meta_missing_and_empty_dir_noop`, `clean_corrupt_meta_directory_named_like_meta_is_left_alone` |

@@ -134,6 +134,12 @@ index files. A configured directory that is missing at startup logs a
 `slot_save_path … does not exist` warning — KV-file pruning is skipped
 there until the directory exists.
 
+At startup the proxy also scans `META_DIR` and removes corrupt
+(unreadable / schema-invalid) `.meta.json` files, so a crash-damaged cache
+dir self-heals before the first request. Their orphan KV files are removed
+only with `STARTUP_CLEANUP_KV=true` (otherwise they are left in place and
+the removal is noted in the log).
+
 **Multi-backend safety:** give every `llama-server` its **own**
 `--slot-save-path` directory (e.g. `/var/kv/be0`, `/var/kv/be1`). Several
 llama.cpp processes sharing one directory write/rewrite the same KV
@@ -144,11 +150,46 @@ circuit breaker (5 s, escalating 10 s / 20 s / 40 s / 60 s on repeated
 failures), the failing request is retried once on another backend, and
 the proxy keeps serving on the remaining backends. Cooling backends are
 probed every second, so a restarted backend rejoins within about a second
-of coming back up. Per-instance directories
+of coming back up. For a planned restart, the [runtime drain control
+(4.2.2)](#422-runtime-drain-control-restarting-one-backend) is the
+cleaner path: drain the backend first so no new request is picked for it
+while it is down. Per-instance directories
 are the safe setup. The meta index (`META_DIR`) is shared, so a restore
 candidate may point at a KV file that only exists in another backend's
 directory; in that case the restore fails and the request proceeds with
 a full prefill (no data loss, just a slower request).
+
+### 4.2.1 Model-aware routing (optional)
+
+When the backends serve **different models**, give each `BACKENDS` entry
+the model it serves:
+
+```bash
+BACKENDS='[
+  {"url":"http://127.0.0.1:8000","n_slots":1,"slot_save_path":"/var/kv/be0","model_id":"Llama-3.2-1B"},
+  {"url":"http://127.0.0.1:8001","n_slots":1,"slot_save_path":"/var/kv/be1","model_id":"Qwen2.5-0.5B"}
+]' \
+PORT=8081 \
+META_DIR=/var/kv_meta \
+./target/release/lpcache
+```
+
+`model_id` is **all-or-nothing**: set on every backend or on none — a
+mixed set is a startup error (the message names the offending entries).
+Once enabled:
+
+- the request's `model` must match a configured id (case-insensitive) or
+  the request is rejected with `404 model not found: <model> (available:
+  …)` — no slot or backend work happens;
+- requests only run on matching backends (a down backend cannot be
+  "covered" by another model's backend);
+- `GET /v1/models` advertises the configured ids instead of `MODEL_ID`;
+- the cache key includes the requested model, and KV files are stored as
+  `{lowercase(model_id)}_{key}` — two models sharing a
+  `--slot-save-path` dir can no longer collide;
+- the proxy logs `model_routing_enabled models=[…]` at startup.
+
+Without any `model_id` (the default) behaviour is exactly as before.
 
 Expected startup logs:
 
@@ -160,11 +201,51 @@ app_start version=0.9.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
 
+### 4.2.2 Runtime drain control (restarting one backend)
+
+Two operator endpoints are always mounted (no configuration — assume a
+trusted network, like the rest of the proxy's surface):
+
+- `POST http://<proxy-host>:<port>/_control/backends/<i>/drain`
+- `POST http://<proxy-host>:<port>/_control/backends/<i>/resume`
+
+(`i` is the backend's index in `BACKENDS`.) **Drain** takes backend `i`
+out of rotation at runtime: no new request is assigned to it —
+unconditionally, so even the all-down fail-open path never routes into
+it — while requests already in flight on its slots finish normally.
+**Resume** clears the drain and re-joins the backend with the same
+health check the background probe loop uses (one `GET /v1/models`): if
+it answers, the backend is eligible immediately; if it does not (still
+starting up), it stays out and the 1 s probe loop keeps checking until
+it does. Both answer with the backend's updated state (`drained`,
+`down`, `cooldown_secs`, `failure_streak`; resume adds `rejoined`) and
+`404` when `i` is out of range. With dashboard enabled, the Backends
+tab offers the same as buttons per row (a drained row shows a
+`DRAINED` badge; the button flips between **Drain** and **Resume**).
+
+Typical runbook for restarting one `llama-server` in a multi-backend
+pool (faster and cleaner than letting the circuit breaker notice the
+dead backend on its own):
+
+```sh
+# 1. take backend 1 out of rotation (in-flight requests finish normally)
+curl -X POST http://localhost:8081/_control/backends/1/drain
+# 2. restart that llama-server
+# 3. re-join it (re-joins as soon as it answers /v1/models;
+#    if it is still starting up, the 1 s probe loop keeps checking)
+curl -X POST http://localhost:8081/_control/backends/1/resume
+```
+
+With **every** backend drained, chat requests fail fast with
+`503 all slots busy, please retry later` (no slot is eligible — the
+acquire fails immediately instead of waiting out the 300 s timeout);
+resume at least one backend to restore service.
+
 ### 4.3 Configuration reference
 
 | Variable              | Default                    | Meaning                                             |
 |-----------------------|----------------------------|-----------------------------------------------------|
-| `BACKENDS`            | —                          | JSON array `[{"url":"...","n_slots":N,"slot_save_path":"...","kv_cache":true}, ...]`; per-backend `slot_save_path` (the KV-file pruning dir) and `kv_cache` (default `true`) are optional — a backend with `kv_cache: false` (no slot save/restore support) never saves/restores KV and gets no meta file for requests it serves |
+| `BACKENDS`            | —                          | JSON array `{"url":"...","n_slots":N,"slot_save_path":"...","kv_cache":true,"model_id":"..."}`; per-backend `slot_save_path` (the KV-file pruning dir), `kv_cache` (default `true`) and `model_id` (model-aware routing — all-or-nothing, see [4.2.1](#421-model-aware-routing-optional)) are optional |
 | `LLAMA_URL`           | `http://127.0.0.1:8000`    | single-backend fallback when `BACKENDS` is unset    |
 | `N_SLOTS`             | `1`                        | slot count for the fallback backend                 |
 | `WORDS_PER_BLOCK`     | `100`                      | words per hash block (must be stable — it is part of the restore filter) |
@@ -173,6 +254,7 @@ listening on 0.0.0.0:8081
 | `SKIP_SAVE_ON_SELF_RESTORE` | `true`             | skip the post-request KV save when the request successfully restored its own key (a cold restore's 200 proved the KV file's presence; a warm "already running" no-op restore skips while the key's meta file is still on disk, and re-saves to heal it when the meta is gone); a ratio-1.0 *prefix* match (multi-turn extension) is not a self-restore and still saves |
 | `META_DIR`            | `./kv_meta` (relative to CWD) | where `<key>.meta.json` files live — use an absolute path |
 | `META_MAX`            | `10`                        | max meta files kept; oldest are pruned (with their KV files) after each save — 0 disables pruning |
+| `STARTUP_CLEANUP_KV`  | `false`                     | the startup scan of `META_DIR` also removes the orphan KV files of removed corrupt metas (the corrupt `.meta.json` files themselves are always removed) |
 | `SLOT_SAVE_PATH`      | —                            | the backend's `--slot-save-path` dir (single-backend fallback); where pruned KV files are removed from |
 | `REQUEST_TIMEOUT`     | `600` (s)                  | per-request timeout to the backend                  |
 | `MODEL_ID`            | `llama.cpp`                | id advertised by `/v1/models` and used as the default `model` field |
@@ -185,7 +267,7 @@ listening on 0.0.0.0:8081
 | `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables) and `dashboard` (the real-time statistics web page, at most one). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
 | `PREFILTER_BLOCKLIST` | —                          | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
 | `PREFILTER_CASE_INSENSITIVE` | `true`              | **legacy**: keyword matching is case-insensitive (set `false` for exact-case) |
-| `PREFILTER_RESULT_CACHE_DIR` | —                   | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): the **cache-result path**; when set, fresh same-key non-streaming requests are answered from a cached backend result (`{dir}/{key}.json`) before any slot/backend work — streaming requests always bypass the cache; unset/blank = disabled |
+| `PREFILTER_RESULT_CACHE_DIR` | —                   | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): the **cache-result path**; when set, fresh same-key non-streaming requests are answered from a cached backend result (`{dir}/{lowercase(model_id)}_{key}.json`) before any slot/backend work — streaming requests always bypass the cache; unset/blank = disabled |
 | `PREFILTER_RESULT_CACHE_TTL` | `300`               | per-entry result-cache expiry in seconds (`0` = entries never expire) |
 | `SAVE_RETRIES`          | `3`                        | retries after a failed KV cache save (backend 500 or other error); `0` = no retry |
 | `SAVE_RETRY_DELAY_MS`   | `1000` (ms)                | delay between KV cache save retry attempts |
@@ -210,6 +292,7 @@ built-in defaults. `--help` prints the full list with defaults:
 | `--skip-save-on-self-restore <BOOL>` | `SKIP_SAVE_ON_SELF_RESTORE` |
 | `--meta-dir <PATH>`           | `META_DIR`          |
 | `--meta-max <N>`              | `META_MAX`          |
+| `--startup-cleanup-kv <BOOL>` | `STARTUP_CLEANUP_KV`|
 | `--slot-save-path <PATH>`     | `SLOT_SAVE_PATH`    |
 | `--request-timeout <SECS>`    | `REQUEST_TIMEOUT`   |
 | `--model-id <ID>`             | `MODEL_ID`          |
@@ -280,7 +363,7 @@ single entry via its `filters` param):
   closed. Logs `prefilter_reject filter=qwen_guard`.
 - **Result cache** (`result_cache`) — answers a fresh (non-expired)
   same-key request with a previously cached backend result (the original
-  JSON body and status code), read from `{dir}/{key}.json`. Fresh
+  JSON body and status code), read from `{dir}/{lowercase(model_id)}_{key}.json`. Fresh
   non-streaming results are stored there after the backend call;
   **streaming requests are never served from the cache by default** and
   always fall through to the backend — set the plugin's `cache_streaming`
@@ -401,7 +484,9 @@ every `refresh_ms`
   the additive resource charts (CPU ms, disk read, disk write) also draw
   the window total next to the max in the top-left corner.
 - **Tables** (in the **Backends**, **Slots**, **Recent requests** and **KV Cache** tabs): per-backend status (URL, slots, busy slots, circuit
-  breaker state), per-slot occupancy grid, a per-key KV table
+  breaker state, and a **Drain / Resume** action column per row — see
+  [4.2.2](#422-runtime-drain-control-restarting-one-backend); a drained
+  backend shows a `DRAINED` badge), per-slot occupancy grid, a per-key KV table
   (each distinct restored or saved key with its restore count and the
   cumulative duration in ms of the restore and save API calls made for
   that key, sorted by the highest restore count — lifetime, so not scoped
@@ -578,7 +663,10 @@ journalctl -u lpcache -f
   10) and prunes the oldest after each save; set it lower to bound disk
   use (each KV file can be hundreds of MB). To also prune the KV files,
   set each backend's `slot_save_path` / `SLOT_SAVE_PATH`. Candidate scan
-  cost is O(meta files), so a smaller bound is also faster.
+  cost is O(meta files), so a smaller bound is also faster. Corrupt meta
+  files are removed at startup; with `STARTUP_CLEANUP_KV=true` the orphan
+  KV files of the removed metas are removed as well (otherwise they stay
+  on disk).
 - **`WORDS_PER_BLOCK`** — changing it orphans existing caches (the restore
   filter skips mismatching `wpb`); only change it before caches are needed.
 - **`PLUGINS`** — the general extension point: select and chain
@@ -608,6 +696,7 @@ journalctl -u lpcache -f
 | Symptom | Cause / fix |
 |---|---|
 | `503 all slots busy, please retry later` | All slots locked for > 300 s — a client is stuck mid-stream, or `n_slots` exceeds the real `-np`. Check the `llama-server` logs. |
+| `503 all slots busy, please retry later` with a `DRAINED` row in the dashboard's Backends tab | You drained the backend(s) (runtime drain control, §4.2.2) and no non-drained backend has an eligible slot. Resume the backend(s) (`POST /_control/backends/<i>/resume` or the **Resume** button) — if it is still starting up, it re-joins as soon as the 1 s probe sees it answer `/v1/models`. |
 | `backend_down be=N` / `chat_error` warnings (usually no client-visible errors) | Backend N became unreachable (crash, OOM, restart). The proxy skips it for 5 s (circuit breaker; 10/20/40/60 s on repeated failures), transparently retries the failing request once on another backend, and probes it every second — a recovered backend rejoins within ~1 s (`backend_up be=N`). A 500 is only returned when no other backend could serve the request. Check that backend's log / restart it. |
 | `save_slot_500` warnings, restore never happens | llama.cpp started without `--slot-save-path`, or an old build without the slot save/restore API. |
 | `restore_before_chat ... ok=false` | The KV `.bin` for that key is missing from `--slot-save-path` (deleted, or a different server/build). The request proceeds without the restore. When the backend *rejects* the restore (HTTP 400) and the KV file is absent from **every** configured slot-save dir, the proxy also removes the stale meta entry (`stale_meta_removed` in the proxy log) so later requests stop retrying the doomed restore; if the file still exists somewhere (or the dir isn't visible from the proxy's host), the meta is kept. |

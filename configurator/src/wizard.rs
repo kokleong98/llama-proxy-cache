@@ -217,7 +217,7 @@ fn prompt_key(cfg: &mut LpcacheConfig, key: &str) -> Result<bool, String> {
             None => return Ok(false), // Esc keeps the current value
         }
     } else if key == "proxy.slot_routing_policy" {
-        let policies = ["lru", "key_affinity"];
+        let policies = ["key_affinity", "lru"];
         let def = policies
             .iter()
             .position(|p| p.eq_ignore_ascii_case(&cur))
@@ -264,12 +264,17 @@ fn prompt_key(cfg: &mut LpcacheConfig, key: &str) -> Result<bool, String> {
 /// Show one backend the way the menu lists it.
 fn format_backend(i: usize, b: &BackendEntry) -> String {
     let save = if b.slot_save_path.trim().is_empty() {
-        "save:none"
+        "save:none".to_string()
     } else {
-        b.slot_save_path.as_str()
+        format!("save:{}", b.slot_save_path)
+    };
+    let model = if b.model_id.trim().is_empty() {
+        "model:none".to_string()
+    } else {
+        format!("model:{}", b.model_id.trim())
     };
     format!(
-        "edit {}: {} — {} slot(s), kv {}, {save}",
+        "edit {}: {} — {} slot(s), kv {}, {model}, {save}",
         i + 1,
         b.url,
         b.n_slots,
@@ -302,6 +307,12 @@ fn prompt_backend(be: &BackendEntry) -> Result<BackendEntry, String> {
                 .map_err(|_| "not a non-negative integer".to_string())
         },
     )?;
+    let model = prompt_text(
+        "model_id — the model this backend serves (empty = no model routing)",
+        &be.model_id,
+        true,
+        |_| Ok(()),
+    )?;
     let save = prompt_text(
         "slot_save_path — the backend's --slot-save-path (empty = none)",
         &be.slot_save_path,
@@ -321,6 +332,7 @@ fn prompt_backend(be: &BackendEntry) -> Result<BackendEntry, String> {
             .map_err(|_| "wizard: bad slot count".to_string())?,
         slot_save_path: save,
         kv_cache: kv,
+        model_id: model.trim().to_string(),
     })
 }
 
@@ -972,12 +984,22 @@ mod tests {
             n_slots: 4,
             slot_save_path: String::new(),
             kv_cache: false,
+            model_id: String::new(),
         };
         let s = format_backend(0, &be);
         assert!(s.starts_with("edit 1: http://h:8000"));
         assert!(s.contains("4 slot(s)"));
         assert!(s.contains("kv off"));
+        assert!(s.contains("model:none"));
         assert!(s.contains("save:none"));
+        let be = BackendEntry {
+            model_id: "Llama-3.2-1B".into(),
+            slot_save_path: "/data/kv".into(),
+            ..be
+        };
+        let s = format_backend(1, &be);
+        assert!(s.contains("model:Llama-3.2-1B"));
+        assert!(s.contains("save:/data/kv"));
     }
 
     #[test]
