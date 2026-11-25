@@ -8,6 +8,11 @@ It speaks OpenAI's `/v1/chat/completions` API and transparently manages
 llama.cpp's slot KV caches so that long, similar prompts don't pay the
 full prefill cost every time.
 
+> 📚 **Documentation.** [Use cases](docs/use-cases.md) ·
+> [Architecture](docs/architecture.md) ·
+> [Setup Guide](docs/setup-guide.md) ·
+> [Configurator Guide](docs/configurator-guide.md)
+
 ## How it works
 
 1. **Request prefilter** (optional) — when a prefilter plugin is
@@ -397,51 +402,61 @@ PLUGINS='[{"name":"dashboard","params":{"path":"/dashboard","refresh_ms":1000}}]
 
 ### Live dashboard — 4 backends, 8 slots, one shared KV folder (Sample)
 
-The five screenshots below come from a single live run against real
-`llama-server` processes (not mocks or fixtures). The topology:
+The five screenshots below come from a single deterministic run against the
+built-in mock llama.cpp backend (`examples/mock_llama` — the same server
+the test suite runs against), so the shot can be reproduced exactly (repro
+steps at the end of this section). The topology:
 
-- **4 backend instances** — `llama-server` serving Llama-3.2-1B (Q4_K_M,
-  CPU, `--parallel 2`) on ports 9101–9104, so the proxy pins **8 slots**
-  in total;
-- **one shared KV folder** — every backend was started with the same
-  `--slot-save-path`, and the proxy was given the same directory as
-  `SLOT_SAVE_PATH`, so a KV cache saved while a request ran on one backend
-  can be restored into a slot on any of the other three;
-- **`SLOT_ROUTING_POLICY=lru`** — the slot routing policy (a free
-  slot first, otherwise the least recently used one).
+- **4 backend instances** — `mock_llama` serving model `llama-3.2-1b`,
+  2 slots each, on ports 9101–9104, so the proxy pins **8 slots** in total;
+- **one shared KV folder** — every mock was started with the same KV save
+  dir (its third argument emulates the backend's `--slot-save-path`), and
+  the proxy was given the same directory as `SLOT_SAVE_PATH`, so a KV cache
+  saved while a request ran on one backend can be restored into a slot on
+  any of the other three;
+- **model-aware routing** — every `BACKENDS` entry carries
+  `model_id: "llama-3.2-1b"` (all-or-nothing), so the requests' `model`
+  field must match and the per-row **model** column shows it;
+- **default `SLOT_ROUTING_POLICY=key_affinity`** — a request with a KV
+  restore key prefers an idle slot already running that key, so the restore
+  is a *warm* no-op (no backend wire call at all).
 
-The load was **50 chat requests** built from the cross join of two content
-lists: List A — 4 distinct documents of ~1,700 tokens each — and List B — 5
-distinct follow-up prompts. Request *i* sends `A[i mod 4]` as the first
-message and `B[(i div 4) mod 5]` as the second, so requests 1–20 cover all
-20 unique (A, B) pairs once and requests 21–50 repeat pairs (a repeat is a
-KV-restore candidate). The requests were dispatched by **4 concurrent
-workers** with a random 10–100 ms wait between dispatches. Every prompt is
-far above the 500-word `BIG_THRESHOLD_WORDS`, so all 50 requests qualified
-for KV save/restore.
+The load is **50 non-streaming chat requests** dispatched by **4 concurrent
+workers** with a random 150–450 ms wait between dispatches, drawn from 9
+fixed prompts: 4 documents of 1,700 words and 5 follow-ups of 460 / 540 /
+500 / 470 / 530 words. Three follow-ups sit at or below the 500-word
+`BIG_THRESHOLD_WORDS` threshold, so only 6 of the 9 prompts — the 4
+documents plus the 540- and 530-word follow-ups — qualify for KV
+save/restore (33 of the 50 requests are "big"). Each big key's first
+occurrence saves; every later occurrence restores it. The mock answers in
+~1 ms with a fixed `usage` block (10 prompt / 5 completion / 8 cached
+tokens, 333.3 gen tok/s), which is why the durations and token counts
+below are small and uniform.
 
 **General tab** (the default view, time filter set to *all time*):
 
 ![General tab](docs/screenshots/dashboard-general.png)
 
 The KPI cards show the run's outcome: 50 requests, 100 % success (errors
-0), **44 KV restores** with 69,839 cached tokens, 10 KV meta files (the
-on-disk meta is pruned at `META_MAX=10`), 0/8 slots in flight (the load had
-finished when the shot was taken) and an average end-to-end duration of
-1.9 s. The **throughput** panel plots 5-second buckets: 12 / 14 / 16 / 8
-requests, the completion tokens per bucket, and — the third chart — the
-*cached (restored) prompt tokens* per bucket, peaking at 25,396: after the
-first few requests, most of every prompt was served from the KV cache
-instead of being prefilled. The **resources** panel is the proxy's own
-footprint per bucket: CPU ms (479.6 ms total), peak RAM (14.0 MB) and disk
-writes (4.52 MB — the KV slot files landing in the shared folder). Every
-chart overlays its p50/p95 percentile lines as described above.
+0), **27 KV restores** (all *warm*) with 400 cached prompt tokens, 6 KV
+meta files (under `META_MAX=10`, so nothing was pruned), 0/8 slots in
+flight (the load had finished when the shot was taken), an average
+end-to-end duration of 1 ms (mock) and the proxy's own footprint — average
+CPU 0.60 ms per request (29.8 ms total), disk writes 0.17 MB (the KV slot
+files landing in the shared folder), peak RAM 8.76 MB. The **throughput**
+panel plots the run as 5-second buckets — 17 / 18 / 15 requests, 85 / 90 /
+75 completion tokens, and 136 / 144 / 120 *cached (restored) prompt
+tokens* per bucket — and the **resources** panel the proxy's own per-bucket
+CPU ms, peak RAM and disk I/O. Every chart overlays its p50/p95 percentile
+lines as described above, and the filter bar's **bar / line** toggle
+re-draws the same bars as a continuous line.
 
 **Backends tab**:
 
 ![Backends tab](docs/screenshots/dashboard-backends.png)
 
-The per-backend table: all four URLs `UP`, no cooldown, no failure streak,
+The per-backend table: all four URLs `UP`, the **model** column showing
+each backend's `model_id` (`llama-3.2-1b`), no cooldown, no failure streak,
 and `0 / 2` busy slots each (idle after the run; during the run this column
 tracks the 4 concurrent requests). The **action** column carries the
 per-backend **Drain** / **Resume** control (a drained row shows a `DRAINED`
@@ -459,54 +474,51 @@ pins across the 4 instances, all idle after the run.
 
 ![Recent requests tab](docs/screenshots/dashboard-recent.png)
 
-One row per finished request, newest first. Read it bottom-up: the oldest
-six rows have no restore candidate yet (`—`, cached 0), took ~8 s (a full
-CPU prefill of the ~1,650-token prompt) and record a *save* duration —
-their KV was written to the shared folder afterwards. Every row after that
-carries the green **restore** flag: the *restore* column shows the LCP
-candidate ratio (0.923–0.929) and the key it restored, *restore ms* is the
-`restore_cache_slot` API call duration (6–156 ms), and the *tokens* column
-shows prompt/completion/cached — e.g. `1624 / 16 / 1597`, i.e. ~90 % of the
-prompt served from cache, which is why these rows finish in ~1 s instead of
-~8 s. The *backend / slot* column shows the requests spread across all 8
-slots of the 4 backends, and each row's key16 matches the payload files the
-`payload_log` plugin wrote for the same request. Note that 44 rows restored
-even though only 30 requests were exact repeats: the LCP scan matches the
-*closest* prefix, so e.g. the first occurrence of (A1, B3) could restore the
-KV saved by (A1, B1) at ratio ≈ 0.93.
+One row per finished request, newest first. Reading bottom-up, the six
+first occurrences of the big keys (interleaved with the small-key rows,
+which never cache) carry no restore candidate yet (`—` in the *restore*
+column) and record a *save* duration (0.08–0.19 ms — the mock's save API
+call); their KV was written to the shared folder afterwards. Every later
+row for a big key is a **warm** restore: the *restore* column shows the LCP
+candidate ratio (1.000 — an exact key match) and the key, while *restore
+ms* is `—` because `key_affinity` picked a slot that already ran the key
+and the backend restore was skipped entirely — a warm restore makes no wire
+call, and `SKIP_SAVE_ON_SELF_RESTORE` (default `true`) skips the
+post-request re-save too. The *tokens* column shows the mock's fixed usage
+— `10 / 5 / 8` prompt / completion / cached — and the *backend / slot*
+column shows the requests spread across all 8 slots of the 4 backends.
 
 **KV Cache tab**:
 
 ![KV Cache tab](docs/screenshots/dashboard-kv.png)
 
-The per-key table, sorted by restore count: 20 distinct keys (the 20 unique
-(A, B) pairs), 44 restores in total (0 *warm* — a warm restore is the
-zero-wire-call skip that happens when the picked slot already ran the key;
-under the default `lru` policy a slot is not picked *because* it runs the
-key, so warm stays 0 here), restore API total 901 ms vs save API total
-1.79 s. The *backend* / *slot* columns show where each key was last
-restored — spread across all four backends, which only works because they
-share one KV folder. The table tracks keys in memory for the proxy's
-lifetime, while the on-disk meta files are pruned at `META_MAX` (10 here),
-which is why the General tab shows 10 KV meta files for 20 keys.
+The per-key table, sorted by restore count: 6 distinct keys (the big
+prompts), 27 restores in total — **all warm** — restore API total 0.00 ms
+(every restore was a zero-wire-call skip) vs save API total 0.92 ms. The
+*backend* / *slot* columns show where each key was last active — spread
+across all four backends, which only works because they share one KV
+folder. The table tracks keys in memory for the proxy's lifetime, while the
+on-disk meta files are pruned at `META_MAX` (10 here, so all 6 remain).
 
-To reproduce a run like this:
+To reproduce the run:
 
 ```bash
-# 4 llama-server instances, 2 slots each, one shared KV folder
-for i in 1 2 3 4; do
-  llama-server -m MODEL.gguf --port 910$i --parallel 2 \
-    --slot-save-path ./kv -ngl 0 --no-webui &
+# 4 mock backends, 2 slots each, one shared KV save dir (the mock's third
+# argument emulates the backend's --slot-save-path)
+for p in 9101 9102 9103 9104; do
+  ./target/release/examples/mock_llama $p llama-3.2-1b ./kv &
 done
 
-BACKENDS='[{"url":"http://127.0.0.1:9101","n_slots":2},
-           {"url":"http://127.0.0.1:9102","n_slots":2},
-           {"url":"http://127.0.0.1:9103","n_slots":2},
-           {"url":"http://127.0.0.1:9104","n_slots":2}]' \
-SLOT_SAVE_PATH=./kv SLOT_ROUTING_POLICY=lru \
+BACKENDS='[{"url":"http://127.0.0.1:9101","n_slots":2,"model_id":"llama-3.2-1b"},
+           {"url":"http://127.0.0.1:9102","n_slots":2,"model_id":"llama-3.2-1b"},
+           {"url":"http://127.0.0.1:9103","n_slots":2,"model_id":"llama-3.2-1b"},
+           {"url":"http://127.0.0.1:9104","n_slots":2,"model_id":"llama-3.2-1b"}]' \
+SLOT_SAVE_PATH=./kv META_DIR=./kv_meta \
 PLUGINS='[{"name":"dashboard","params":{"path":"/dashboard"}}]' \
   ./target/release/lpcache
-# → open http://<proxy-host>:<port>/dashboard
+# → open http://<proxy-host>:8081/dashboard, then send 50 chat requests
+#   with "model": "llama-3.2-1b" (the shots' load: 9 fixed prompts,
+#   4 concurrent workers, 150–450 ms between dispatches)
 ```
 
 ## Build & run
@@ -551,14 +563,14 @@ words appended — the second request logs
 
 The suite spans the core proxy (`lpcache`), the adapter plugin library
 (`lpcache-plugins`) and the configurator (`lpcache-config`) across unit,
-integration and doc tests — **338 passing tests** plus **2 ignored** doc
+integration and doc tests — **358 passing tests** plus **2 ignored** doc
 tests:
 
 | Suite | Location | Tests | Command |
 | --- | --- | ---: | --- |
-| Core proxy units | `src/` | 112 | `cargo test -p lpcache --lib` |
-| Plugin library units | `plugins/src/` | 110 | `cargo test -p lpcache-plugins --lib` |
-| Proxy integration (end-to-end) | `tests/api.rs` | 71 | `cargo test -p lpcache --test api` |
+| Core proxy units | `src/` | 123 | `cargo test -p lpcache --lib` |
+| Plugin library units | `plugins/src/` | 114 | `cargo test -p lpcache-plugins --lib` |
+| Proxy integration (end-to-end) | `tests/api.rs` | 77 | `cargo test -p lpcache --test api` |
 | Backend-client integration | `tests/client.rs` | 15 | `cargo test -p lpcache --test client` |
 | Configurator units | `configurator/src/` | 29 | `cargo test -p lpcache-config` |
 | Plugin doc tests | `plugins/src/` | 3 (1 + 2 ignored) | `cargo test -p lpcache-plugins --doc` |
@@ -580,7 +592,8 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   parsing (space/equal forms, extra `=`, last-wins, unknown/missing flags,
   `--help`/`--version`, usage text), CLI-over-env-over-default precedence,
   the `SLOT_ROUTING_POLICY`
-  env/CLI parsing (`lru` default, `key_affinity` / `key-affinity`,
+  env/CLI parsing (`key_affinity` default, `lru`, `key_affinity` /
+   `key-affinity` spelling variants,
   invalid → default with a warning) and `PLUGINS` / legacy
   `PREFILTER_*` / `REQUEST_LOG*` / `REQUEST_PAYLOAD_DIR` spec synthesis and
   precedence.
@@ -630,11 +643,13 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   policy, safe acceptance, bounded verdict LRU + per-key reuse, reject/accept
   checks, fail-open/fail-closed, HTTP-error routing to `on_error`,
   empty-text skip, factory build/defaults/bad-param rejection.
-- **`result_cache`** (`result_cache.rs`, 20): store put/get round-trip,
+- **`result_cache`** (`result_cache.rs`, 23): store put/get round-trip,
   trait dispatch, expire/zero-TTL, corrupt-entry self-healing, fresh-hit
   serve, stream bypass and `cache_streaming` aggregation, `Cache-Control:
   no-cache` bypass (on/off), `RemoveAfterServe` one-shot cleanup (incl.
-  missing-file noop), factory build and `dir`/cleanup validation.
+  missing-file noop), model-aware entry naming (the `{model}_{key}` KV
+  convention, per-model isolation, legacy bare-entry serve + migration),
+  factory build and `dir`/cleanup validation.
 - **`request_log`** (`request_log.rs`, 14): XLF header and record format,
   UTC millisecond precision, dash rendering for missing/perf fields, field
   escaping, custom-field subset/order, invalid field-list rejection, size
@@ -644,7 +659,7 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   payload files with `{seq}-{timestamp}-{key16}` names, unique names per
   request (incl. concurrent writers), `nokey` fallback for unparseable
   payloads, `.bin` for non-UTF-8 payloads, factory `dir` validation.
-- **`dashboard`** (`dashboard.rs`, 21): factory defaults/validation, stats
+- **`dashboard`** (`dashboard.rs`, 22): factory defaults/validation, stats
   path join, counters/time-series/recent updates (incl. the per-request
   and per-bucket process resource fields — CPU ms, disk bytes read/written,
   peak RAM), resource metrics absent when records lack them, `?since`
@@ -654,7 +669,8 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
   p50/p95, nearest-rank point aggregates, bounded histogram quantiles,
   and the coarsening merge), per-scope recent rings, long-range
   coarsening and oldest-bucket cap, self-contained HTML, chart bar figures
-  and baseline.
+  and baseline, the bar/line chart toggle, and the per-backend drain flag
+  in the stats payload.
 - **`chain`** (`chain.rs`, 3) and **`llama` backend** (`llama.rs`, 5): chain
   accept/reject ordering and nested factory build; slot pinning in
   body/options/query (with and without an existing `options` key) and the
@@ -706,6 +722,9 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
     404/bad-index + idempotent no-op resume on the `/_control` endpoints.
   - *LRU pruning* (3): meta + KV file pruning, restore of surviving entries
     with fallback for pruned keys, LRU timestamp bump keeping hot entries.
+  - *Startup cleanup* (2): startup scan removes corrupt meta but keeps
+    orphan KV files by default, and removes them when `startup_cleanup` is
+    on.
   - *Slot routing* (2): small-request successes marking the slot used so
     the free tier moves on (regression), `key_affinity` picking the idle
     slot already running the key and saving the redundant restore wire
@@ -731,16 +750,23 @@ Unit tests live in `#[cfg(test)]` modules next to the code they cover.
     `RemoveAfterServe` cleanup, keyword blocklist running before the cache.
   - *Stale-meta cleanup* (2): meta removed after a rejected restore, meta kept
     when the slot-save dir is unvisible (remote backend).
-  - *Request log* (5): XLF record per request, stream perf fields, delivered
-    stream bytes, failed request without pipeline fields, rotation + `keep`.
+  - *Self-restore save skip* (3): the KV save is skipped by default
+    (`SKIP_SAVE_ON_SELF_RESTORE`) when a request restores its own key
+    (self-restore), stays skipped on a warm self-restore whose meta
+    exists, and heals a missing meta on a warm self-restore (the
+    post-request save re-writes the KV file and meta).
+  - *Request log* (6): XLF record per request, restore candidate + LCP
+    ratio fields, stream perf fields, delivered stream bytes, failed
+    request without pipeline fields, rotation + `keep`.
   - *Payload log* (1): one payload file per request with the exact body bytes
     and the request's KV cache key in the name; malformed bodies captured as
     `nokey` files.
-  - *Dashboard* (7): page and stats JSON reachable, chart figures (incl.
+  - *Dashboard* (8): page and stats JSON reachable, chart figures (incl.
     the percentile lines/legend and the window totals), counters updated
     after requests, `?since`/`?backend` scoping (incl. the `cached`,
     `coalesced` and `coalesced_groups` scopes), routes excluded from the
-    request log and aggregates, custom page path.
+    request log and aggregates, custom page path, and the restore/save API
+    call durations in the stats payload.
 
 ### Functional & load testing
 

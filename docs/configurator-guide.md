@@ -14,7 +14,10 @@ All three write the **same TOML file** (default `lpcache.config.toml` in the
 current directory) and run the **same validation**, so a value accepted in
 one style is accepted everywhere. Note that `lpcache` itself never reads
 the TOML file — the configurator converts it to environment variables /
-CLI flags / a systemd unit when you deploy.
+CLI flags / a systemd unit when you deploy. Two proxy parameters are **not
+in the TOML file at all** — `SKIP_SAVE_ON_SELF_RESTORE` and
+`STARTUP_CLEANUP_KV` — they are set with env vars or CLI flags only (see
+[PARAMETERS.md](../PARAMETERS.md)).
 
 ![lpcache-config help](configurator/cli-help.png)
 
@@ -297,7 +300,7 @@ Behaviour and worked examples:
 
 | param | type | default | notes |
 | --- | --- | --- | --- |
-| `dir` * | text | — | cache dir holding the `{key}.json` entries (created on first write) |
+| `dir` * | text | — | cache dir holding the `{lowercase(model_id)}_{key}.json` entries (the KV cache file naming convention; legacy bare `{key}.json` entries are still read and migrated on first access); created on first write |
 | `ttl_secs` | float ≥ 0 | `300` | per-entry expiry; 0 = never expire (the runtime clamps negatives to 0 — the validator rejects them) |
 | `cleanup` | enum | — | only `remove_after_serve` (delete an entry once served); omitted = none, anything else is a startup error |
 | `cache_streaming` | bool | `false` | also cache streaming results and serve them to streaming clients |

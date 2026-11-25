@@ -368,7 +368,7 @@ Live results ([§6.6](#66-qwen_guard-fail-open--fail-closed)): with the guard do
 | `path` | `lpcache-request.log` | Log file location (relative → cwd; parent dir created) |
 | `max_bytes` | `10485760` (10 MiB) | Rotation threshold; `0` = no rotation |
 | `keep` | `5` | Rotated generations kept; `0` = keep all |
-| `fields` | all 33 | Ordered subset of the known XLF fields; omitted = all 33 in the default order. An empty list, an unknown field name, or a repeated field is a startup error (the error lists the known fields) |
+| `fields` | all 36 | Ordered subset of the known XLF fields; omitted = all 36 in the default order. An empty list, an unknown field name, or a repeated field is a startup error (the error lists the known fields) |
 
 **Example.**
 
@@ -440,7 +440,7 @@ request, and a `restore` column showing the candidate's LCP ratio — plus the c
 { "name": "dashboard", "params": { "path": "/dashboard" } }
 ```
 
-Live result ([§6.7](#67-dashboard)): `GET /dashboard` returns an ~101 KB self-contained page titled "lpcache dashboard" (a tabbed panel — General with the throughput / resources charts, plus Backends, Slots, Recent requests and KV Cache; filter bar with time presets + a backend filter that defaults to "all"); `GET /dashboard/api/stats` returns JSON with a `counters` object (`ok`, `client_errors`, `cache_hits`, `cache_hit_rate`, `tokens`, `resources` — the process CPU ms, disk bytes read/written, RAM max and peak RAM, …) plus the live `proxy` snapshot.
+Live result ([§6.7](#67-dashboard)): `GET /dashboard` returns an ~114 KB self-contained page titled "lpcache dashboard" (a tabbed panel — General with the throughput / resources charts, plus Backends, Slots, Recent requests and KV Cache; filter bar with time presets, a bar/line chart-style toggle and a backend filter that defaults to "all"); `GET /dashboard/api/stats` returns JSON with a `counters` object (`ok`, `client_errors`, `cache_hits`, `cache_hit_rate`, `tokens`, `resources` — the process CPU ms, disk bytes read/written, RAM max and peak RAM, …) plus the live `proxy` snapshot.
 
 ---
 
@@ -674,10 +674,11 @@ This validates the plugin's wiring and both failure paths. A full safety-classif
 
 ```text
 $ curl -s http://127.0.0.1:8085/dashboard | wc -c
-103125                      # self-contained HTML page, titled "lpcache dashboard" (lpcache 0.11.0)
+116852                      # self-contained HTML page, titled "lpcache dashboard" (lpcache 0.12.0)
 
 $ curl -s 'http://127.0.0.1:8085/dashboard/api/stats' | python3 -c 'import sys,json; print(list(json.load(sys.stdin).keys()))'
-['counters', 'model', 'proxy', 'recent', 'refresh_ms', 'series', 'uptime_secs', 'version', 'window_secs']
+['counters', 'kv_cache', 'model', 'proxy', 'recent', 'refresh_ms', 'series', 'uptime_secs', 'version', 'window_secs']
+# (a `?since=<unix secs>` query adds a `range` key with that range's counters)
 ```
 
 The `counters` object reflects the run's traffic (after the tests above):
@@ -685,15 +686,16 @@ The `counters` object reflects the run's traffic (after the tests above):
 ```json
 { "ok": 7, "client_errors": 3, "cache_hits": 2, "cache_hit_rate": 0.2,
   "total": 10, "success_rate": 0.7, "restored": 0, "streamed": 0, "coalesced_followers": 0,
-  "avg_duration_secs": 0.085, "avg_prefill_tps": 319.97, "avg_gen_tps": 119.95,
+  "big_requests": 0, "server_errors": 0,
+  "avg_duration_secs": 0.085, "avg_prefill_tps": 319.97, "avg_gen_tps": 119.95, "avg_ttft_ms": null,
   "tokens": { "prompt": 252, "completion": 12, "cached": 0 },
   "resources": { "cpu_ms": 41.2, "avg_cpu_ms": 4.12,
                  "disk_read_bytes": 32768, "disk_write_bytes": 65536,
                  "ram_max_bytes": 48234496, "peak_ram_bytes": 48234496 } }
 ```
 
-`client_errors` counts the `400` keyword rejections; `cache_hits` counts the `result_cache` serves. The `resources` object is the proxy's **own** process usage: `cpu_ms` and the disk bytes read/written are per-request deltas summed (the backend's KV I/O is not included), while `ram_max_bytes` / `peak_ram_bytes` are point-in-time gauges (the largest resident size and the peak resident size seen across the counted requests). The `proxy` key carries the live `ProxyStatus` (backends, slots, circuit breakers, meta files, in-flight). The dashboard's own page/stats requests are excluded, so polling never inflates these numbers.
+`client_errors` counts the `400` keyword rejections; `cache_hits` counts the `result_cache` serves. The `resources` object is the proxy's **own** process usage: `cpu_ms` and the disk bytes read/written are per-request deltas summed (the backend's KV I/O is not included), while `ram_max_bytes` / `peak_ram_bytes` are point-in-time gauges (the largest resident size and the peak resident size seen across the counted requests). The `proxy` key carries the live `ProxyStatus` (backends, slots, circuit breakers, meta files, in-flight). `kv_cache` carries the per-key restore/save counters behind the KV Cache tab, and a `?since=<unix secs>` query adds a `range` key with the counters scoped to that time range (absent = all time). The dashboard's own page/stats requests are excluded, so polling never inflates these numbers.
 
 ---
 
-*Validated against `lpcache 0.8.0` + Llama-3.2-1B-Instruct (Q4_K_M) on `llama-server`, 2026-11-09; page size re-verified against `lpcache 0.11.0`, 2026-11-19.*
+*Validated against `lpcache 0.8.0` + Llama-3.2-1B-Instruct (Q4_K_M) on `llama-server`, 2026-11-09; page size re-verified against `lpcache 0.11.0`, 2026-11-19, and `lpcache 0.12.0`, 2026-11-25.*

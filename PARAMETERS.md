@@ -26,6 +26,7 @@ precedence over the built-in defaults. `-h` / `--help` prints the built-in help.
 | `WORDS_PER_BLOCK` | `--words-per-block <N>` | `100` | Words per SHA256 hash block used for prefix hashing |
 | `BIG_THRESHOLD_WORDS` | `--big-threshold-words <N>` | `500` | Word count above which a request is "big": runs with `cache_prompt=true`, KV cache saved to backend afterwards, meta file written |
 | `LCP_TH` | `--lcp-th <F>` | `0.1` | Min. shared-block ratio (0..1) for a restore candidate to be restored before dispatch |
+| `SKIP_SAVE_ON_SELF_RESTORE` | `--skip-save-on-self-restore <BOOL>` | `true` | Skip the post-request KV save + meta write when a big request successfully restored **its own** key (self-restore) — the saved file already holds that key's state. A warm self-restore (the picked slot already runs the key, so the restore is a zero-wire-call skip) stays skipped while the key's meta file is still on disk and *heals* a missing meta by saving when the meta has gone (e.g. after LRU pruning or manual cleanup). A closest-prefix restore from a *different* key still saves — even at ratio 1.0, because the file holds the other key's state. Set `false` to always save after a successful self-restore |
 | `META_DIR` | `--meta-dir <PATH>` | `kv_meta` | Meta file directory, joined to the **current working directory** |
 | `META_MAX` | `--meta-max <N>` | `10` | LRU bound on meta files kept after each save; oldest pruned along with same-named KV files in the slot-save dirs; `0` = unlimited |
 | `STARTUP_CLEANUP_KV` | `--startup-cleanup-kv <BOOL>` | `false` | At startup, corrupt `.meta.json` files in `META_DIR` are always removed; when `true`, the orphan KV files of the removed metas are removed from the slot-save dirs as well (the model id is unrecoverable from a corrupt meta, so KV names are matched by key suffix) |
@@ -268,7 +269,20 @@ as a sample) — presented as a two-row legend (the per-request p50/p95 pair on 
 no percentiles. The additive resource charts (CPU ms, disk read, disk
 write) draw the window total — the sum of the drawn per-bucket values —
 next to the max in each chart's top-left corner (the peak-RAM gauge is
-not additive and keeps the max alone). The page's own URL takes a `?backend=` param with the same
+not additive and keeps the max alone). A bar/line toggle in the filter bar
+re-renders every chart in the chosen style. Beyond the General tab (KPI
+cards + the throughput/resource chart panels) the page has four more tabs:
+**Backends** (per-backend state, cooldown, failure streak, busy/total
+slots, the backend's `model_id` when model-aware routing is on, and the
+per-row **Drain**/**Resume** buttons that call the proxy's `/_control`
+endpoints — see §4), **Slots** (the slot-occupancy grid), **Recent
+requests** (one row per finished request; the *restore* column shows the
+best restore candidate's LCP ratio and the candidate key when it differs
+from the request's own key, and *restore ms* / *save ms* are the
+`restore_cache_slot` / save API call durations when a wire call happened)
+and **KV Cache** (per-key restore counts with warm/cold split and
+restore/save API totals, plus the backend/slot where each key was last
+restored). The page's own URL takes a `?backend=` param with the same
 values to deep-link the backend filter (e.g. `/dashboard?backend=0`).
 The dashboard's own routes are excluded from the
 aggregates and the request log. At most one `dashboard` plugin. Unlike the

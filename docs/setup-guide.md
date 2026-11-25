@@ -11,7 +11,7 @@ client (OpenAI API)                llama.cpp backend(s)
 ┌────────────────────────────────────────────────────────┐
 │ lpcache (this project)                              │
 │  • prefix hashing  • big/small  • LCP restore lookup   │
-│  • slot locks (free-first, then LRU)  • SSE passthrough│
+│  • slot locks (key-affinity / LRU)  • SSE passthrough│
 │  • prefilter: keyword/guard reject + result-cache serve (opt.) │
 │  • saves KV cache + writes <key>.meta.json            │
 └────────────────────────────────────────────────────────┘
@@ -197,7 +197,7 @@ Expected startup logs:
 client_init url=http://127.0.0.1:8000 api_key=false
 client_init url=http://127.0.0.1:8001 api_key=false
 slot_manager n_backends=2 total_slots=2
-app_start version=0.9.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
+app_start version=0.12.0 n_backends=2 port=8081 meta_max=10 stream_queue=16
 listening on 0.0.0.0:8081
 ```
 
@@ -262,9 +262,9 @@ resume at least one backend to restore service.
 | `LOG_LEVEL`           | `INFO`                     | `TRACE..ERROR`; `RUST_LOG` overrides it             |
 | `STREAM_QUEUE_SIZE`   | `16`                       | capacity of the per-request SSE channel that buffers streamed bytes between the background reader and the HTTP response (must be >= 1; smaller values backpressure the backend faster) |
 | `COALESCE_REQUESTS`   | `false`                    | group concurrent same-cache-key requests into one backend call (Rust-only) |
-| `SLOT_ROUTING_POLICY`   | `lru`                      | slot pick policy: `lru` (free-first, then least recently used) or `key_affinity` (for a request with a KV restore key, prefer an idle slot already running that key so the restore is a no-op) |
+| `SLOT_ROUTING_POLICY`   | `key_affinity`               | slot pick policy: `key_affinity` (for a request with a KV restore key, prefer an idle slot already running that key so the restore is a no-op; otherwise free-first, then least recently used) or `lru` (always free-first, then least recently used) |
 | `LLAMA_API_KEY`       | —                          | sent to the backend as `Authorization: Bearer <key>` (llama-server `--api-key`); unset = no auth |
-| `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables) and `dashboard` (the real-time statistics web page, at most one). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
+| `PLUGINS`             | —                          | JSON **array** of plugin specs `[{"name": "...", "params": {...}}]`; built-in names: `keyword`, `qwen_guard`, `result_cache`, `chain` (prefilters, chained in list order; empty array = no prefilter), `request_log` (the request logger — a spec here takes precedence over the `REQUEST_LOG*` variables), `payload_log` (raw request/response payload logger — a spec here takes precedence over `REQUEST_PAYLOAD_DIR`) and `dashboard` (the real-time statistics web page, at most one). When unset, the legacy `PREFILTER_*` variables below are translated into the equivalent specs |
 | `PREFILTER_BLOCKLIST` | —                          | **legacy** (synthesized into a `keyword` plugin when `PLUGINS` is unset): comma-separated keywords; matching requests are rejected with `400` **before** any slot/backend work; unset/blank = disabled |
 | `PREFILTER_CASE_INSENSITIVE` | `true`              | **legacy**: keyword matching is case-insensitive (set `false` for exact-case) |
 | `PREFILTER_RESULT_CACHE_DIR` | —                   | **legacy** (synthesized into a `result_cache` plugin when `PLUGINS` is unset): the **cache-result path**; when set, fresh same-key non-streaming requests are answered from a cached backend result (`{dir}/{lowercase(model_id)}_{key}.json`) before any slot/backend work — streaming requests always bypass the cache; unset/blank = disabled |
@@ -276,6 +276,7 @@ resume at least one backend to restore service.
 | `REQUEST_LOG_MAX_BYTES` | `10485760` (10 MiB)        | rotation threshold in bytes (`<path>.1`, `<path>.2`, …); `0` = no rotation |
 | `REQUEST_LOG_KEEP`      | `5`                        | rotated generations retained (the oldest is dropped); `0` = keep them all |
 | `REQUEST_LOG_FIELDS`    | all 36 fields              | comma-separated ordered subset of the known XLF field names (W3C + `lpcache-*` pipeline/performance/resource fields) |
+| `REQUEST_PAYLOAD_DIR`   | —                          | **legacy** (synthesized into a `payload_log` plugin when `PLUGINS` is unset): the **payload-log dir**; when set, each chat request's raw request/response payload is written to files under this dir; env var only (no CLI flag) |
 
 Every variable also has a command-line flag; explicit flags take
 precedence over environment variables, which take precedence over the
@@ -421,7 +422,7 @@ resident memory when the request completed). Missing values render as `-`.
   file starting with a new XLF header) and at most
   `REQUEST_LOG_KEEP` (default 5) generations are kept; `0` for either
   disables rotation / keeps all generations. `REQUEST_LOG_FIELDS`
-  selects an ordered subset of the 34 known fields.
+  selects an ordered subset of the 36 known fields.
 - Logging never breaks request serving: log I/O failures are logged and
   swallowed.
 - The full field list and format details are in the
@@ -482,8 +483,10 @@ every `refresh_ms`
   p50/p95 on row 1, drawn-bars p50/p95 on row 2) whose items toggle those
   lines (hidden lines are dropped from the scale);
   the additive resource charts (CPU ms, disk read, disk write) also draw
-  the window total next to the max in the top-left corner.
-- **Tables** (in the **Backends**, **Slots**, **Recent requests** and **KV Cache** tabs): per-backend status (URL, slots, busy slots, circuit
+  the window total next to the max in the top-left corner. Each panel has
+  a **bar / line** display toggle (persisted per browser in `localStorage`),
+  which re-renders the same bars as a continuous line.
+- **Tables** (in the **Backends**, **Slots**, **Recent requests** and **KV Cache** tabs): per-backend status (URL, model id, slots, busy slots, circuit
   breaker state, and a **Drain / Resume** action column per row — see
   [4.2.2](#422-runtime-drain-control-restarting-one-backend); a drained
   backend shows a `DRAINED` badge), per-slot occupancy grid, a per-key KV table
@@ -596,7 +599,7 @@ Then, with a >500-word prompt in the messages, send the prompt twice
 ```
 
 This is the same flow the test-suite validates; the identical flows are
-covered by `cargo test --workspace` (270 tests) against the in-process mock.
+covered by `cargo test --workspace` (358 tests) against the in-process mock.
 
 ### 7.1 Load test (optional)
 
